@@ -1,0 +1,40 @@
+#ifndef MOOR_EXIT_NOTICE_H
+#define MOOR_EXIT_NOTICE_H
+
+static const char MOOR_EXIT_NOTICE_HTML[] =
+    "<!DOCTYPE html>\n"
+    "<html lang=\"en\">\n"
+    "<head>\n"
+    "<meta charset=\"UTF-8\">\n"
+    "<title>MOOR Exit Relay</title>\n"
+    "<style>\n"
+    "body { font-family: sans-serif; max-width: 700px; margin: 40px auto;\n"
+    "       padding: 0 20px; color: #222; background: #f9f9f9; }\n"
+    "h1 { color: #333; }\n"
+    "p { line-height: 1.6; }\n"
+    ".box { background: #fff; border: 1px solid #ddd; padding: 20px;\n"
+    "       border-radius: 6px; margin: 20px 0; }\n"
+    "</style>\n"
+    "</head>\n"
+    "<body>\n"
+    "<h1>This is a MOOR Exit Relay</h1>\n"
+    "<div class=\"box\">\n"
+    "<p>You are most likely accessing this page because you have had some issue with\n"
+    "the traffic coming from this IP address. This router is part of the\n"
+    "<strong>MOOR network</strong>, an anonymous overlay network similar to Tor.</p>\n"
+    "<p>MOOR exit relays route encrypted traffic on behalf of users who seek\n"
+    "privacy online. The operator of this relay does not monitor, log, or\n"
+    "inspect any of the traffic passing through it. <strong>No traffic logs are\n"
+    "kept.</strong></p>\n"
+    "<p>The operator of this relay is not responsible for the content or actions\n"
+    "of the traffic that passes through it. If you wish to block traffic from\n"
+    "this exit relay, you may block this IP address.</p>\n"
+    "<p>For more information about onion routing and anonymous communication,\n"
+    "see <a href=\"https://en.wikipedia.org/wiki/Onion_routing\">"
+    "Wikipedia: Onion Routing</a>.</p>\n"
+    "</div>\n"
+    "<p><em>Contact: [operator contact placeholder]</em></p>\n"
+    "</body>\n"
+    "</html>\n";
+
+#endif /* MOOR_EXIT_NOTICE_H */

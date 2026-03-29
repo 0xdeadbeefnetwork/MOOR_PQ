@@ -1,0 +1,271 @@
+## MOOR Configuration File (moorrc)
+## Post-Quantum Anonymous Overlay Network
+##
+## This file uses the same format as Tor's torrc.
+## Lines starting with # are comments.
+## All options can also be set via command-line: --OptionName value
+##
+## Copy this file to ~/.moor.conf (or /etc/moor/moor.conf) and
+## uncomment the section matching your node type.
+
+## ============================================================
+## MODE (required)
+## ============================================================
+## One of: client, relay, da, hs, ob
+#Mode client
+
+## ============================================================
+## COMMON OPTIONS (all modes)
+## ============================================================
+
+## Listen address (default: 127.0.0.1 for client, 0.0.0.0 for relay/da)
+#BindAddress 0.0.0.0
+
+## Data directory for persistent state (keys, consensus cache, etc.)
+#DataDirectory /var/lib/moor
+
+## Verbose logging
+#Verbose 0
+
+## Contact info (email, URL, etc. -- shows on network status page)
+#ContactInfo you@example.com
+
+## Daemonize
+#Daemon 0
+#PidFile /var/run/moor.pid
+
+## Control port (Tor-compatible protocol for controllers)
+#ControlPort 9051
+#ControlPortPassword mypassword
+
+## Runtime statistics logging
+#Monitor 0
+
+## Directory authority address(es) for bootstrapping
+## Default: 107.174.70.38:9030
+#DAAddress 107.174.70.38
+#DAPort 9030
+
+## Fallback directory (used when DAs are unreachable)
+#FallbackDir 1.2.3.4:9030:abcdef0123456789...
+
+## GeoIP databases (auto-detected from standard paths if not set)
+#GeoIPFile /usr/share/moor/geoip
+#GeoIPv6File /usr/share/moor/geoip6
+
+## ============================================================
+## CLIENT (Mode client)
+## ============================================================
+##
+## Example:
+##   Mode client
+##   SocksPort 9050
+##   BindAddress 127.0.0.1
+
+## SOCKS5 proxy port for applications (browser, curl, etc.)
+#SocksPort 9050
+
+## Connect through bridge relays (censorship circumvention)
+#UseBridges 0
+#Bridge scramble 1.2.3.4:443 a1b2c3d4e5f6...  (64-char hex fingerprint)
+#Bridge shade 5.6.7.8:8080 f1e2d3c4b5a6...
+#Bridge mirage 9.10.11.12:443 0123456789ab...
+
+## Preferred entry node (64-char hex fingerprint)
+#EntryNode abcdef0123456789...
+
+## PIR for hidden service lookups (default: on)
+## Prevents HSDir relays from learning which .moor address you visit
+#PIR 1
+
+## Transparent proxy (redirect traffic without SOCKS)
+#TransPort 9040
+#TransListenAddress 127.0.0.1
+#DNSPort 5353
+#DNSListenAddress 127.0.0.1
+
+## IPv6
+#ClientUseIPv6 0
+#ClientPreferIPv6ORPort 0
+
+## Resolve .moor addresses automatically
+#AutomapHostsOnResolve 1
+
+## ============================================================
+## RELAY (Mode relay)
+## ============================================================
+##
+## Exit relay example (VALIDATOR / 86.54.28.49):
+##   Mode relay
+##   BindAddress 0.0.0.0
+##   ORPort 9001
+##   AdvertiseAddress 86.54.28.49
+##   Nickname VALIDATOR
+##   Exit 1
+##   DataDirectory /home/moor/moor-exit
+##   Verbose 1
+##
+## Middle relay example (DROPOUT / 86.54.28.132):
+##   Mode relay
+##   BindAddress 0.0.0.0
+##   ORPort 9001
+##   AdvertiseAddress 86.54.28.132
+##   Nickname DROPOUT
+##   DataDirectory /home/moor/moor-middle
+##   Verbose 1
+##
+## Guard relay example:
+##   Mode relay
+##   BindAddress 0.0.0.0
+##   ORPort 9001
+##   AdvertiseAddress 1.2.3.4
+##   Nickname MYGUARD
+##   Guard 1
+##   DataDirectory /home/moor/moor-guard
+##   Verbose 1
+
+## Port for other MOOR relays to connect to
+#ORPort 9001
+
+## Public IP address (required if behind NAT or multi-homed)
+#AdvertiseAddress 1.2.3.4
+
+## Relay nickname (shows in consensus)
+#Nickname MyRelay
+
+## Bandwidth rate in bytes/sec (auto-detected if not set)
+#BandwidthRate 5000000
+
+## Relay role flags (uncomment ONE or leave all commented for middle)
+## Exit: forwards traffic to the open internet
+## Guard: entry point for client circuits
+## MiddleOnly: explicitly middle-only (no guard/exit)
+#Exit 0
+#Guard 0
+#MiddleOnly 0
+
+## Exit policy (only applies when Exit 1)
+## Rules are evaluated in order; first match wins.
+#ExitPolicy reject *:25        # SMTP
+#ExitPolicy reject *:119       # NNTP
+#ExitPolicy reject *:135-139   # RPC/DCOM
+#ExitPolicy reject *:445       # SMB
+#ExitPolicy reject *:6881-6999 # BitTorrent
+#ExitPolicy accept *:*         # Accept everything else
+
+## Reduced exit policy (allows only common web ports)
+#ExitPolicy accept *:80
+#ExitPolicy accept *:443
+#ExitPolicy reject *:*
+
+## Declare sibling relays you operate (64-char hex fingerprint each)
+#RelayFamily abcdef0123456789...
+#RelayFamily 0123456789abcdef...
+
+## Bandwidth accounting (limit monthly traffic)
+#AccountingMax 1TB
+#AccountingPeriod month
+
+## Rate limiting
+#RateLimit 10000000
+
+## Cache directory service responses
+#DirCache 1
+
+## ============================================================
+## BRIDGE RELAY (unlisted relay for censorship circumvention)
+## ============================================================
+##
+## Example:
+##   Mode relay
+##   IsBridge 1
+##   ORPort 443
+##   BindAddress 0.0.0.0
+##   AdvertiseAddress 1.2.3.4
+##   BridgeTransport scramble
+
+#IsBridge 0
+## Bridge transport: scramble (obfs4-like), shade (traffic morphing), mirage (TLS camouflage)
+#BridgeTransport scramble
+
+## Bridge distribution authority
+#BridgeAuthPort 8443
+#BridgeDBPort 8080
+#BridgeDBFile /var/lib/moor/bridgedb.json
+
+## ============================================================
+## DIRECTORY AUTHORITY (Mode da)
+## ============================================================
+##
+## DA1 example (107.174.70.38):
+##   Mode da
+##   BindAddress 0.0.0.0
+##   DirPort 9030
+##   DAPeers 107.174.70.122:9030
+##   DataDirectory /home/moor/moor-da
+##   Verbose 1
+##
+## DA2 example (107.174.70.122):
+##   Mode da
+##   BindAddress 0.0.0.0
+##   DirPort 9030
+##   DAPeers 107.174.70.38:9030
+##   DataDirectory /home/moor/moor-da
+##   Verbose 1
+
+## Directory service port
+#DirPort 9030
+
+## Peer DAs (comma-separated ip:port or ip:port:hex_pk)
+#DAPeers 10.0.0.2:9030
+
+## PoW difficulty for relay admission (higher = harder to register)
+#PowDifficulty 8
+#PowMemLimit 256
+
+## ============================================================
+## HIDDEN SERVICE (Mode hs)
+## ============================================================
+##
+## Example:
+##   Mode hs
+##   HiddenServiceDir /var/lib/moor/hidden_service
+##   HiddenServicePort 80
+##   DAAddress 107.174.70.38
+##   DAPort 9030
+
+## Each HiddenServiceDir starts a new hidden service.
+#HiddenServiceDir /var/lib/moor/hidden_service
+#HiddenServicePort 80
+
+## Client authorization (only listed clients can connect)
+#HiddenServiceAuthorizedClient <base32_curve25519_pubkey>
+#ClientOnionAuthDir /var/lib/moor/onion_auth
+
+## HS PoW DoS protection (require proof-of-work for intro)
+#HSPoW 0
+#HSPoWDifficulty 16
+
+## ============================================================
+## ONION BALANCE (Mode ob)
+## ============================================================
+##
+## Load-balance across multiple HS backend instances.
+#OnionBalanceMaster 1
+#OnionBalancePort 8080
+
+## ============================================================
+## TRAFFIC ANALYSIS RESISTANCE
+## ============================================================
+
+## Circuit padding (mandatory baseline, cannot disable)
+## Machine: generic (default), web, stream, none
+#PaddingMachine generic
+#PaddingMode 0
+
+## Poisson mixing delay in ms (adds random delay to cells)
+#MixDelay 0
+
+## Multi-path circuits (splits traffic across multiple paths)
+#Conflux 0
+#ConfluxLegs 2

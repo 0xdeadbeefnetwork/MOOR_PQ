@@ -1,0 +1,230 @@
+.TH MOOR 1 "March 2026" "MOOR 0.7.0" "User Commands"
+.SH NAME
+moor \- post-quantum anonymous overlay network
+.SH SYNOPSIS
+.B moor
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+MOOR routes traffic through 3 encrypted hops using X25519 + Kyber768 hybrid
+key exchange. No single relay knows both source and destination. Every hop
+is post-quantum resistant.
+.PP
+With no arguments, MOOR starts as a SOCKS5 proxy client on port 9050.
+.SH MODES
+.TP
+.B Client (default)
+SOCKS5 proxy on localhost. Route browser/application traffic through the network.
+.TP
+.B \-\-mode relay
+Onion relay. Forwards encrypted cells between other nodes.
+.TP
+.B \-\-mode da
+Directory authority. Publishes signed consensus of known relays.
+.TP
+.B \-\-mode hs
+Hidden service. Host a service reachable via .moor addresses.
+.TP
+.B \-\-mode ob
+OnionBalance. Load-balance a hidden service across multiple backends.
+.TP
+.B \-\-mode bridgedb
+Bridge distribution service. Hands out bridge addresses via HTTPS.
+.TP
+.B \-\-mode bridge_auth
+Bridge authority. Publishes a separate consensus of bridge relays.
+.SH CLIENT OPTIONS
+.TP
+.B \-\-socks\-port \fIport\fR
+SOCKS5 listen port (default: 9050).
+.TP
+.B \-\-bind \fIaddr\fR
+Bind address (default: 127.0.0.1).
+.TP
+.B \-\-da\-address \fIaddr\fR
+Primary directory authority address (default: 107.174.70.38).
+.TP
+.B \-\-da\-port \fIport\fR
+Primary directory authority port (default: 9030).
+.TP
+.B \-\-use\-bridges
+Connect via bridge relays instead of direct.
+.TP
+.B \-\-bridge \fIline\fR
+Bridge specification: "transport addr:port pk_hex".
+.TP
+.B \-\-geoip \fIfile\fR
+IPv4 GeoIP database for path diversity (Tor format).
+.TP
+.B \-\-geoip6 \fIfile\fR
+IPv6 GeoIP database for path diversity (Tor format).
+.TP
+.B \-\-conflux
+Enable multi-path circuits.
+.TP
+.B \-\-conflux\-legs \fIn\fR
+Number of circuit legs (default: 2).
+.TP
+.B \-\-padding\-machine \fIname\fR
+WTF-PAD machine: web, stream, generic, none (default: generic).
+.TP
+.B \-\-pir / \-\-no\-pir
+Enable/disable PIR for hidden service lookups (default: on).
+.TP
+.B \-\-data\-dir \fIdir\fR
+Persistent state directory (guards, consensus cache).
+.SH RELAY OPTIONS
+.TP
+.B \-\-or\-port \fIport\fR
+Onion routing port (default: 9001).
+.TP
+.B \-\-guard
+Advertise as guard relay (entry point for client circuits). Under 20 relays
+in the network, the DA trusts this flag immediately. Over 20, the relay must
+earn it via Fast + Stable + bandwidth + 8 days uptime.
+.TP
+.B \-\-exit
+Advertise as exit relay (forwards traffic to the internet). Always self-declared,
+never auto-assigned. Nobody accidentally becomes an exit.
+.TP
+.B \-\-middle\-only
+Middle-only relay. DA strips Guard/Exit/HSDir flags. Safest to run.
+.TP
+.B \-\-advertise \fIaddr\fR
+Public IP to advertise (auto-detected if omitted).
+.TP
+.B \-\-nickname \fIname\fR
+Human-readable relay name (shows in consensus).
+.TP
+.B \-\-bandwidth \fIbytes/s\fR
+Advertised bandwidth (default: 1000000). DA measures actual throughput.
+.TP
+.B \-\-is\-bridge
+Run as unlisted bridge relay (not published in consensus).
+.TP
+.B \-\-bridge\-transport \fItype\fR
+Bridge transport: scramble, shade, mirage (default: scramble).
+.TP
+.B \-\-mix\-delay \fIms\fR
+Poisson mixing delay in milliseconds (0 = disabled).
+.TP
+.B \-\-pow\-difficulty \fIn\fR
+Argon2id PoW difficulty for relay registration (default: 8).
+.TP
+.B \-\-pow\-memlimit \fIKB\fR
+Argon2id memory limit (default: 256).
+.SH DA OPTIONS
+.TP
+.B \-\-dir\-port \fIport\fR
+Directory service port (default: 9030).
+.TP
+.B \-\-da\-peers \fIlist\fR
+Peer DAs: ip:port or ip:port:hex_identity_pk, comma-separated.
+.SH HS OPTIONS
+Hidden services require a config file:
+.PP
+.RS
+.nf
+Mode hs
+DAAddress 107.174.70.38
+DAPort 9030
+HiddenServiceDir /path/to/keys
+HiddenServicePort 8080
+.fi
+.RE
+.PP
+The .moor address is printed on first run and derived from the service key.
+.SH TRANSPARENT PROXY OPTIONS
+.TP
+.B \-\-TransPort \fIport\fR
+Transparent TCP proxy port (redirect traffic without SOCKS).
+.TP
+.B \-\-DNSPort \fIport\fR
+Transparent DNS port (resolve through the network).
+.SH ADVANCED OPTIONS
+.TP
+.B \-f, \-\-config \fIfile\fR
+Load configuration from file. See moorrc.sample for all options.
+.TP
+.B \-\-control\-port \fIport\fR
+Tor-compatible control port for monitoring (0 = disabled).
+.TP
+.B \-\-monitor
+Enable runtime statistics logging.
+.TP
+.B \-\-daemon
+Fork to background.
+.TP
+.B \-\-pid\-file \fIpath\fR
+Write PID file (implies --daemon).
+.TP
+.B \-v
+Verbose logging.
+.SH RELAY TYPES
+With no role flags, a relay is a general-purpose relay. The directory authority
+assigns Guard/Exit based on performance metrics. Under 20 relays in the network,
+self-declared flags are trusted immediately. Over 20:
+.PP
+.RS
+.B Fast
+\- bandwidth >= 12.5th percentile
+.br
+.B Stable
+\- uptime >= median
+.br
+.B Guard
+\- Fast + Stable + bandwidth + 8 days uptime
+.br
+.B HSDir
+\- Fast + Stable + 96 hours uptime
+.br
+.B Exit
+\- always self-declared (--exit flag)
+.RE
+.PP
+Nobody accidentally becomes an exit relay. Exit is always opt-in.
+.SH CRYPTO
+All key exchanges use X25519 + Kyber768 (ML-KEM-768) hybrid.
+Consensus is dual-signed with Ed25519 + ML-DSA-65 (Dilithium3).
+Link handshakes use Noise_IK with BLAKE2b and ChaCha20-Poly1305.
+Post-quantum is mandatory and cannot be disabled.
+.SH EXAMPLES
+.TP
+Run as client:
+.B moor
+.TP
+Browse via MOOR:
+.B curl -x socks5h://127.0.0.1:9050 http://example.com
+.TP
+Run a middle relay:
+.B moor --mode relay --advertise 1.2.3.4 --nickname MyRelay -v
+.TP
+Run an exit relay:
+.B moor --mode relay --exit --advertise 1.2.3.4 --nickname MyExit -v
+.TP
+Run a guard relay:
+.B moor --mode relay --guard --advertise 1.2.3.4 --nickname MyGuard -v
+.TP
+Run DA with trusted peer:
+.B moor --mode da --da-peers 1.2.3.4:9030:abcdef...
+.TP
+Run via bridge:
+.B moor --use-bridges --bridge "scramble 1.2.3.4:443 abcdef..."
+.TP
+Easy relay setup:
+.B curl -sL https://raw.githubusercontent.com/0xdeadbeefnetwork/MOOR_PQ/main/setup.sh | sudo bash
+.SH FILES
+.TP
+.I ~/.moor/
+Default data directory (guards, consensus cache, keys).
+.TP
+.I moorrc.sample
+Example configuration file with all options documented.
+.TP
+.I /etc/moor/moor.conf
+System-wide configuration (created by setup.sh).
+.SH SEE ALSO
+Full documentation: https://moor.afflicted.sh/docs.html
+.PP
+GitHub: https://github.com/0xdeadbeefnetwork/MOOR_PQ
+.SH AUTHOR
+MOOR project.

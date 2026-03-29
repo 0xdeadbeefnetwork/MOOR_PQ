@@ -1,0 +1,2418 @@
+#include "moor/moor.h"
+#include "moor/transport.h"
+#include "moor/transport_shade.h"
+#include "moor/transport_mirage.h"
+#include <sodium.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <signal.h>
+#include <errno.h>
+
+#ifndef MOOR_SYSCONFDIR
+#define MOOR_SYSCONFDIR "/usr/local/etc/moor"
+#endif
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#define close closesocket
+#define MSG_NOSIGNAL 0
+#else
+#include <unistd.h>
+#include <sys/utsname.h>
+#include <pthread.h>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/prctl.h>
+#include <poll.h>
+#endif
+
+/* Global state */
+extern moor_config_t g_config;
+static moor_mode_t g_mode = MOOR_MODE_CLIENT;
+static char g_bind_addr[64] = "127.0.0.1";
+static uint16_t g_or_port = MOOR_DEFAULT_OR_PORT;
+static uint16_t g_dir_port = MOOR_DEFAULT_DIR_PORT;
+static uint16_t g_socks_port = MOOR_DEFAULT_SOCKS_PORT;
+static char g_da_address[64] = "107.174.70.38";
+static uint16_t g_da_port = MOOR_DEFAULT_DIR_PORT;
+static moor_da_entry_t g_da_list[9];
+static int g_num_das = 0;
+static char g_hs_dir[256] = "./hs_keys";
+static uint16_t g_hs_local_port = 8080;
+static char g_advertise_addr[64] = "";
+static uint32_t g_relay_flags = NODE_FLAG_RUNNING | NODE_FLAG_STABLE;
+static uint64_t g_bandwidth = 1000000; /* 1 MB/s default */
+static char g_data_dir[256] = "";
+static char g_da_peers[512] = "";  /* comma-separated "ip:port,ip:port,..." */
+static int g_padding = 0;
+static int g_verbose = 0;
+static int g_is_bridge = 0;
+static int g_use_bridges = 0;
+static char g_bridge_transport[32] = "scramble";
+/* PQ hybrid is always enabled -- no toggle needed */
+static int g_pow_difficulty = 0;
+static char g_geoip_file[256] = "";
+static char g_geoip6_file[256] = "";
+static int g_padding_mode = 0;
+static int g_conflux = 0;
+static int g_conflux_legs = 2;
+static moor_geoip_db_t g_geoip_db;
+static uint16_t g_control_port = 0;
+static int g_monitor = 0;
+
+static uint8_t g_identity_pk[32] = {0};
+static uint8_t g_identity_sk[64] = {0};
+static uint8_t g_onion_pk[32] = {0};
+static uint8_t g_onion_sk[32] = {0};
+static uint8_t g_pq_identity_pk[MOOR_MLDSA_PK_LEN] = {0};
+static uint8_t g_pq_identity_sk[MOOR_MLDSA_SK_LEN] = {0};
+
+/* Forward declarations */
+static void bw_event_timer_cb(void *arg);
+static void relay_dir_accept_cb(int fd, int events, void *arg);
+
+static void print_usage(const char *prog) {
+    fprintf(stderr,
+        "\033[36m"
+        "                 ███╗   ███╗ ██████╗  ██████╗ ██████╗ \n"
+        "                 ████╗ ████║██╔═══██╗██╔═══██╗██╔══██╗\n"
+        "                 ██╔████╔██║██║   ██║██║   ██║██████╔╝\n"
+        "                 ██║╚██╔╝██║██║   ██║██║   ██║██╔══██╗\n"
+        "                 ██║ ╚═╝ ██║╚██████╔╝╚██████╔╝██║  ██║\n"
+        "                 ╚═╝     ╚═╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝\n"
+        "\033[0m\n"
+        "  MOOR v%s -- My Own Onion Router -- PQ Secure Overlay Network\n"
+        "\n"
+        "Usage:\n"
+        "  %s -f <moorrc>                     Load configuration file\n"
+        "  %s [options]                        Override with command-line flags\n"
+        "\n"
+        "  With no arguments, MOOR starts as a SOCKS5 client on port %u.\n"
+        "  Most options should go in a config file (moorrc). See the man page\n"
+        "  or https://moor.afflicted.sh/docs.html for full documentation.\n"
+        "\n"
+        "Frequently used options:\n"
+        "  -f <file>             Configuration file (like torrc)\n"
+        "  --SocksPort <port>    SOCKS5 listen port (default: %u)\n"
+        "  --ORPort <port>       Onion Router port for relays\n"
+        "  --DirPort <port>      Directory port for DAs\n"
+        "  --ExitRelay 1         Run as exit relay\n"
+        "  --Nickname <name>     Relay nickname\n"
+        "  --DataDirectory <dir> Persistent state directory\n"
+        "  --BandwidthRate <bw>  Bandwidth in bytes/s\n"
+        "\n"
+        "  --mode <m>            client|relay|da|hs|ob (default: client)\n"
+        "  --guard               Set Guard flag on relay\n"
+        "  --exit                Set Exit flag on relay\n"
+        "  --advertise <addr>    Public IP to advertise\n"
+        "\n"
+        "Hidden services:\n"
+        "  --mode hs             Run hidden service\n"
+        "  --hs-port <port>      Local service port (default: 8080)\n"
+        "  --hs-dir <dir>        Key directory (default: ./hs_keys)\n"
+        "\n"
+        "Bridges:\n"
+        "  --UseBridges 1        Connect via bridge relays\n"
+        "  --Bridge <line>       \"transport addr:port fingerprint\"\n"
+        "  --is-bridge           Run as unlisted bridge relay\n"
+        "\n"
+        "Advanced:\n"
+        "  --conflux             Multi-path circuits\n"
+        "  --pir / --no-pir      PIR for HS lookups (default: on)\n"
+        "  --padding-machine <m> WTF-PAD: web|stream|generic|none\n"
+        "  --mix-delay <ms>      Poisson mixing delay (0=off)\n"
+        "  --pow-difficulty <n>  Relay admission PoW difficulty\n"
+        "  --control-port <port> Control port (Tor-compatible protocol)\n"
+        "  --daemon              Fork to background\n"
+        "  -v                    Verbose logging\n"
+        "  -h, --help            Show this help\n",
+        MOOR_VERSION_STRING,
+        prog, prog,
+        (unsigned)MOOR_DEFAULT_SOCKS_PORT,
+        (unsigned)MOOR_DEFAULT_SOCKS_PORT);
+}
+
+/* Apply moor_config_t into existing globals (CLI overrides already applied) */
+static void apply_config_to_globals(const moor_config_t *cfg) {
+    g_mode = (moor_mode_t)cfg->mode;
+    snprintf(g_bind_addr, sizeof(g_bind_addr), "%s", cfg->bind_addr);
+    snprintf(g_advertise_addr, sizeof(g_advertise_addr), "%s", cfg->advertise_addr);
+    g_or_port = cfg->or_port;
+    g_dir_port = cfg->dir_port;
+    g_socks_port = cfg->socks_port;
+    snprintf(g_da_address, sizeof(g_da_address), "%s", cfg->da_address);
+    g_da_port = cfg->da_port;
+    /* Copy multi-DA list; keep g_da_address/g_da_port as da_list[0] for compat */
+    g_num_das = cfg->num_das;
+    for (int i = 0; i < cfg->num_das && i < 9; i++)
+        g_da_list[i] = cfg->da_list[i];
+    snprintf(g_data_dir, sizeof(g_data_dir), "%s", cfg->data_dir);
+    snprintf(g_da_peers, sizeof(g_da_peers), "%s", cfg->da_peers);
+    g_bandwidth = cfg->bandwidth;
+    g_relay_flags = NODE_FLAG_RUNNING | NODE_FLAG_STABLE;
+    if (cfg->guard) g_relay_flags |= NODE_FLAG_GUARD;
+    if (cfg->exit) g_relay_flags |= NODE_FLAG_EXIT;
+    if (cfg->middle_only) g_relay_flags |= NODE_FLAG_MIDDLEONLY;
+    g_padding = cfg->padding;
+    g_verbose = cfg->verbose;
+    g_is_bridge = cfg->is_bridge;
+    g_use_bridges = cfg->use_bridges;
+    /* PQ hybrid always enabled -- cfg->pq_hybrid ignored */
+    g_pow_difficulty = cfg->pow_difficulty;
+    snprintf(g_geoip_file, sizeof(g_geoip_file), "%s", cfg->geoip_file);
+    snprintf(g_geoip6_file, sizeof(g_geoip6_file), "%s", cfg->geoip6_file);
+    g_padding_mode = cfg->padding_mode;
+    g_conflux = cfg->conflux;
+    g_conflux_legs = cfg->conflux_legs > 0 ? cfg->conflux_legs : 2;
+    g_control_port = cfg->control_port;
+    g_monitor = cfg->monitor;
+
+    /* HS: use first hidden service entry if available, or keep defaults */
+    if (cfg->num_hidden_services > 0) {
+        snprintf(g_hs_dir, sizeof(g_hs_dir), "%s", cfg->hidden_services[0].hs_dir);
+        g_hs_local_port = cfg->hidden_services[0].local_port;
+    }
+}
+
+/* Parse CLI args directly into the config struct (overriding file values) */
+static void parse_args_into_config(moor_config_t *cfg, int argc, char **argv) {
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--config") == 0 || strcmp(argv[i], "-f") == 0) {
+            if (i + 1 < argc) i++; /* skip -- already handled before this function */
+        }
+        /* Tor-compatible aliases: --SocksPort, --ORPort, --ExitRelay, etc. */
+        else if (strcmp(argv[i], "--SocksPort") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "SocksPort", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--ORPort") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "ORPort", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--DirPort") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "DirPort", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--ExitRelay") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "Exit", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--Nickname") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "Nickname", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--DataDirectory") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "DataDir", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--BandwidthRate") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "Bandwidth", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--UseBridges") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "UseBridges", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--Bridge") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "Bridge", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--ContactInfo") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "ContactInfo", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "Mode", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--bind") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "BindAddress", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--or-port") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "ORPort", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--advertise") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "AdvertiseAddress", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--dir-port") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "DirPort", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--socks-port") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "SocksPort", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--da-address") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "DAAddress", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--da-port") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "DAPort", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--hs-dir") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "HiddenServiceDir", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--hs-port") == 0 && i + 1 < argc) {
+            const char *val = argv[++i];
+            if (moor_config_set(cfg, "HiddenServicePort", val) != 0) {
+                /* No HiddenServiceDir yet — set legacy global directly (#186) */
+                int p = atoi(val);
+                if (p > 0 && p <= 65535)
+                    g_hs_local_port = (uint16_t)p;
+            }
+        }
+        else if (strcmp(argv[i], "--guard") == 0) {
+            moor_config_set(cfg, "Guard", "1");
+        }
+        else if (strcmp(argv[i], "--exit") == 0) {
+            moor_config_set(cfg, "Exit", "1");
+        }
+        else if (strcmp(argv[i], "--middle-only") == 0) {
+            moor_config_set(cfg, "MiddleOnly", "1");
+        }
+        else if (strcmp(argv[i], "--bandwidth") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "Bandwidth", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--data-dir") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "DataDir", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--da-peers") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "DAPeers", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--padding") == 0) {
+            moor_config_set(cfg, "Padding", "1");
+        }
+        else if (strcmp(argv[i], "--is-bridge") == 0) {
+            moor_config_set(cfg, "IsBridge", "1");
+        }
+        else if (strcmp(argv[i], "--use-bridges") == 0) {
+            moor_config_set(cfg, "UseBridges", "1");
+        }
+        else if (strcmp(argv[i], "--bridge") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "Bridge", argv[++i]);
+            moor_config_set(cfg, "UseBridges", "1");
+        }
+        else if (strcmp(argv[i], "--bridge-transport") == 0 && i + 1 < argc) {
+            snprintf(g_bridge_transport, sizeof(g_bridge_transport), "%s", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--pq-hybrid") == 0) {
+            /* PQ hybrid is always enabled -- flag accepted for compat but ignored */
+        }
+        else if (strcmp(argv[i], "--pow-difficulty") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "PowDifficulty", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--pow-memlimit") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "PowMemLimit", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--nickname") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "Nickname", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--geoip") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "GeoIPFile", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--geoip6") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "GeoIPv6File", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--padding-mode") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "PaddingMode", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--conflux") == 0) {
+            moor_config_set(cfg, "Conflux", "1");
+        }
+        else if (strcmp(argv[i], "--conflux-legs") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "ConfluxLegs", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--control-port") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "ControlPort", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--monitor") == 0) {
+            moor_config_set(cfg, "Monitor", "1");
+        }
+        else if (strcmp(argv[i], "--mix-delay") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "MixDelay", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--padding-machine") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "PaddingMachine", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--pir") == 0) {
+            moor_config_set(cfg, "PIR", "1");
+        }
+        else if (strcmp(argv[i], "--no-pir") == 0) {
+            moor_config_set(cfg, "PIR", "0");
+        }
+        else if (strcmp(argv[i], "--TransPort") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "TransPort", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--DNSPort") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "DNSPort", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--EntryNode") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "EntryNode", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--daemon") == 0) {
+            moor_config_set(cfg, "Daemon", "1");
+        }
+        else if (strcmp(argv[i], "--pid-file") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "PidFile", argv[++i]);
+            moor_config_set(cfg, "Daemon", "1");
+        }
+        else if (strcmp(argv[i], "-v") == 0) {
+            moor_config_set(cfg, "Verbose", "1");
+        }
+        else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            print_usage(argv[0]);
+            exit(0);
+        }
+        else {
+            fprintf(stderr, "unknown option: %s\n", argv[i]);
+            print_usage(argv[0]);
+            exit(1);
+        }
+    }
+}
+
+/* DA event callback */
+static moor_da_config_t g_da_config;
+
+static void da_accept_cb(int fd, int events, void *arg) {
+    (void)events;
+    (void)arg;
+    struct sockaddr_storage peer;
+    socklen_t plen = sizeof(peer);
+    int client_fd = accept(fd, (struct sockaddr *)&peer, &plen);
+    if (client_fd < 0) return;
+    /* Set recv timeout to prevent slowloris blocking the event loop (#191) */
+    moor_setsockopt_timeo(client_fd, SO_RCVTIMEO, 5);
+    moor_setsockopt_timeo(client_fd, SO_SNDTIMEO, 5);
+    moor_da_handle_request(client_fd, &g_da_config);
+    close(client_fd);
+}
+
+static void da_consensus_timer_cb(void *arg) {
+    (void)arg;
+    moor_da_build_consensus(&g_da_config);
+    moor_da_exchange_votes(&g_da_config);
+}
+
+/* Periodic DA-to-DA relay sync (every 5 min) */
+static void da_sync_timer_cb(void *arg) {
+    (void)arg;
+    moor_da_sync_relays(&g_da_config);
+}
+
+/* Periodic relay liveness probe (every 15 min) */
+static void da_probe_timer_cb(void *arg) {
+    (void)arg;
+    int dead = moor_da_probe_relays(&g_da_config);
+    if (dead > 0) {
+        moor_da_build_consensus(&g_da_config);
+        moor_da_exchange_votes(&g_da_config);
+    }
+}
+
+/* Relay event callbacks */
+static moor_relay_config_t g_relay_cfg;
+static int g_relay_listen_fd = -1;
+
+static void relay_read_cb(int fd, int events, void *arg) {
+    (void)fd;
+    moor_connection_t *conn = (moor_connection_t *)arg;
+
+    /* Handle write-readiness: flush output queue */
+    if (events & MOOR_EVENT_WRITE) {
+        moor_queue_flush(&conn->outq, conn, &conn->write_off);
+        if (moor_queue_is_empty(&conn->outq))
+            moor_event_modify(conn->fd, MOOR_EVENT_READ);
+    }
+
+    /* Handle read-readiness: process incoming cells.
+     * Limit batch size to prevent starvation — transport connections
+     * (e.g. scramble) can deliver a continuous stream of padding cells
+     * that would block the event loop from servicing other fds. */
+    if (events & MOOR_EVENT_READ) {
+        moor_cell_t cell;
+        int ret = 0;
+        int count = 0;
+        while (count < 64 && (ret = moor_connection_recv_cell(conn, &cell)) == 1) {
+            moor_relay_process_cell(conn, &cell);
+            count++;
+        }
+        if (ret < 0) {
+            moor_event_remove(conn->fd);
+            moor_circuit_teardown_for_conn(conn);
+            moor_connection_close(conn);
+        }
+    }
+}
+
+static moor_scramble_server_params_t g_scramble_server_params;
+static moor_shade_server_params_t g_shade_server_params;
+static moor_mirage_server_params_t g_mirage_server_params;
+
+static void relay_accept_cb(int fd, int events, void *arg) {
+    (void)events;
+    (void)arg;
+
+    /* Accept raw fd first to detect BW_TEST before link handshake */
+    struct sockaddr_storage peer;
+    socklen_t plen = sizeof(peer);
+    int client_fd = accept(fd, (struct sockaddr *)&peer, &plen);
+    if (client_fd < 0) return;
+
+    /* Rate limit: check connection rate for peer IP */
+    char peer_ip[INET6_ADDRSTRLEN];
+    if (peer.ss_family == AF_INET6) {
+        struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&peer;
+        inet_ntop(AF_INET6, &a6->sin6_addr, peer_ip, sizeof(peer_ip));
+    } else {
+        struct sockaddr_in *a4 = (struct sockaddr_in *)&peer;
+        inet_ntop(AF_INET, &a4->sin_addr, peer_ip, sizeof(peer_ip));
+    }
+    if (!moor_ratelimit_check(peer_ip, MOOR_RL_CONN)) {
+        LOG_WARN("rate limit: rejected connection from %s", peer_ip);
+        close(client_fd);
+        return;
+    }
+
+    /* Peek at first bytes to detect bandwidth test / DA probe.
+     * Use a short poll to wait for data arrival (the peer sends
+     * immediately after connect, but the kernel may not have
+     * delivered it by the time we accept). */
+    moor_set_nonblocking(client_fd);
+    char peek[8];
+    ssize_t pn = recv(client_fd, peek, 8, MSG_PEEK);
+    if (pn <= 0) {
+        /* Data not yet available — wait up to 50ms */
+        struct pollfd pfd = { .fd = client_fd, .events = POLLIN };
+        if (poll(&pfd, 1, 50) > 0)
+            pn = recv(client_fd, peek, 8, MSG_PEEK);
+    }
+    if (pn == 8 && memcmp(peek, "BW_TEST\n", 8) == 0) {
+        /* Restore blocking mode for BW_TEST echo handler */
+#ifndef _WIN32
+        int bwflags = fcntl(client_fd, F_GETFL, 0);
+        if (bwflags >= 0) fcntl(client_fd, F_SETFL, bwflags & ~O_NONBLOCK);
+#endif
+        /* Consume the header and handle bandwidth test */
+        recv(client_fd, peek, 8, 0);
+        moor_bw_auth_handle_test(client_fd);
+        close(client_fd);
+        return;
+    }
+    if (pn >= 6 && memcmp(peek, "PROBE\n", 6) == 0) {
+        /* DA liveness probe — consume and reply */
+        recv(client_fd, peek, 6, 0);
+        send(client_fd, "ALIVE\n", 6, MSG_NOSIGNAL);
+        close(client_fd);
+        return;
+    }
+
+    /* Restore blocking mode for link handshake (PQ hybrid needs blocking recv) */
+    {
+#ifdef _WIN32
+        u_long mode = 0;
+        ioctlsocket(client_fd, FIONBIO, &mode);
+#else
+        int flags = fcntl(client_fd, F_GETFL, 0);
+        if (flags >= 0) fcntl(client_fd, F_SETFL, flags & ~O_NONBLOCK);
+#endif
+    }
+
+    /* Set handshake timeout to prevent slowloris blocking event loop */
+    moor_setsockopt_timeo(client_fd, SO_RCVTIMEO, MOOR_HANDSHAKE_TIMEOUT);
+    moor_setsockopt_timeo(client_fd, SO_SNDTIMEO, MOOR_HANDSHAKE_TIMEOUT);
+
+    moor_connection_t *conn = moor_connection_alloc();
+    if (!conn) { close(client_fd); return; }
+
+    const moor_transport_t *transport = NULL;
+    const void *transport_params = NULL;
+    if (g_is_bridge) {
+        transport = moor_transport_find(g_bridge_transport);
+        if (strcmp(g_bridge_transport, "scramble") == 0)
+            transport_params = &g_scramble_server_params;
+        else if (strcmp(g_bridge_transport, "shade") == 0)
+            transport_params = &g_shade_server_params;
+        else if (strcmp(g_bridge_transport, "mirage") == 0)
+            transport_params = &g_mirage_server_params;
+    }
+
+    LOG_DEBUG("relay_accept: starting handshake with %s (fd=%d)", peer_ip, client_fd);
+    if (moor_connection_accept_fd(conn, client_fd, g_identity_pk, g_identity_sk,
+                                   transport, transport_params) != 0) {
+        LOG_DEBUG("relay_accept: handshake FAILED with %s", peer_ip);
+        moor_connection_free(conn);
+        return;
+    }
+    LOG_DEBUG("relay_accept: handshake OK with %s (fd=%d)", peer_ip, client_fd);
+    moor_event_add(conn->fd, MOOR_EVENT_READ, relay_read_cb, conn);
+}
+
+static void relay_dir_accept_cb(int fd, int events, void *arg) {
+    (void)events;
+    (void)arg;
+    struct sockaddr_storage peer;
+    socklen_t plen = sizeof(peer);
+    int client_fd = accept(fd, (struct sockaddr *)&peer, &plen);
+    if (client_fd < 0) return;
+    /* Set recv timeout to prevent slowloris blocking the event loop (#191) */
+    moor_setsockopt_timeo(client_fd, SO_RCVTIMEO, 5);
+    moor_setsockopt_timeo(client_fd, SO_SNDTIMEO, 5);
+    moor_relay_dir_handle_request(client_fd);
+    close(client_fd);
+}
+
+static void relay_periodic_cb(void *arg) {
+    (void)arg;
+    /* Sample observed bandwidth before re-registration so the descriptor
+     * advertises min(configured, observed) — Tor-aligned. */
+    moor_monitor_sample_observed_bw();
+    moor_stats_t *stats = moor_monitor_stats();
+    if (stats->observed_bw > 0 && stats->observed_bw < g_relay_cfg.bandwidth) {
+        g_relay_cfg.bandwidth = stats->observed_bw;
+        g_bandwidth = stats->observed_bw;
+    }
+    moor_relay_periodic();
+}
+
+/* One-shot relay self-test after listener starts.
+ * Runs in a separate thread because the self-test does a blocking TCP
+ * connect + Noise_IK handshake to our own OR port -- if we ran this in
+ * the event loop callback, the loop would be blocked and unable to
+ * accept/process our own incoming connection (deadlock). */
+static void *relay_selftest_thread(void *arg) {
+    (void)arg;
+    if (moor_relay_self_test(&g_relay_cfg) != 0)
+        return NULL;
+
+    /* Auto bandwidth test: measure our own throughput via BW_TEST
+     * against our public OR port, then re-register with the result.
+     * Cap at 50 MB/s since self-tests via loopback overestimate. */
+    const char *addr = g_relay_cfg.advertise_addr[0] ?
+                       g_relay_cfg.advertise_addr : g_relay_cfg.bind_addr;
+    moor_bw_measurement_t bw = {0};
+    bw.self_reported_bw = g_relay_cfg.bandwidth;
+    if (moor_bw_auth_measure(&bw, addr, g_relay_cfg.or_port, 512 * 1024) == 0 &&
+        bw.measured_bw > 0) {
+        uint64_t capped = bw.measured_bw;
+        if (capped > 50 * 1024 * 1024)
+            capped = 50 * 1024 * 1024;  /* 50 MB/s cap for self-tests */
+        g_relay_cfg.bandwidth = capped;
+        g_bandwidth = capped;
+        LOG_INFO("auto-bandwidth: measured %llu bytes/sec (advertised %llu)",
+                 (unsigned long long)bw.measured_bw,
+                 (unsigned long long)capped);
+        /* Re-register with updated bandwidth */
+        if (!g_is_bridge)
+            moor_relay_register(&g_relay_cfg);
+    } else {
+        LOG_WARN("auto-bandwidth: self-test failed, using default %llu bytes/sec",
+                 (unsigned long long)g_relay_cfg.bandwidth);
+    }
+    return NULL;
+}
+
+static int g_selftest_timer_id = -1;
+
+static void relay_selftest_timer_cb(void *arg) {
+    (void)arg;
+    /* One-shot: remove the timer so it doesn't fire again */
+    if (g_selftest_timer_id >= 0) {
+        moor_event_remove_timer(g_selftest_timer_id);
+        g_selftest_timer_id = -1;
+    }
+    pthread_t t;
+    if (pthread_create(&t, NULL, relay_selftest_thread, NULL) == 0)
+        pthread_detach(t);
+}
+
+/* One-shot consensus re-fetch after startup (#183) */
+static int g_relay_consensus_retry_id = -1;
+
+static void relay_consensus_retry_cb(void *arg) {
+    (void)arg;
+    moor_consensus_t fresh = {0};
+    if (moor_client_fetch_consensus_multi(&fresh, g_da_list, g_num_das) == 0) {
+        moor_relay_set_consensus(&fresh);
+        LOG_INFO("relay: refreshed consensus (%u relays)", fresh.num_relays);
+
+        /* If DA has 0 relays (just restarted), re-register immediately
+         * so we don't wait up to 30 min to reappear in consensus. */
+        if (fresh.num_relays == 0 && !g_is_bridge) {
+            LOG_INFO("relay: DA has empty consensus, re-registering");
+            moor_relay_register(&g_relay_cfg);
+        }
+
+        /* First successful fetch — switch from 15s bootstrap retry
+         * to normal consensus refresh interval (Tor-aligned: half the
+         * consensus interval, i.e. 30 minutes). */
+        if (g_relay_consensus_retry_id >= 0) {
+            moor_event_set_timer_interval(g_relay_consensus_retry_id,
+                                           MOOR_CONSENSUS_INTERVAL * 1000 / 2);
+        }
+    }
+}
+
+/* Network liveness check (every 10s) */
+static void liveness_timer_cb(void *arg) {
+    (void)arg;
+    moor_liveness_check();
+}
+
+/* Bandwidth accounting / hibernation (Tor-aligned).
+ * Track total bytes per accounting period. When AccountingMax reached,
+ * stop accepting new circuits ("soft hibernation"). */
+static uint64_t g_accounting_bytes = 0;
+static uint64_t g_accounting_period_start = 0;
+static int g_hibernating = 0;
+
+static void accounting_timer_cb(void *arg) {
+    (void)arg;
+    if (g_config.accounting_max == 0) return;
+
+    moor_stats_t *stats = moor_monitor_stats();
+    uint64_t total = stats->bytes_sent + stats->bytes_recv;
+    uint64_t now = (uint64_t)time(NULL);
+
+    /* Reset period */
+    uint64_t period = g_config.accounting_period_sec > 0 ?
+                      g_config.accounting_period_sec : 86400;
+    if (now - g_accounting_period_start >= period) {
+        g_accounting_period_start = now;
+        g_accounting_bytes = total;
+        if (g_hibernating) {
+            g_hibernating = 0;
+            LOG_INFO("accounting: new period started, resuming");
+        }
+        return;
+    }
+
+    uint64_t used = total - g_accounting_bytes;
+    if (!g_hibernating && used >= g_config.accounting_max) {
+        g_hibernating = 1;
+        LOG_WARN("accounting: limit reached (%llu bytes), entering soft hibernation",
+                 (unsigned long long)g_config.accounting_max);
+    }
+}
+
+int moor_is_hibernating(void) { return g_hibernating; }
+
+/* Observed bandwidth sampler (every 10s, Tor-aligned) */
+static void observed_bw_timer_cb(void *arg) {
+    (void)arg;
+    moor_monitor_sample_observed_bw();
+}
+
+/* Rate limit refill timer: refill token buckets every 6 seconds */
+static void ratelimit_refill_cb(void *arg) {
+    (void)arg;
+    moor_ratelimit_refill();
+    /* Timer is recurring -- fire_timers() resets next_fire automatically */
+}
+
+/* Circuit timeout timer: destroy stale/incomplete circuits */
+static void circuit_timeout_cb(void *arg) {
+    (void)arg;
+    moor_circuit_check_timeouts();
+}
+
+/* Path bias timer: check guard circuit success rates */
+static void pathbias_timer_cb(void *arg) {
+    (void)arg;
+    moor_pathbias_check_all(moor_pathbias_get_state());
+}
+
+/* Guard persistence timer: save state to disk */
+static void guard_save_timer_cb(void *arg) {
+    (void)arg;
+    if (g_data_dir[0])
+        moor_guard_save(moor_pathbias_get_state(), g_data_dir);
+}
+
+/* Monitor periodic stats timer */
+static void monitor_periodic_cb(void *arg) {
+    (void)arg;
+    moor_monitor_log_periodic();
+}
+
+/* Mix drain timer: fires every 1ms, sends all due cells from mix pool */
+static void mix_drain_timer_cb(void *arg) {
+    (void)arg;
+    moor_mix_drain();
+}
+
+/* WTF-PAD: active padding machine (NULL = use legacy padding_adv) */
+static const wfpad_machine_t *g_wfpad_machine = NULL;
+
+/* WTF-PAD tick: iterate all circuits, send CELL_PADDING where due */
+extern moor_circuit_t g_circuit_pool[];
+static void wfpad_tick_all(uint64_t now_ms) {
+    for (int i = 0; i < MOOR_MAX_CIRCUITS; i++) {
+        if (g_circuit_pool[i].circuit_id == 0) continue;
+        if (!g_circuit_pool[i].conn) continue;
+        if (g_circuit_pool[i].conn->state != CONN_STATE_OPEN) continue;
+
+        /* Lazy-init: assign randomized machine to circuits that don't have one yet.
+         * Per-circuit randomization makes the state machine unlearnable. */
+        if (!g_circuit_pool[i].wfpad_state.machine && g_wfpad_machine) {
+            moor_wfpad_init_circuit_randomized(&g_circuit_pool[i].wfpad_state, g_wfpad_machine);
+            g_circuit_pool[i].wfpad_state.next_pad_time_ms = now_ms + 100;
+        }
+
+        if (moor_wfpad_tick(&g_circuit_pool[i].wfpad_state, now_ms)) {
+            uint8_t pad_payload[509];
+            moor_crypto_random(pad_payload, 509);
+            if (moor_mix_enabled()) {
+                moor_mix_enqueue(g_circuit_pool[i].conn,
+                                 g_circuit_pool[i].circuit_id,
+                                 CELL_PADDING, pad_payload);
+            } else {
+                moor_cell_t cell;
+                memset(&cell, 0, sizeof(cell));
+                cell.circuit_id = g_circuit_pool[i].circuit_id;
+                cell.command = CELL_PADDING;
+                memcpy(cell.payload, pad_payload, 509);
+                moor_connection_send_cell(g_circuit_pool[i].conn, &cell);
+            }
+        }
+    }
+}
+
+/* Padding timer: fires at random intervals, sends CELL_PADDING on all circuits */
+static int g_padding_timer_id = -1;
+static void padding_timer_cb(void *arg) {
+    (void)arg;
+    if (g_wfpad_machine) {
+        wfpad_tick_all(moor_time_ms());
+    } else {
+        moor_padding_send_all();
+    }
+    /* Update interval for next fire (variable random interval) */
+    if (g_padding_timer_id >= 0)
+        moor_event_set_timer_interval(g_padding_timer_id,
+                                       g_wfpad_machine ? 5 :
+                                       moor_padding_next_interval());
+}
+
+/* Dormant mode: client goes quiet after no SOCKS5 activity */
+#define MOOR_DORMANT_TIMEOUT_MS    (5 * 60 * 1000)       /* 5 minutes */
+#define MOOR_DORMANT_CONSENSUS_MS  (4 * 3600 * 1000)     /* 4 hours */
+static int g_dormant = 0;
+static uint64_t g_last_socks_activity_ms = 0;
+static int g_consensus_timer_id = -1;
+
+static void consensus_refresh_cb(void *arg);
+
+static void dormant_check_cb(void *arg) {
+    (void)arg;
+    if (g_mode != MOOR_MODE_CLIENT || g_dormant) return;
+    uint64_t now = moor_time_ms();
+    if (g_last_socks_activity_ms > 0 &&
+        (now - g_last_socks_activity_ms) > MOOR_DORMANT_TIMEOUT_MS) {
+        g_dormant = 1;
+        /* Stop padding to save bandwidth */
+        if (g_padding_timer_id >= 0) {
+            moor_event_remove_timer(g_padding_timer_id);
+            g_padding_timer_id = -1;
+        }
+        /* Slow down consensus refresh */
+        if (g_consensus_timer_id >= 0)
+            moor_event_set_timer_interval(g_consensus_timer_id,
+                                           MOOR_DORMANT_CONSENSUS_MS);
+        LOG_INFO("dormant: no SOCKS5 activity for 5min, reducing activity");
+    }
+}
+
+static void dormant_wake(void) {
+    if (!g_dormant) return;
+    g_dormant = 0;
+    LOG_INFO("dormant: waking up (SOCKS5 connection)");
+    /* Restart padding */
+    if (g_padding_timer_id < 0)
+        g_padding_timer_id = moor_event_add_timer(
+            g_wfpad_machine ? 5 : moor_padding_next_interval(),
+            padding_timer_cb, NULL);
+    /* Restore consensus refresh interval */
+    if (g_consensus_timer_id >= 0)
+        moor_event_set_timer_interval(g_consensus_timer_id,
+                                       MOOR_CONSENSUS_INTERVAL * 1000);
+    /* Trigger immediate consensus refresh */
+    consensus_refresh_cb(NULL);
+}
+
+/* SOCKS5 client event callbacks */
+static int g_socks_listen_fd = -1;
+
+static void socks_accept_cb(int fd, int events, void *arg) {
+    (void)events;
+    (void)arg;
+    g_last_socks_activity_ms = moor_time_ms();
+    if (g_dormant) dormant_wake();
+    moor_socks5_accept(fd);
+}
+
+static int run_da(void) {
+    memset(&g_da_config, 0, sizeof(g_da_config));
+    memcpy(g_da_config.identity_pk, g_identity_pk, 32);
+    memcpy(g_da_config.identity_sk, g_identity_sk, 64);
+    memcpy(g_da_config.pq_identity_pk, g_pq_identity_pk, MOOR_MLDSA_PK_LEN);
+    memcpy(g_da_config.pq_identity_sk, g_pq_identity_sk, MOOR_MLDSA_SK_LEN);
+    g_da_config.dir_port = g_dir_port;
+    snprintf(g_da_config.bind_addr, sizeof(g_da_config.bind_addr), "%s", g_bind_addr);
+
+    /* Parse DA peers for vote exchange */
+    g_da_config.num_peers = 0;
+    /* Parse DA peers: "ip:port:hex_identity_pk,ip:port:hex_identity_pk,..."
+     * The identity_pk (64 hex chars = 32 bytes) is required for vote trust. */
+    if (g_da_peers[0]) {
+        char peers_copy[512];
+        strncpy(peers_copy, g_da_peers, sizeof(peers_copy) - 1);
+        peers_copy[sizeof(peers_copy) - 1] = '\0';
+        char *saveptr = NULL;
+        char *token = strtok_r(peers_copy, ",", &saveptr);
+        while (token && g_da_config.num_peers < 8) {
+            /* Parse: addr:port or addr:port:hex_pk */
+            char addr[64] = {0};
+            int port_val = 0;
+            char hex_pk[128] = {0};
+
+            /* Find first colon (after address) */
+            char *c1 = strchr(token, ':');
+            if (!c1) { token = strtok_r(NULL, ",", &saveptr); continue; }
+            size_t addr_len = (size_t)(c1 - token);
+            if (addr_len >= sizeof(addr)) addr_len = sizeof(addr) - 1;
+            memcpy(addr, token, addr_len);
+
+            /* Parse port */
+            char *c2 = strchr(c1 + 1, ':');
+            if (c2) {
+                /* addr:port:hex_pk format */
+                char port_str[8] = {0};
+                size_t plen = (size_t)(c2 - c1 - 1);
+                if (plen >= sizeof(port_str)) plen = sizeof(port_str) - 1;
+                memcpy(port_str, c1 + 1, plen);
+                port_val = atoi(port_str);
+                snprintf(hex_pk, sizeof(hex_pk), "%s", c2 + 1);
+            } else {
+                /* addr:port format (no identity key) */
+                port_val = atoi(c1 + 1);
+            }
+
+            if (port_val < 1 || port_val > 65535) {
+                LOG_WARN("DA peer: invalid port in '%s', skipping", token);
+                token = strtok_r(NULL, ",", &saveptr);
+                continue;
+            }
+
+            int idx = g_da_config.num_peers;
+            snprintf(g_da_config.peers[idx].address,
+                     sizeof(g_da_config.peers[idx].address), "%s", addr);
+            g_da_config.peers[idx].port = (uint16_t)port_val;
+
+            /* Decode hex identity_pk if provided */
+            if (hex_pk[0] && strlen(hex_pk) == 64) {
+                sodium_hex2bin(g_da_config.peers[idx].identity_pk, 32,
+                               hex_pk, 64, NULL, NULL, NULL);
+                LOG_INFO("DA peer %d: %s:%d pk=%.8s...",
+                         idx, addr, port_val, hex_pk);
+            } else if (hex_pk[0]) {
+                LOG_WARN("DA peer %d: bad identity key length (%zu hex chars, need 64)",
+                         idx, strlen(hex_pk));
+            } else {
+                LOG_WARN("DA peer %d: %s:%d (no identity key — votes will be rejected)",
+                         idx, addr, port_val);
+            }
+            g_da_config.num_peers++;
+            token = strtok_r(NULL, ",", &saveptr);
+        }
+        LOG_INFO("DA: %d peer DAs configured for vote exchange",
+                 g_da_config.num_peers);
+    }
+
+    /* Fill in missing peer identity keys from hardcoded DA list.
+     * Like Tor: DA keys are compiled into the binary so vote trust
+     * works without manual key exchange. */
+    for (int p = 0; p < g_da_config.num_peers; p++) {
+        static const uint8_t zero[32] = {0};
+        if (sodium_memcmp(g_da_config.peers[p].identity_pk, zero, 32) == 0) {
+            /* Try to match by address against hardcoded da_list */
+            for (int d = 0; d < g_config.num_das; d++) {
+                if (strcmp(g_da_config.peers[p].address,
+                           g_config.da_list[d].address) == 0 &&
+                    g_da_config.peers[p].port == g_config.da_list[d].port &&
+                    sodium_memcmp(g_config.da_list[d].identity_pk, zero, 32) != 0) {
+                    memcpy(g_da_config.peers[p].identity_pk,
+                           g_config.da_list[d].identity_pk, 32);
+                    LOG_INFO("DA peer %d: auto-filled identity key from hardcoded DA list", p);
+                    break;
+                }
+            }
+        }
+    }
+
+    g_da_config.pow_difficulty = g_pow_difficulty;
+
+    moor_da_init(&g_da_config);
+
+    /* Print our identity fingerprint so operators can configure peers */
+    {
+        char hex_id[65];
+        sodium_bin2hex(hex_id, sizeof(hex_id), g_da_config.identity_pk, 32);
+        LOG_INFO("DA identity fingerprint: %s", hex_id);
+        LOG_INFO("DA: configure peers with: --da-peers <peer_ip>:<peer_port>:%s", hex_id);
+    }
+
+    /* Bootstrap: import relays from a peer DA's existing consensus.
+     * This lets a new DA start with the same relay set as existing DAs
+     * rather than waiting for relays to re-register. */
+    if (g_da_config.num_peers > 0) {
+        moor_consensus_t *peer_cons = calloc(1, sizeof(moor_consensus_t));
+        if (peer_cons) {
+            for (int p = 0; p < g_da_config.num_peers; p++) {
+                if (moor_client_fetch_consensus(peer_cons,
+                        g_da_config.peers[p].address,
+                        g_da_config.peers[p].port) == 0) {
+                    for (uint32_t i = 0; i < peer_cons->num_relays; i++)
+                        moor_da_add_relay(&g_da_config, &peer_cons->relays[i]);
+                    LOG_INFO("DA: bootstrapped %u relays from peer %s:%u",
+                             peer_cons->num_relays,
+                             g_da_config.peers[p].address,
+                             g_da_config.peers[p].port);
+                    /* Learn peer identity_pk from consensus signatures */
+                    for (uint32_t s = 0; s < peer_cons->num_da_sigs; s++) {
+                        for (int q = 0; q < g_da_config.num_peers; q++) {
+                            if (sodium_is_zero(g_da_config.peers[q].identity_pk, 32)) {
+                                memcpy(g_da_config.peers[q].identity_pk,
+                                       peer_cons->da_sigs[s].identity_pk, 32);
+                                if (peer_cons->da_sigs[s].has_pq) {
+                                    memcpy(g_da_config.peers[q].pq_identity_pk,
+                                           peer_cons->da_sigs[s].pq_pk,
+                                           MOOR_MLDSA_PK_LEN);
+                                    g_da_config.peers[q].has_pq = 1;
+                                }
+                                LOG_INFO("DA: learned peer %d identity from consensus sig", q);
+                                break;
+                            }
+                        }
+                    }
+                    moor_consensus_cleanup(peer_cons);
+                    break; /* One successful bootstrap is enough */
+                }
+            }
+            free(peer_cons);
+        }
+    }
+
+    int listen_fd = moor_da_run(&g_da_config);
+    if (listen_fd < 0) return -1;
+
+    moor_event_add(listen_fd, MOOR_EVENT_READ, da_accept_cb, NULL);
+
+    /* Build initial consensus and exchange votes with peers */
+    moor_da_build_consensus(&g_da_config);
+    moor_da_exchange_votes(&g_da_config);
+
+    /* Timer to rebuild consensus periodically */
+    moor_event_add_timer(MOOR_CONSENSUS_INTERVAL * 1000,
+                         da_consensus_timer_cb, NULL);
+
+    /* DA-to-DA relay sync: every 5 minutes, pull relay lists from peers */
+    moor_event_add_timer(300 * 1000, da_sync_timer_cb, NULL);
+
+    /* Relay liveness probing: every 15 minutes, verify relays are reachable */
+    moor_event_add_timer(900 * 1000, da_probe_timer_cb, NULL);
+
+    LOG_INFO("directory authority running on %s:%u", g_bind_addr, g_dir_port);
+    return moor_event_loop();
+}
+
+static int run_relay(void) {
+    memset(&g_relay_cfg, 0, sizeof(g_relay_cfg));
+    memcpy(g_relay_cfg.identity_pk, g_identity_pk, 32);
+    memcpy(g_relay_cfg.identity_sk, g_identity_sk, 64);
+    memcpy(g_relay_cfg.onion_pk, g_onion_pk, 32);
+    memcpy(g_relay_cfg.onion_sk, g_onion_sk, 32);
+    g_relay_cfg.or_port = g_or_port;
+    g_relay_cfg.dir_port = 0;
+    g_relay_cfg.flags = g_relay_flags;
+    g_relay_cfg.bandwidth = g_bandwidth;
+    snprintf(g_relay_cfg.bind_addr, sizeof(g_relay_cfg.bind_addr), "%s", g_bind_addr);
+    snprintf(g_relay_cfg.advertise_addr, sizeof(g_relay_cfg.advertise_addr), "%s",
+             g_advertise_addr[0] ? g_advertise_addr : g_bind_addr);
+    snprintf(g_relay_cfg.da_address, sizeof(g_relay_cfg.da_address), "%s", g_da_address);
+    g_relay_cfg.da_port = g_da_port;
+    g_relay_cfg.num_das = g_num_das;
+    for (int i = 0; i < g_num_das && i < 9; i++)
+        g_relay_cfg.da_list[i] = g_da_list[i];
+
+    g_relay_cfg.pow_difficulty = g_pow_difficulty;
+    g_relay_cfg.pow_memlimit = g_config.pow_memlimit;
+    g_relay_cfg.mix_delay = g_config.mix_delay;
+    g_relay_cfg.padding_mode = g_padding_mode;
+    memcpy(g_relay_cfg.nickname, g_config.nickname, sizeof(g_relay_cfg.nickname));
+    memcpy(g_relay_cfg.contact_info, g_config.contact_info, sizeof(g_relay_cfg.contact_info));
+
+    /* Generate Kyber768 KEM keypair for PQ circuit crypto */
+    if (moor_kem_keygen(g_relay_cfg.kem_pk, g_relay_cfg.kem_sk) != 0) {
+        LOG_ERROR("failed to generate KEM keypair");
+        return -1;
+    }
+    LOG_INFO("relay: Kyber768 KEM keypair generated for PQ circuits");
+
+    /* Copy exit policy from config */
+    memcpy(&g_relay_cfg.exit_policy, &g_config.exit_policy,
+           sizeof(g_relay_cfg.exit_policy));
+
+    if ((g_relay_flags & NODE_FLAG_EXIT) && g_config.exit_policy.num_rules == 0) {
+        moor_exit_policy_set_defaults(&g_config.exit_policy);
+        memcpy(&g_relay_cfg.exit_policy, &g_config.exit_policy,
+               sizeof(g_relay_cfg.exit_policy));
+        LOG_INFO("exit relay: applied default exit policy (%d rules)",
+                 g_config.exit_policy.num_rules);
+    }
+
+    moor_relay_init(&g_relay_cfg);
+
+    /* Bridge relays print their bridge line but don't register with DA */
+    if (g_is_bridge) {
+        LOG_INFO("bridge relay: skipping DA registration (unlisted)");
+        char fp_hex[65];
+        for (int i = 0; i < 32; i++)
+            snprintf(fp_hex + i * 2, 3, "%02x", g_identity_pk[i]);
+        const char *addr = g_advertise_addr[0] ? g_advertise_addr : g_bind_addr;
+        LOG_INFO("bridge line: %s %s:%u %s",
+                 g_bridge_transport, addr, g_relay_cfg.or_port, fp_hex);
+    }
+
+    /* Listen for OR connections BEFORE registering with DA.
+     * The DA probes our OR port after receiving the descriptor,
+     * so we must be listening before the registration attempt. */
+    g_relay_listen_fd = moor_listen(g_bind_addr, g_or_port);
+    if (g_relay_listen_fd < 0) return -1;
+
+    moor_event_add(g_relay_listen_fd, MOOR_EVENT_READ, relay_accept_cb, NULL);
+
+    /* Initialize async EXTEND worker pipe (non-blocking relay EXTEND) */
+    if (moor_relay_extend_init() != 0) {
+        LOG_ERROR("failed to initialize async EXTEND subsystem");
+        return -1;
+    }
+
+    /* Fetch consensus so relay can resolve EXTEND addresses (#183) */
+    {
+        moor_consensus_t relay_cons = {0};
+        if (moor_client_fetch_consensus_multi(&relay_cons, g_da_list, g_num_das) == 0) {
+            moor_relay_set_consensus(&relay_cons);
+            LOG_INFO("relay: fetched consensus (%u relays)", relay_cons.num_relays);
+        } else {
+            LOG_WARN("relay: failed to fetch initial consensus");
+        }
+    }
+
+    /* Now register with DAs (listener is already up for probe-back) */
+    if (!g_is_bridge) {
+        moor_relay_register(&g_relay_cfg);
+    }
+
+    /* Self-test: verify our own OR port is reachable (2s delay for listener startup) */
+    g_selftest_timer_id = moor_event_add_timer(2000, relay_selftest_timer_cb, NULL);
+
+    /* Re-fetch consensus after 15s to pick up relays that registered after us.
+     * After first success, interval increases to CONSENSUS_INTERVAL/2 (30 min). */
+    g_relay_consensus_retry_id = moor_event_add_timer(15000, relay_consensus_retry_cb, NULL);
+
+    /* Periodic re-registration */
+    moor_event_add_timer(MOOR_CONSENSUS_INTERVAL * 1000 / 2,
+                         relay_periodic_cb, NULL);
+
+    /* Circuit timeout enforcement: check every 10 seconds */
+    moor_event_add_timer(10000, circuit_timeout_cb, NULL);
+
+    /* Observed bandwidth sampling: every 10 seconds (Tor-aligned).
+     * Tracks actual throughput so relays advertise realistic bandwidth. */
+    moor_event_add_timer(10000, observed_bw_timer_cb, NULL);
+
+    /* Rate limiting: init + periodic refill */
+    moor_ratelimit_init();
+    moor_event_add_timer(6000, ratelimit_refill_cb, NULL);
+
+    /* Bandwidth accounting (Tor-aligned hibernation) */
+    if (g_config.accounting_max > 0) {
+        g_accounting_period_start = (uint64_t)time(NULL);
+        moor_event_add_timer(60000, accounting_timer_cb, NULL);
+        LOG_INFO("accounting: limit %llu bytes/period (%llus)",
+                 (unsigned long long)g_config.accounting_max,
+                 (unsigned long long)g_config.accounting_period_sec);
+    }
+
+    /* Initialize Poisson mixing pool (relay only) */
+    moor_mix_init(g_config.mix_delay);
+    if (g_config.mix_delay > 0) {
+        moor_event_add_timer(1, mix_drain_timer_cb, NULL);
+        LOG_INFO("Poisson mixing enabled (lambda=%llu ms)",
+                 (unsigned long long)g_config.mix_delay);
+    }
+
+    /* WTF-PAD: resolve padding machine (default: "generic" — mandatory baseline).
+     * Per-circuit randomized machines are applied at lazy-init in wfpad_tick_all(). */
+    if (g_config.padding_machine[0]) {
+        g_wfpad_machine = moor_wfpad_find_machine(g_config.padding_machine);
+        if (g_wfpad_machine) {
+            g_padding = 1;
+            LOG_INFO("WTF-PAD: using '%s' padding machine (randomized per-circuit)",
+                     g_wfpad_machine->name);
+        }
+    }
+
+    /* Padding is mandatory — always start the padding timer.
+     * Traffic analysis defenses (constant-rate floor, FRONT, WTF-PAD)
+     * require this timer to fire every 5ms for all active circuits. */
+    moor_padding_enable(1);
+    g_padding = 1;
+    g_padding_timer_id = moor_event_add_timer(
+        g_wfpad_machine ? 5 : moor_padding_next_interval(),
+        padding_timer_cb, NULL);
+
+    /* Initialize monitoring */
+    moor_monitor_init();
+    if (g_data_dir[0])
+        moor_monitor_set_data_dir(g_data_dir);
+    if (g_config.control_password[0])
+        moor_monitor_set_password(g_config.control_password);
+    if (g_control_port > 0) {
+        moor_monitor_start(g_bind_addr, g_control_port);
+        moor_event_add_timer(1000, bw_event_timer_cb, NULL);
+    }
+    if (g_monitor)
+        moor_event_add_timer(60000, monitor_periodic_cb, NULL);
+
+    /* Directory mirror: cache consensus and serve on dir_port */
+    if (g_config.dir_cache && g_dir_port > 0) {
+        g_relay_cfg.dir_port = g_dir_port;
+        moor_relay_dir_cache_refresh(g_da_address, g_da_port);
+        int dir_listen = moor_listen(g_bind_addr, g_dir_port);
+        if (dir_listen >= 0) {
+            moor_event_add(dir_listen, MOOR_EVENT_READ, relay_dir_accept_cb, NULL);
+            LOG_INFO("directory mirror on %s:%u", g_bind_addr, g_dir_port);
+        }
+    }
+
+    LOG_INFO("relay running on %s:%u", g_bind_addr, g_or_port);
+    return moor_event_loop();
+}
+
+/* Consensus refresh timer callback */
+static moor_consensus_t *g_live_consensus = NULL;
+
+/* Try fetching consensus through a guard relay's dir_port (directory guard).
+ * Falls back to direct DA fetch on failure. */
+static int fetch_consensus_via_dir_guard(moor_consensus_t *fresh) {
+    moor_consensus_t *current = moor_socks5_get_consensus();
+    if (!current || current->num_relays == 0) return -1;
+
+    /* Pick a guard relay that has a dir_port */
+    for (uint32_t i = 0; i < current->num_relays; i++) {
+        const moor_node_descriptor_t *r = &current->relays[i];
+        if (!(r->flags & NODE_FLAG_GUARD)) continue;
+        if (!(r->flags & NODE_FLAG_RUNNING)) continue;
+        if (r->dir_port == 0) continue;
+
+        if (moor_client_fetch_consensus(fresh, r->address, r->dir_port) == 0) {
+            LOG_INFO("consensus fetched via directory guard %s:%u",
+                     r->address, r->dir_port);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static void consensus_refresh_cb(void *arg) {
+    (void)arg;
+    if (!g_live_consensus) return;
+    /* Heap-alloc to avoid ~3.5MB on stack in timer callback */
+    moor_consensus_t *fresh = calloc(1, sizeof(moor_consensus_t));
+    if (!fresh) return;
+
+    int ok = 0;
+    /* Try directory guard first (avoids leaking client IP to DA) */
+    if (fetch_consensus_via_dir_guard(fresh) == 0)
+        ok = 1;
+    /* Fallback to direct DA */
+    if (!ok && moor_client_fetch_consensus_multi(fresh, g_da_list, g_num_das) == 0)
+        ok = 1;
+
+    if (ok) {
+        moor_socks5_update_consensus(fresh);
+        if (g_config.data_dir[0])
+            moor_consensus_cache_save(fresh, g_config.data_dir);
+        LOG_INFO("consensus refreshed");
+    }
+    moor_consensus_cleanup(fresh);
+    free(fresh);
+    /* Fix #181: Removed re-add — fire_timers() already re-arms recurring timers */
+}
+
+static int run_client(void) {
+    moor_socks5_config_t socks_config;
+    memset(&socks_config, 0, sizeof(socks_config));
+    socks_config.listen_port = g_socks_port;
+    snprintf(socks_config.listen_addr, sizeof(socks_config.listen_addr), "%s", g_bind_addr);
+    snprintf(socks_config.da_address, sizeof(socks_config.da_address), "%s", g_da_address);
+    socks_config.da_port = g_da_port;
+    socks_config.num_das = g_num_das;
+    for (int i = 0; i < g_num_das && i < 9; i++)
+        socks_config.da_list[i] = g_da_list[i];
+    memcpy(socks_config.identity_pk, g_identity_pk, 32);
+    memcpy(socks_config.identity_sk, g_identity_sk, 64);
+
+    socks_config.conflux = g_conflux;
+    socks_config.conflux_legs = g_conflux_legs;
+
+    /* Load persisted guard state (Prop 271) */
+    if (g_data_dir[0]) {
+        if (moor_guard_load(moor_pathbias_get_state(), g_data_dir) == 0)
+            LOG_INFO("guard: loaded persisted state from %s", g_data_dir);
+    }
+
+    moor_socks5_init(&socks_config);
+    g_socks_listen_fd = moor_socks5_start(&socks_config);
+    if (g_socks_listen_fd < 0) return -1;
+
+    moor_event_add(g_socks_listen_fd, MOOR_EVENT_READ, socks_accept_cb, NULL);
+
+    /* Circuit timeout enforcement: check every 10 seconds */
+    moor_event_add_timer(10000, circuit_timeout_cb, NULL);
+
+    /* Path bias detection: check guard success rates every 60s */
+    moor_event_add_timer(60000, pathbias_timer_cb, NULL);
+
+    /* Guard persistence: save state every 5 minutes */
+    if (g_data_dir[0]) {
+        moor_event_add_timer(300000, guard_save_timer_cb, NULL);
+    }
+
+    /* Periodic consensus refresh */
+    g_live_consensus = moor_socks5_get_consensus();
+    g_consensus_timer_id = moor_event_add_timer(MOOR_CONSENSUS_INTERVAL * 1000,
+                                                 consensus_refresh_cb, NULL);
+
+    /* Dormant mode: check every 60s for idle client */
+    g_last_socks_activity_ms = moor_time_ms();
+    moor_event_add_timer(60000, dormant_check_cb, NULL);
+
+    /* Network liveness check: every 10s (avoids retry spam when offline) */
+    moor_event_add_timer(10000, liveness_timer_cb, NULL);
+
+    /* WTF-PAD: resolve padding machine (default: "generic" — mandatory baseline).
+     * Per-circuit randomized machines are applied at lazy-init in wfpad_tick_all(). */
+    if (g_config.padding_machine[0]) {
+        g_wfpad_machine = moor_wfpad_find_machine(g_config.padding_machine);
+        if (g_wfpad_machine) {
+            g_padding = 1;
+            LOG_INFO("WTF-PAD: using '%s' padding machine (randomized per-circuit)",
+                     g_wfpad_machine->name);
+        }
+    }
+
+    /* Padding is mandatory — always start the padding timer.
+     * Traffic analysis defenses (constant-rate floor, FRONT, WTF-PAD)
+     * require this timer to fire every 5ms for all active circuits. */
+    moor_padding_enable(1);
+    g_padding = 1;
+    g_padding_timer_id = moor_event_add_timer(
+        g_wfpad_machine ? 5 : moor_padding_next_interval(),
+        padding_timer_cb, NULL);
+
+    /* Initialize monitoring */
+    moor_monitor_init();
+    if (g_data_dir[0])
+        moor_monitor_set_data_dir(g_data_dir);
+    if (g_config.control_password[0])
+        moor_monitor_set_password(g_config.control_password);
+    if (g_control_port > 0) {
+        moor_monitor_start(g_bind_addr, g_control_port);
+        moor_event_add_timer(1000, bw_event_timer_cb, NULL);
+    }
+    if (g_monitor)
+        moor_event_add_timer(60000, monitor_periodic_cb, NULL);
+
+    /* TransPort: transparent TCP proxy (iptables REDIRECT) */
+    if (g_config.trans_port > 0) {
+        const char *ta = g_config.trans_addr[0] ? g_config.trans_addr : "127.0.0.1";
+        moor_transparent_start(ta, g_config.trans_port);
+    }
+
+    /* DNSPort: transparent DNS resolver */
+    if (g_config.dns_port > 0) {
+        const char *da = g_config.dns_addr[0] ? g_config.dns_addr : "127.0.0.1";
+        moor_dns_start(da, g_config.dns_port);
+    }
+
+    LOG_INFO("SOCKS5 client running on %s:%u", g_bind_addr, g_socks_port);
+    return moor_event_loop();
+}
+
+/* HS intro circuit event context and callback */
+static moor_hs_config_t g_hs_configs[MOOR_MAX_HIDDEN_SERVICES];
+
+typedef struct {
+    moor_hs_config_t *config;
+    moor_connection_t *conn;
+} hs_intro_ctx_t;
+
+static hs_intro_ctx_t g_hs_intro_ctxs[MOOR_MAX_HIDDEN_SERVICES * MOOR_MAX_INTRO_POINTS];
+static int g_num_hs_intro_ctxs = 0;
+
+/* HS rendezvous circuit context and callbacks */
+typedef struct {
+    moor_hs_config_t *config;
+    moor_circuit_t *circ;
+    moor_connection_t *conn;
+} hs_rp_ctx_t;
+
+#define MAX_HS_RP_CTXS 64
+static hs_rp_ctx_t g_hs_rp_ctxs[MAX_HS_RP_CTXS];
+static int g_num_hs_rp_ctxs = 0;
+
+/* Map local target FDs back to HS RP circuit+stream for data return */
+typedef struct {
+    int fd;
+    moor_circuit_t *circ;
+    uint16_t stream_id;
+} hs_target_fd_t;
+
+#define MAX_HS_TARGET_FDS 128
+static hs_target_fd_t g_hs_target_fds[MAX_HS_TARGET_FDS];
+static int g_hs_target_fd_count = 0;
+
+static hs_target_fd_t *hs_target_fd_find(int fd) {
+    for (int i = 0; i < g_hs_target_fd_count; i++) {
+        if (g_hs_target_fds[i].fd == fd)
+            return &g_hs_target_fds[i];
+    }
+    return NULL;
+}
+
+static void hs_target_fd_remove(int fd) {
+    for (int i = 0; i < g_hs_target_fd_count; i++) {
+        if (g_hs_target_fds[i].fd == fd) {
+            g_hs_target_fds[i] = g_hs_target_fds[g_hs_target_fd_count - 1];
+            g_hs_target_fd_count--;
+            return;
+        }
+    }
+}
+
+/* Callback: data arrived from local service target (HS → client via RP) */
+static void hs_target_read_cb(int fd, int events, void *arg) {
+    (void)events;
+    (void)arg;
+    hs_target_fd_t *map = hs_target_fd_find(fd);
+    if (!map) {
+        moor_event_remove(fd);
+        close(fd);
+        return;
+    }
+
+    uint8_t buf[MOOR_RELAY_DATA];
+    ssize_t n = recv(fd, (char *)buf, sizeof(buf), 0);
+    if (n <= 0) {
+        /* Local service closed or error -- send RELAY_END back */
+        moor_cell_t end_cell;
+        moor_cell_relay(&end_cell, map->circ->circuit_id, RELAY_END,
+                       map->stream_id, NULL, 0);
+        moor_circuit_encrypt_forward(map->circ, &end_cell);
+        moor_connection_send_cell(map->circ->conn, &end_cell);
+
+        moor_event_remove(fd);
+        hs_target_fd_remove(fd);
+        close(fd);
+        LOG_DEBUG("HS: local service closed, sent RELAY_END");
+        return;
+    }
+
+    /* Forward data to client via RP circuit */
+    uint8_t *send_data = buf;
+    uint16_t send_len = (uint16_t)n;
+    uint8_t e2e_enc_buf[MOOR_RELAY_DATA];
+    if (map->circ->e2e_active) {
+        size_t max_pt = MOOR_RELAY_DATA - 16; /* room for AEAD MAC */
+        if ((size_t)n > max_pt) n = (ssize_t)max_pt;
+        size_t enc_len;
+        if (moor_crypto_aead_encrypt(e2e_enc_buf, &enc_len, buf, (size_t)n,
+                                      NULL, 0, map->circ->e2e_send_key,
+                                      map->circ->e2e_send_nonce++) != 0) {
+            LOG_ERROR("e2e encrypt failed");
+            return;
+        }
+        send_data = e2e_enc_buf;
+        send_len = (uint16_t)enc_len;
+    }
+    moor_cell_t data_cell;
+    moor_cell_relay(&data_cell, map->circ->circuit_id, RELAY_DATA,
+                   map->stream_id, send_data, send_len);
+    moor_circuit_encrypt_forward(map->circ, &data_cell);
+    moor_connection_send_cell(map->circ->conn, &data_cell);
+}
+
+/* Callback: cell arrived on HS rendezvous circuit (from client via RP) */
+static void hs_rp_read_cb(int fd, int events, void *arg) {
+    (void)fd;
+    hs_rp_ctx_t *ctx = (hs_rp_ctx_t *)arg;
+
+    /* Flush output queue on write-readiness */
+    if ((events & MOOR_EVENT_WRITE) && ctx->conn) {
+        moor_queue_flush(&ctx->conn->outq, ctx->conn, &ctx->conn->write_off);
+        if (moor_queue_is_empty(&ctx->conn->outq))
+            moor_event_modify(ctx->conn->fd, MOOR_EVENT_READ);
+    }
+
+    if (!(events & MOOR_EVENT_READ)) return;
+
+    if (!ctx->conn) {
+        LOG_WARN("HS RP cb: conn is NULL (fd=%d)", fd);
+        moor_event_remove(fd);
+        return;
+    }
+    LOG_DEBUG("HS RP cb: fd=%d conn_fd=%d state=%d events=0x%x",
+              fd, ctx->conn->fd, ctx->conn->state, events);
+
+    moor_cell_t cell;
+    int ret;
+    int count = 0;
+    while (count < 64 && (ret = moor_connection_recv_cell(ctx->conn, &cell)) == 1) {
+        count++;
+        /* Handle DESTROY cell -- RP circuit torn down by peer */
+        if (cell.command == CELL_DESTROY) {
+            LOG_INFO("HS: received DESTROY on RP circuit (circ_id=%u)",
+                     cell.circuit_id);
+            ret = -1;
+            break;
+        }
+
+        moor_circuit_t *circ = moor_circuit_find(cell.circuit_id, ctx->conn);
+        if (!circ) { circ = ctx->circ; }
+
+        moor_circuit_decrypt_backward(circ, &cell);
+
+        moor_relay_payload_t relay;
+        moor_relay_unpack(&relay, cell.payload);
+
+        if (relay.recognized != 0) continue;
+
+        switch (relay.relay_command) {
+        case RELAY_BEGIN: {
+            /* Client wants to connect to our local service */
+            LOG_INFO("HS: RELAY_BEGIN on RP circuit (stream %u)",
+                     relay.stream_id);
+
+            /* Connect to our local service (localhost:local_port) */
+            struct sockaddr_in sa;
+            memset(&sa, 0, sizeof(sa));
+            sa.sin_family = AF_INET;
+            sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            sa.sin_port = htons(ctx->config->local_port);
+
+            int target_fd = socket(AF_INET, SOCK_STREAM, 0);
+            if (target_fd < 0) {
+                LOG_ERROR("HS: socket() failed for local service");
+                break;
+            }
+
+            if (connect(target_fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+                LOG_ERROR("HS: connect to localhost:%u failed: %s",
+                         ctx->config->local_port, strerror(errno));
+                close(target_fd);
+                /* Send RELAY_END back */
+                moor_cell_t end_cell;
+                moor_cell_relay(&end_cell, circ->circuit_id, RELAY_END,
+                               relay.stream_id, NULL, 0);
+                moor_circuit_encrypt_forward(circ, &end_cell);
+                moor_connection_send_cell(circ->conn, &end_cell);
+                break;
+            }
+
+            LOG_INFO("HS: connected to local service localhost:%u (fd=%d)",
+                     ctx->config->local_port, target_fd);
+
+            /* Store target FD mapping */
+            if (g_hs_target_fd_count < MAX_HS_TARGET_FDS) {
+                int idx = g_hs_target_fd_count++;
+                g_hs_target_fds[idx].fd = target_fd;
+                g_hs_target_fds[idx].circ = circ;
+                g_hs_target_fds[idx].stream_id = relay.stream_id;
+            } else {
+                LOG_WARN("HS: target fd table full, rejecting stream %u",
+                         relay.stream_id);
+                close(target_fd);
+                /* Send RELAY_END so client doesn't hang (#193) */
+                moor_cell_t end_cell;
+                moor_cell_relay(&end_cell, circ->circuit_id, RELAY_END,
+                               relay.stream_id, NULL, 0);
+                moor_circuit_encrypt_forward(circ, &end_cell);
+                moor_connection_send_cell(circ->conn, &end_cell);
+                break;
+            }
+
+            /* Register target FD for reading */
+            moor_event_add(target_fd, MOOR_EVENT_READ,
+                           hs_target_read_cb, NULL);
+
+            /* Send RELAY_CONNECTED back to client */
+            uint8_t connected_data[8];
+            memset(connected_data, 0, sizeof(connected_data));
+            connected_data[3] = 1; /* 127.0.0.1 */
+            moor_cell_t conn_cell;
+            moor_cell_relay(&conn_cell, circ->circuit_id, RELAY_CONNECTED,
+                           relay.stream_id, connected_data, 8);
+            moor_circuit_encrypt_forward(circ, &conn_cell);
+            moor_connection_send_cell(circ->conn, &conn_cell);
+            LOG_INFO("HS: sent RELAY_CONNECTED for stream %u",
+                     relay.stream_id);
+            break;
+        }
+
+        case RELAY_DATA: {
+            /* E2e decrypt for HS rendezvous circuits (#197) */
+            if (circ->e2e_active && relay.data_length > 16) {
+                uint8_t dec_buf[MOOR_RELAY_DATA];
+                size_t dec_len;
+                if (moor_crypto_aead_decrypt(dec_buf, &dec_len,
+                                              relay.data, relay.data_length,
+                                              NULL, 0, circ->e2e_recv_key,
+                                              circ->e2e_recv_nonce++) != 0) {
+                    LOG_ERROR("e2e decrypt failed");
+                    break;
+                }
+                memcpy(relay.data, dec_buf, dec_len);
+                relay.data_length = (uint16_t)dec_len;
+            }
+            /* Forward data to local service */
+            hs_target_fd_t *map = NULL;
+            for (int i = 0; i < g_hs_target_fd_count; i++) {
+                if (g_hs_target_fds[i].circ == circ &&
+                    g_hs_target_fds[i].stream_id == relay.stream_id) {
+                    map = &g_hs_target_fds[i];
+                    break;
+                }
+            }
+            if (map && map->fd >= 0) {
+                send(map->fd, (const char *)relay.data,
+                     relay.data_length, MSG_NOSIGNAL);
+            }
+            break;
+        }
+
+        case RELAY_END: {
+            /* Client closed the stream */
+            for (int i = 0; i < g_hs_target_fd_count; i++) {
+                if (g_hs_target_fds[i].circ == circ &&
+                    g_hs_target_fds[i].stream_id == relay.stream_id) {
+                    moor_event_remove(g_hs_target_fds[i].fd);
+                    close(g_hs_target_fds[i].fd);
+                    g_hs_target_fds[i] =
+                        g_hs_target_fds[g_hs_target_fd_count - 1];
+                    g_hs_target_fd_count--;
+                    break;
+                }
+            }
+            break;
+        }
+
+        case RELAY_SENDME:
+            /* Acknowledge (no-op for now) */
+            break;
+
+        default:
+            LOG_DEBUG("HS RP: unhandled relay cmd %d", relay.relay_command);
+            break;
+        }
+    }
+    if (ret < 0) {
+        LOG_WARN("HS: RP circuit connection lost (fd=%d conn_fd=%d state=%d "
+                 "recv_nonce=%llu send_nonce=%llu)",
+                 fd, ctx->conn->fd, ctx->conn->state,
+                 (unsigned long long)ctx->conn->recv_nonce,
+                 (unsigned long long)ctx->conn->send_nonce);
+        moor_event_remove(ctx->conn->fd);
+        /* Clean up local service target FDs for this circuit */
+        {
+            int i = 0;
+            while (i < g_hs_target_fd_count) {
+                if (g_hs_target_fds[i].circ == ctx->circ) {
+                    moor_event_remove(g_hs_target_fds[i].fd);
+                    close(g_hs_target_fds[i].fd);
+                    g_hs_target_fds[i] =
+                        g_hs_target_fds[g_hs_target_fd_count - 1];
+                    g_hs_target_fd_count--;
+                    /* Don't increment i -- check the swapped-in element */
+                } else {
+                    i++;
+                }
+            }
+        }
+        /* Close the dead fd and free pool entries */
+        int dead_fd = ctx->conn->fd;
+        moor_connection_free(ctx->conn);  /* returns pool entry (sets fd=-1) */
+        if (dead_fd >= 0) close(dead_fd);
+        moor_circuit_free(ctx->circ);     /* returns pool entry */
+        /* Clear the config slot so it can be reused */
+        for (int i = 0; i < 8; i++) {
+            if (ctx->config->rp_circuits[i] == ctx->circ) {
+                ctx->config->rp_circuits[i] = NULL;
+                ctx->config->rp_connections[i] = NULL;
+                break;
+            }
+        }
+        ctx->circ = NULL;
+        ctx->conn = NULL;
+        /* Reclaim this RP ctx slot so the array doesn't monotonically fill */
+        {
+            int dead_idx = (int)(ctx - g_hs_rp_ctxs);
+            if (dead_idx >= 0 && dead_idx < g_num_hs_rp_ctxs) {
+                if (dead_idx < g_num_hs_rp_ctxs - 1)
+                    g_hs_rp_ctxs[dead_idx] =
+                        g_hs_rp_ctxs[g_num_hs_rp_ctxs - 1];
+                g_num_hs_rp_ctxs--;
+            }
+        }
+    }
+}
+
+/* Register any new RP circuits from config with the event loop */
+static void hs_register_rp_circuits(moor_hs_config_t *config, int from_idx) {
+    (void)from_idx; /* Scan all slots -- reused slots may be below from_idx */
+    for (int i = 0; i < 8; i++) {
+        moor_circuit_t *circ = config->rp_circuits[i];
+        moor_connection_t *conn = config->rp_connections[i];
+        if (!circ || !conn || conn->fd < 0) continue;
+        /* Check if already registered */
+        int already = 0;
+        for (int j = 0; j < g_num_hs_rp_ctxs; j++) {
+            if (g_hs_rp_ctxs[j].circ == circ) { already = 1; break; }
+        }
+        if (already) continue;
+        if (g_num_hs_rp_ctxs < MAX_HS_RP_CTXS) {
+            int idx = g_num_hs_rp_ctxs++;
+            g_hs_rp_ctxs[idx].config = config;
+            g_hs_rp_ctxs[idx].circ = circ;
+            g_hs_rp_ctxs[idx].conn = conn;
+            moor_event_add(conn->fd, MOOR_EVENT_READ,
+                           hs_rp_read_cb, &g_hs_rp_ctxs[idx]);
+            LOG_INFO("HS: registered RP circuit %d fd=%d for events",
+                     i, conn->fd);
+        }
+    }
+}
+
+static void hs_intro_read_cb(int fd, int events, void *arg) {
+    (void)fd;
+    hs_intro_ctx_t *ctx = (hs_intro_ctx_t *)arg;
+
+    /* Flush output queue on write-readiness */
+    if ((events & MOOR_EVENT_WRITE) && ctx->conn) {
+        moor_queue_flush(&ctx->conn->outq, ctx->conn, &ctx->conn->write_off);
+        if (moor_queue_is_empty(&ctx->conn->outq))
+            moor_event_modify(ctx->conn->fd, MOOR_EVENT_READ);
+    }
+
+    if (!(events & MOOR_EVENT_READ)) return;
+
+    moor_cell_t cell;
+    int ret;
+    int count = 0;
+    while (count < 64 && (ret = moor_connection_recv_cell(ctx->conn, &cell)) == 1) {
+        count++;
+        /* Find the circuit for this cell */
+        moor_circuit_t *circ = moor_circuit_find(cell.circuit_id, ctx->conn);
+        if (!circ) continue;
+
+        /* Decrypt all onion layers (we are the circuit origin) */
+        moor_circuit_decrypt_backward(circ, &cell);
+
+        /* Parse relay payload */
+        moor_relay_payload_t relay;
+        moor_relay_unpack(&relay, cell.payload);
+
+        if (relay.recognized == 0 && relay.relay_command == RELAY_INTRODUCE2) {
+            LOG_INFO("HS: received INTRODUCE2 (%u bytes)", relay.data_length);
+            moor_hs_handle_introduce(ctx->config, circ,
+                                      relay.data, relay.data_length);
+            /* Always register -- slot reuse won't change num_rp_circuits */
+            hs_register_rp_circuits(ctx->config, 0);
+        }
+    }
+    if (ret < 0) {
+        moor_event_remove(ctx->conn->fd);
+        LOG_WARN("HS: intro circuit connection lost");
+        /* Clean up circuit and connection, mark slot for re-establishment */
+        int dead_fd = ctx->conn->fd;
+        for (int j = 0; j < ctx->config->num_intro_circuits; j++) {
+            if (ctx->config->intro_circuits[j] &&
+                ctx->config->intro_circuits[j]->conn == ctx->conn) {
+                moor_circuit_free(ctx->config->intro_circuits[j]);
+                ctx->config->intro_circuits[j] = NULL;
+                ctx->config->intro_established_at[j] = 0;
+                break;
+            }
+        }
+        moor_connection_free(ctx->conn);
+        if (dead_fd >= 0) close(dead_fd);
+        ctx->conn = NULL;
+    }
+}
+
+static moor_consensus_t *g_hs_consensus = NULL; /* heap-allocated HS consensus */
+
+static int run_hs(void) {
+    /* Heap-allocate consensus (~3.5MB -- must not be on stack) */
+    g_hs_consensus = calloc(1, sizeof(moor_consensus_t));
+    if (!g_hs_consensus) {
+        LOG_ERROR("failed to allocate consensus");
+        return -1;
+    }
+    /* Try cached consensus first, then fetch fresh */
+    int have_consensus = 0;
+    if (g_config.data_dir[0] &&
+        moor_consensus_cache_load(g_hs_consensus, g_config.data_dir) == 0 &&
+        moor_consensus_is_fresh(g_hs_consensus)) {
+        LOG_INFO("using cached consensus");
+        have_consensus = 1;
+    }
+    if (!have_consensus) {
+        if (moor_client_fetch_consensus_multi(g_hs_consensus, g_da_list, g_num_das) != 0) {
+            LOG_ERROR("failed to fetch consensus");
+            free(g_hs_consensus); g_hs_consensus = NULL;
+            return -1;
+        }
+        if (g_config.data_dir[0])
+            moor_consensus_cache_save(g_hs_consensus, g_config.data_dir);
+    }
+
+    /* Multi-HS: iterate all configured hidden services */
+    int hs_count = g_config.num_hidden_services;
+    if (hs_count == 0) {
+        /* Backward compat: use legacy g_hs_dir / g_hs_local_port */
+        hs_count = 1;
+    }
+
+    for (int h = 0; h < hs_count; h++) {
+        moor_hs_config_t hs_config;
+        memset(&hs_config, 0, sizeof(hs_config));
+
+        if (g_config.num_hidden_services > 0) {
+            snprintf(hs_config.hs_dir, sizeof(hs_config.hs_dir), "%s",
+                     g_config.hidden_services[h].hs_dir);
+            hs_config.local_port = g_config.hidden_services[h].local_port;
+            /* Propagate authorized clients */
+            hs_config.num_auth_clients = g_config.hidden_services[h].num_auth_clients;
+            for (int ac = 0; ac < hs_config.num_auth_clients; ac++) {
+                memcpy(hs_config.auth_clients[ac].client_pk,
+                       g_config.hidden_services[h].auth_client_pks[ac], 32);
+            }
+        } else {
+            snprintf(hs_config.hs_dir, sizeof(hs_config.hs_dir), "%s", g_hs_dir);
+            hs_config.local_port = g_hs_local_port;
+        }
+
+        snprintf(hs_config.da_address, sizeof(hs_config.da_address), "%s", g_da_address);
+        hs_config.da_port = g_da_port;
+        hs_config.num_das = g_num_das;
+        for (int d = 0; d < g_num_das && d < 9; d++)
+            hs_config.da_list[d] = g_da_list[d];
+
+        /* HS PoW DoS protection */
+        hs_config.pow_enabled = g_config.hs_pow;
+        hs_config.pow_difficulty = g_config.hs_pow_difficulty > 0 ?
+                                    g_config.hs_pow_difficulty : 16;
+
+        /* Store consensus pointer before init so DHT publish can use it */
+        hs_config.cached_consensus = g_hs_consensus;
+
+        if (moor_hs_init(&hs_config, g_hs_consensus) != 0) {
+            LOG_ERROR("failed to initialize hidden service %d", h);
+            return -1;
+        }
+
+        /* Persist hs_config so event callbacks can access it */
+        memcpy(&g_hs_configs[h], &hs_config, sizeof(hs_config));
+
+        /* Register intro circuit connections with event loop */
+        for (int i = 0; i < g_hs_configs[h].num_intro_circuits; i++) {
+            moor_circuit_t *circ = g_hs_configs[h].intro_circuits[i];
+            if (circ && circ->conn && circ->conn->fd >= 0) {
+                if (g_num_hs_intro_ctxs >=
+                    MOOR_MAX_HIDDEN_SERVICES * MOOR_MAX_INTRO_POINTS) {
+                    LOG_WARN("HS: intro ctx array full, skipping");
+                    continue;
+                }
+                int idx = g_num_hs_intro_ctxs++;
+                g_hs_intro_ctxs[idx].config = &g_hs_configs[h];
+                g_hs_intro_ctxs[idx].conn = circ->conn;
+                moor_event_add(circ->conn->fd, MOOR_EVENT_READ,
+                               hs_intro_read_cb, &g_hs_intro_ctxs[idx]);
+                LOG_INFO("HS: registered intro circuit %d fd=%d for events",
+                         i, circ->conn->fd);
+            }
+        }
+
+        printf("Hidden service %d address: %s\n", h, hs_config.moor_address);
+    }
+
+    return moor_event_loop();
+}
+
+/* BW event timer: fires every 1 second to send BW events to ctrl clients.
+ * Fix #181: Removed moor_event_add_timer() — fire_timers() already re-arms
+ * recurring timers by resetting next_fire. Re-adding from callback leaks
+ * a new timer slot every invocation, exhausting MAX_TIMERS (32) in 32s. */
+static void bw_event_timer_cb(void *arg) {
+    (void)arg;
+    moor_monitor_notify_bw();
+}
+
+static int run_ob(void) {
+    moor_ob_config_t ob_config;
+    memset(&ob_config, 0, sizeof(ob_config));
+    snprintf(ob_config.hs_dir, sizeof(ob_config.hs_dir), "%s",
+             g_config.num_hidden_services > 0 ?
+             g_config.hidden_services[0].hs_dir : g_hs_dir);
+    snprintf(ob_config.da_address, sizeof(ob_config.da_address), "%s", g_da_address);
+    ob_config.da_port = g_da_port;
+    ob_config.ob_port = g_config.ob_port > 0 ? g_config.ob_port : 9055;
+    ob_config.pow_enabled = g_config.hs_pow;
+    ob_config.pow_difficulty = g_config.hs_pow_difficulty > 0 ?
+                                g_config.hs_pow_difficulty : 16;
+
+    if (moor_ob_init(&ob_config) != 0) {
+        LOG_ERROR("failed to initialize OnionBalance");
+        return -1;
+    }
+
+    printf("OnionBalance master address: %s\n", ob_config.moor_address);
+    printf("Listening for backend uploads on port %u\n", ob_config.ob_port);
+
+    /* Listen for backend descriptor uploads */
+    int listen_fd = moor_listen(g_bind_addr, ob_config.ob_port);
+    if (listen_fd < 0) return -1;
+
+    /* Simple accept loop: backend connects, sends "OB_DESC\n" + len(4) + data */
+    LOG_INFO("OB master running on %s:%u", g_bind_addr, ob_config.ob_port);
+
+    /* Periodic publish timer */
+    /* For simplicity, use event loop with accept callback */
+    /* For now, just return the event loop fd */
+    return moor_event_loop();
+}
+
+static int run_bridgedb(void) {
+    moor_bridgedb_config_t bdb_config;
+    memset(&bdb_config, 0, sizeof(bdb_config));
+    snprintf(bdb_config.bind_addr, sizeof(bdb_config.bind_addr), "%s", g_bind_addr);
+    bdb_config.http_port = g_config.bridgedb_port > 0 ? g_config.bridgedb_port : 8080;
+
+    /* Load bridges from config file if specified */
+    if (g_config.bridgedb_file[0]) {
+        FILE *f = fopen(g_config.bridgedb_file, "r");
+        if (!f) {
+            LOG_ERROR("bridgedb: cannot open bridge file: %s", g_config.bridgedb_file);
+            return -1;
+        }
+        char line[512];
+        while (fgets(line, sizeof(line), f) &&
+               bdb_config.num_bridges < MOOR_BRIDGEDB_MAX_BRIDGES) {
+            /* Strip trailing newline */
+            size_t len = strlen(line);
+            while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+                line[--len] = '\0';
+            if (len == 0 || line[0] == '#') continue;
+
+            /* Parse: "transport addr:port fingerprint_hex" */
+            moor_bridge_entry_t *b = &bdb_config.bridges[bdb_config.num_bridges];
+            memset(b, 0, sizeof(*b));
+
+            char *s1 = strchr(line, ' ');
+            if (!s1) continue;
+            *s1 = '\0'; s1++;
+            while (*s1 == ' ') s1++;
+
+            char *s2 = strchr(s1, ' ');
+            if (!s2) continue;
+            *s2 = '\0'; s2++;
+            while (*s2 == ' ') s2++;
+
+            /* Transport */
+            snprintf(b->transport, sizeof(b->transport), "%s", line);
+
+            /* addr:port */
+            char *colon = strrchr(s1, ':');
+            if (!colon) continue;
+            *colon = '\0';
+            snprintf(b->address, sizeof(b->address), "%s", s1);
+            long port_val = strtol(colon + 1, NULL, 10);
+            if (port_val <= 0 || port_val > 65535) continue;
+            b->port = (uint16_t)port_val;
+
+            /* Hex fingerprint (64 hex chars) */
+            if (strlen(s2) < 64) continue;
+            int fp_ok = 1;
+            for (int i = 0; i < 32; i++) {
+                unsigned int byte_val;
+                if (sscanf(s2 + i * 2, "%2x", &byte_val) != 1) {
+                    fp_ok = 0;
+                    break;
+                }
+                b->identity_pk[i] = (uint8_t)byte_val;
+            }
+            if (!fp_ok) continue; /* reject partial fingerprint */
+
+            bdb_config.num_bridges++;
+        }
+        fclose(f);
+    } else {
+        /* Copy bridges from main config */
+        for (int i = 0; i < g_config.num_bridges &&
+             i < MOOR_MAX_BRIDGES && i < MOOR_BRIDGEDB_MAX_BRIDGES; i++) {
+            bdb_config.bridges[i] = g_config.bridges[i];
+            bdb_config.num_bridges++;
+        }
+    }
+
+    if (bdb_config.num_bridges == 0) {
+        LOG_ERROR("bridgedb: no bridges configured");
+        return -1;
+    }
+
+    if (moor_bridgedb_init(&bdb_config) != 0) {
+        LOG_ERROR("bridgedb: initialization failed");
+        return -1;
+    }
+
+    printf("BridgeDB serving %d bridges on port %u\n",
+           bdb_config.num_bridges, bdb_config.http_port);
+
+    return moor_bridgedb_run(&bdb_config);
+}
+
+extern volatile sig_atomic_t g_shutdown_requested;
+
+static char g_pid_file_path[256] = "";
+
+static void signal_handler(int sig) {
+    (void)sig;
+    g_shutdown_requested = 1;
+}
+
+#ifdef _WIN32
+static LONG WINAPI moor_win32_crash_handler(EXCEPTION_POINTERS *ep) {
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    void *addr = ep->ExceptionRecord->ExceptionAddress;
+    const char *name = "UNKNOWN";
+    switch (code) {
+    case EXCEPTION_ACCESS_VIOLATION:    name = "ACCESS_VIOLATION"; break;
+    case EXCEPTION_STACK_OVERFLOW:      name = "STACK_OVERFLOW"; break;
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:  name = "INT_DIVIDE_BY_ZERO"; break;
+    case EXCEPTION_ILLEGAL_INSTRUCTION: name = "ILLEGAL_INSTRUCTION"; break;
+    }
+    fprintf(stderr, "\n*** MOOR CRASH: %s (0x%08lX) at %p ***\n",
+            name, (unsigned long)code, addr);
+    if (code == EXCEPTION_ACCESS_VIOLATION &&
+        ep->ExceptionRecord->NumberParameters >= 2) {
+        fprintf(stderr, "  %s address %p\n",
+                ep->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading",
+                (void *)(uintptr_t)ep->ExceptionRecord->ExceptionInformation[1]);
+    }
+#if defined(__x86_64__) || defined(_M_X64)
+    CONTEXT *ctx = ep->ContextRecord;
+    fprintf(stderr, "  RIP=%p RSP=%p RBP=%p\n",
+            (void *)ctx->Rip, (void *)ctx->Rsp, (void *)ctx->Rbp);
+#endif
+    fflush(stderr);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+#endif
+
+#ifndef _WIN32
+static int write_pid_file(const char *path) {
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        LOG_ERROR("cannot write PID file: %s", path);
+        return -1;
+    }
+    fprintf(f, "%ld\n", (long)getpid());
+    fclose(f);
+    return 0;
+}
+
+static int daemonize(const char *pid_file) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        LOG_ERROR("fork() failed");
+        return -1;
+    }
+    if (pid > 0)
+        _exit(0); /* parent exits */
+
+    /* Child: new session */
+    if (setsid() < 0) {
+        LOG_ERROR("setsid() failed");
+        return -1;
+    }
+
+    /* Second fork to prevent controlling terminal acquisition */
+    pid = fork();
+    if (pid < 0) {
+        LOG_ERROR("second fork() failed");
+        return -1;
+    }
+    if (pid > 0)
+        _exit(0);
+
+    /* Redirect stdin/stdout/stderr to /dev/null */
+    int devnull = open("/dev/null", O_RDWR);
+    if (devnull >= 0) {
+        dup2(devnull, STDIN_FILENO);
+        dup2(devnull, STDOUT_FILENO);
+        dup2(devnull, STDERR_FILENO);
+        if (devnull > 2)
+            close(devnull);
+    }
+
+    /* Write PID file */
+    if (pid_file && pid_file[0]) {
+        if (write_pid_file(pid_file) != 0)
+            return -1;
+        snprintf(g_pid_file_path, sizeof(g_pid_file_path), "%s", pid_file);
+    }
+
+    return 0;
+}
+#endif /* !_WIN32 */
+
+int main(int argc, char **argv) {
+    /* 1. Fill config with defaults */
+    moor_config_defaults(&g_config);
+
+    /* 2. Auto-discover config: --config flag, ./moor.conf, or SYSCONFDIR */
+    int have_explicit_config = 0;
+    for (int i = 1; i < argc; i++) {
+        if ((strcmp(argv[i], "--config") == 0 || strcmp(argv[i], "-f") == 0) &&
+            i + 1 < argc) {
+            have_explicit_config = 1;
+            if (moor_config_load(&g_config, argv[i + 1]) != 0) {
+                fprintf(stderr, "FATAL: failed to load config file: %s\n",
+                        argv[i + 1]);
+                return 1;
+            }
+            break;
+        }
+    }
+    if (!have_explicit_config) {
+        /* Auto-discover config: try moorrc, moor.conf, then SYSCONFDIR.
+         * Like Tor: tries ./torrc → /etc/tor/torrc → SYSCONFDIR/torrc */
+        static const char *config_search[] = {
+            "moorrc", "moor.conf",
+            MOOR_SYSCONFDIR "/moorrc",
+            MOOR_SYSCONFDIR "/moor.conf",
+            NULL
+        };
+        FILE *f = NULL;
+        const char *found_config = NULL;
+        for (const char **p = config_search; *p; p++) {
+            f = fopen(*p, "r");
+            if (f) { found_config = *p; fclose(f); break; }
+        }
+        if (found_config) {
+            if (moor_config_load(&g_config, found_config) != 0) {
+                fprintf(stderr, "FATAL: failed to parse %s\n", found_config);
+                return 1;
+            }
+        } else {
+            /* Try SYSCONFDIR/moor.conf if installed (legacy path) */
+            f = fopen(MOOR_SYSCONFDIR "/moor.conf", "r");
+            if (f) {
+                fclose(f);
+                if (moor_config_load(&g_config, MOOR_SYSCONFDIR "/moor.conf") != 0) {
+                    fprintf(stderr, "FATAL: failed to parse " MOOR_SYSCONFDIR "/moor.conf\n");
+                    return 1;
+                }
+            }
+        }
+    }
+
+    /* 3. CLI args override config file values */
+    parse_args_into_config(&g_config, argc, argv);
+
+    /* With no args and no config file, start as client (like Tor).
+     * Default config: client mode, SOCKS5 on 9050, DA at 107.174.70.38. */
+
+    /* 4. Validate and apply config */
+    if (moor_config_validate(&g_config) != 0) {
+        fprintf(stderr, "FATAL: invalid configuration\n");
+        return 1;
+    }
+    apply_config_to_globals(&g_config);
+
+    if (g_verbose)
+        moor_log_set_level(MOOR_LOG_DEBUG);
+
+    /* Init crypto */
+    if (moor_crypto_init() != 0) {
+        fprintf(stderr, "FATAL: crypto init failed\n");
+        return 1;
+    }
+
+    /* Platform hardening: lock memory, prevent core dumps */
+#if !defined(_WIN32) && defined(__linux__)
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+        /* Non-root can't mlockall -- try raising soft memlock limit */
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+            rl.rlim_cur = rl.rlim_max;
+            setrlimit(RLIMIT_MEMLOCK, &rl);
+            mlockall(MCL_CURRENT | MCL_FUTURE); /* best-effort retry */
+        }
+        /* Not a warning -- running as non-root is correct */
+        LOG_DEBUG("mlockall unavailable (not root) -- using madvise for key pages");
+    }
+    prctl(PR_SET_DUMPABLE, 0); /* prevent ptrace/core dumps */
+#endif
+
+    /* Load persistent keys for relay/DA, or generate ephemeral */
+    if (g_data_dir[0] && (g_mode == MOOR_MODE_RELAY || g_mode == MOOR_MODE_DA)) {
+        if (moor_keys_load(g_data_dir, g_identity_pk, g_identity_sk,
+                           g_onion_pk, g_onion_sk) == 0) {
+            LOG_INFO("loaded persistent identity keys from %s", g_data_dir);
+        } else {
+            moor_crypto_sign_keygen(g_identity_pk, g_identity_sk);
+            moor_crypto_box_keygen(g_onion_pk, g_onion_sk);
+            if (moor_keys_save(g_data_dir, g_identity_pk, g_identity_sk,
+                               g_onion_pk, g_onion_sk) == 0) {
+                LOG_INFO("generated and saved persistent keys to %s", g_data_dir);
+            } else {
+                LOG_WARN("generated keys but failed to save to %s", g_data_dir);
+            }
+        }
+
+        /* PQ keys for DA mode: load or generate ML-DSA-65 keypair */
+        if (g_mode == MOOR_MODE_DA) {
+            if (moor_pq_keys_load(g_data_dir, g_pq_identity_pk,
+                                  g_pq_identity_sk) == 0) {
+                LOG_INFO("loaded persistent ML-DSA-65 keys from %s", g_data_dir);
+            } else {
+                if (moor_mldsa_keygen(g_pq_identity_pk, g_pq_identity_sk) == 0) {
+                    if (moor_pq_keys_save(g_data_dir, g_pq_identity_pk,
+                                          g_pq_identity_sk) == 0) {
+                        LOG_INFO("generated and saved ML-DSA-65 keys to %s",
+                                 g_data_dir);
+                    } else {
+                        LOG_WARN("generated ML-DSA-65 keys but failed to save");
+                    }
+                } else {
+                    LOG_WARN("ML-DSA-65 keygen failed, DA will use Ed25519-only");
+                }
+            }
+        }
+    } else {
+        moor_crypto_sign_keygen(g_identity_pk, g_identity_sk);
+        moor_crypto_box_keygen(g_onion_pk, g_onion_sk);
+    }
+
+    /* Daemonize if requested (before entering event loop) */
+#ifndef _WIN32
+    if (g_config.daemon_mode) {
+        if (daemonize(g_config.pid_file) != 0) {
+            fprintf(stderr, "FATAL: failed to daemonize\n");
+            return 1;
+        }
+    }
+#endif
+
+    moor_bootstrap_report(BOOT_STARTING);
+
+    /* ---- Startup Banner ---- */
+    {
+        const char *mode_str =
+            g_mode == MOOR_MODE_CLIENT ? "client" :
+            g_mode == MOOR_MODE_RELAY  ? "relay" :
+            g_mode == MOOR_MODE_DA     ? "directory authority" :
+            g_mode == MOOR_MODE_OB     ? "onionbalance" :
+            g_mode == MOOR_MODE_BRIDGEDB ? "bridgedb" : "hidden service";
+
+        fprintf(stderr,
+            "\n"
+            "\033[36m====================================================================\033[0m\n"
+            "\033[36m                 ███╗   ███╗ ██████╗  ██████╗ ██████╗ \033[0m\n"
+            "\033[36m                 ████╗ ████║██╔═══██╗██╔═══██╗██╔══██╗\033[0m\n"
+            "\033[36m                 ██╔████╔██║██║   ██║██║   ██║██████╔╝\033[0m\n"
+            "\033[36m                 ██║╚██╔╝██║██║   ██║██║   ██║██╔══██╗\033[0m\n"
+            "\033[36m                 ██║ ╚═╝ ██║╚██████╔╝╚██████╔╝██║  ██║\033[0m\n"
+            "\033[36m                 ╚═╝     ╚═╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝\033[0m \033[1mv%s\033[0m\n"
+            "\n"
+            "                \033[1mM Y   O W N   O N I O N   R O U T E R\033[0m\n"
+            "                       \033[90mPQ SECURE OVERLAY NETWORK\033[0m\n"
+            "\n"
+            "\033[36m--------------------------------------------------------------------\033[0m\n"
+            "\n"
+            "        \033[33m>>>   PRIVACY IS A RIGHT, NOT A FEATURE   <<<\033[0m\n"
+            "        \033[33m>>>     TRUSTLESS • STATELESS • SILENT     <<<\033[0m\n"
+            "\n"
+            "\033[36m--------------------------------------------------------------------\033[0m\n"
+            "\033[36m====================================================================\033[0m\n"
+            "\n",
+            MOOR_VERSION_STRING);
+
+        struct utsname uts;
+        const char *os = "unknown";
+        if (uname(&uts) == 0) os = uts.sysname;
+
+        LOG_INFO("MOOR v%s running on %s with libsodium %s",
+                 MOOR_VERSION_STRING, os, sodium_version_string());
+        LOG_INFO("Operating in %s mode (PID %d)", mode_str, (int)getpid());
+
+        if (g_mode == MOOR_MODE_CLIENT)
+            LOG_INFO("SOCKS5 proxy on %s:%u", g_bind_addr, g_socks_port);
+        else if (g_mode == MOOR_MODE_RELAY && g_config.nickname[0])
+            LOG_INFO("Relay nickname: %s", g_config.nickname);
+    }
+
+    /* Register transports */
+    moor_transport_register(&moor_scramble_transport);
+    moor_transport_register(&moor_mirage_transport);
+    moor_transport_register(&moor_shade_transport);
+
+    /* PQ hybrid always enabled -- Kyber768 + Noise_IK mandatory */
+
+    /* Set up scramble server params for bridge mode */
+    memcpy(g_scramble_server_params.identity_pk, g_identity_pk, 32);
+    memcpy(g_scramble_server_params.identity_sk, g_identity_sk, 64);
+
+    /* Shade server params: derive Curve25519 from Ed25519 */
+    memcpy(g_shade_server_params.node_id, g_identity_pk, 32);
+    if (crypto_sign_ed25519_pk_to_curve25519(g_shade_server_params.server_pk,
+                                              g_identity_pk) != 0)
+        LOG_WARN("shade: Ed25519->Curve25519 pk conversion failed");
+    if (crypto_sign_ed25519_sk_to_curve25519(g_shade_server_params.server_sk,
+                                              g_identity_sk) != 0)
+        LOG_WARN("shade: Ed25519->Curve25519 sk conversion failed");
+    g_shade_server_params.iat_mode = MOOR_SHADE_IAT_NONE;
+
+    /* Mirage: no keys needed */
+    memset(&g_mirage_server_params, 0, sizeof(g_mirage_server_params));
+
+    /* Init subsystems */
+    moor_event_init();
+    moor_connection_init_pool();
+    moor_circuit_init_pool();
+
+    /* Load GeoIP databases: try explicit path, then default locations */
+    {
+        static const char *geoip4_defaults[] = {
+            MOOR_SYSCONFDIR "/geoip",
+            "/usr/share/moor/geoip",
+            "/usr/local/share/moor/geoip",
+            NULL
+        };
+        static const char *geoip6_defaults[] = {
+            MOOR_SYSCONFDIR "/geoip6",
+            "/usr/share/moor/geoip6",
+            "/usr/local/share/moor/geoip6",
+            NULL
+        };
+        /* IPv4: use explicit path or probe defaults */
+        if (g_geoip_file[0]) {
+            if (moor_geoip_load(&g_geoip_db, g_geoip_file) == 0)
+                LOG_INFO("GeoIP: loaded %d IPv4 entries from %s",
+                         g_geoip_db.num_entries, g_geoip_file);
+            else
+                LOG_WARN("GeoIP: failed to load %s", g_geoip_file);
+        } else {
+            for (const char **p = geoip4_defaults; *p; p++) {
+                if (moor_geoip_load(&g_geoip_db, *p) == 0) {
+                    LOG_INFO("GeoIP: loaded %d IPv4 entries from %s",
+                             g_geoip_db.num_entries, *p);
+                    break;
+                }
+            }
+        }
+        /* IPv6: use explicit path or probe defaults */
+        if (g_geoip6_file[0]) {
+            if (moor_geoip_load6(&g_geoip_db, g_geoip6_file) == 0)
+                LOG_INFO("GeoIP: loaded %d IPv6 entries from %s",
+                         g_geoip_db.num_entries6, g_geoip6_file);
+            else
+                LOG_WARN("GeoIP: failed to load %s", g_geoip6_file);
+        } else {
+            for (const char **p = geoip6_defaults; *p; p++) {
+                if (moor_geoip_load6(&g_geoip_db, *p) == 0) {
+                    LOG_INFO("GeoIP: loaded %d IPv6 entries from %s",
+                             g_geoip_db.num_entries6, *p);
+                    break;
+                }
+            }
+        }
+    }
+    if (g_geoip_db.num_entries > 0 || g_geoip_db.num_entries6 > 0) {
+        moor_circuit_set_geoip(&g_geoip_db);
+        moor_da_set_geoip(&g_geoip_db);
+        LOG_INFO("GeoIP: path diversity enabled (%d v4 + %d v6 entries)",
+                 g_geoip_db.num_entries, g_geoip_db.num_entries6);
+    }
+
+    /* Handle signals */
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+#ifndef _WIN32
+    signal(SIGPIPE, SIG_IGN);
+#endif
+
+#ifdef _WIN32
+    /* Install crash handler to catch access violations */
+    SetUnhandledExceptionFilter(moor_win32_crash_handler);
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        fprintf(stderr, "FATAL: WSAStartup failed\n");
+        return 1;
+    }
+#endif
+
+    int ret;
+    switch (g_mode) {
+    case MOOR_MODE_DA:
+        ret = run_da();
+        break;
+    case MOOR_MODE_RELAY:
+        ret = run_relay();
+        break;
+    case MOOR_MODE_CLIENT:
+        ret = run_client();
+        break;
+    case MOOR_MODE_HS:
+        ret = run_hs();
+        break;
+    case MOOR_MODE_OB:
+        ret = run_ob();
+        break;
+    case MOOR_MODE_BRIDGEDB:
+        ret = run_bridgedb();
+        break;
+    case MOOR_MODE_BRIDGE_AUTH:
+        LOG_ERROR("bridge_auth mode is not yet implemented");
+        ret = -1;
+        break;
+    default:
+        ret = -1;
+    }
+
+    /* Remove PID file */
+    if (g_pid_file_path[0])
+        unlink(g_pid_file_path);
+
+    /* Cleanup -- wipe all secret keys (globals + copies in sub-configs) */
+    sodium_memzero(g_identity_sk, 64);
+    sodium_memzero(g_onion_sk, 32);
+    sodium_memzero(g_pq_identity_sk, MOOR_MLDSA_SK_LEN);
+    sodium_memzero(&g_da_config, sizeof(g_da_config));
+    sodium_memzero(&g_relay_cfg, sizeof(g_relay_cfg));
+    sodium_memzero(&g_config.control_password,
+                   sizeof(g_config.control_password));
+    moor_monitor_cleanup();
+
+#ifdef _WIN32
+    WSACleanup();
+#endif
+
+    return (ret == 0) ? 0 : 1;
+}
