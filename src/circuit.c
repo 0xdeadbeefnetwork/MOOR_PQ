@@ -1793,6 +1793,18 @@ void moor_circuit_check_timeouts(void) {
             continue;
         }
 
+        /* Relay-side: kill circuits stuck waiting for KEM CT (pq_kem_pending).
+         * A client that starts CREATE_PQ but never sends CELL_KEM_CT would
+         * pin the circuit slot and DH key_seed in memory forever. */
+        if (!circ->is_client && circ->pq_kem_pending && age > MOOR_CIRCUIT_TIMEOUT) {
+            LOG_WARN("circuit %u: KEM CT timeout (pq_kem_pending, age=%llu s)",
+                     circ->circuit_id, (unsigned long long)age);
+            moor_crypto_wipe(circ->pq_key_seed, 32);
+            circ->pq_kem_pending = 0;
+            moor_circuit_destroy(circ);
+            continue;
+        }
+
         /* Circuit rotation: tear down old established circuits.
          * Skip circuits with active streams to avoid killing live connections. */
         if (circ->is_client && age > MOOR_CIRCUIT_ROTATE_SECS) {
@@ -3388,6 +3400,13 @@ static void cbuild_finish(moor_circuit_t *circ, int status) {
     moor_crypto_wipe(ctx, sizeof(*ctx));
     free(ctx);
     circ->build_ctx = NULL;
+
+    if (status != 0) {
+        /* Free the circuit pool slot so it can be reused.
+         * Must happen AFTER ctx is freed (circ_free_unlocked wipes the slot). */
+        moor_circuit_free(circ);
+    }
+
     if (cb) cb(circ, status, arg);
 }
 
@@ -3843,9 +3862,12 @@ int moor_circuit_build_async(moor_circuit_t *circ,
     if (!middle) { moor_crypto_wipe(ctx, sizeof(*ctx)); free(ctx); circ->build_ctx = NULL; return -1; }
     memcpy(&ctx->path[1], middle, sizeof(moor_node_descriptor_t));
 
-    /* Check for existing connection to guard */
+    /* Check for existing connection to guard (multiplexing) */
     moor_connection_t *existing = moor_connection_find_by_identity(guard->identity_pk);
     if (existing) {
+        /* Reusing guard connection -- free the caller's unused allocation */
+        if (conn != existing)
+            moor_connection_free(conn);
         circ->conn = existing;
         cbuild_on_connect(existing, 0, circ);
         return 0;
