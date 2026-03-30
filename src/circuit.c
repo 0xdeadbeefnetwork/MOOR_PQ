@@ -3611,45 +3611,60 @@ static void cbuild_send_extend(moor_circuit_t *circ, int hop_idx) {
         }
     }
 
-    /* Build EXTEND2 payload with link specifiers */
+    /* Build EXTEND payload.  PQ and classical use different formats:
+     * - EXTEND_PQ: flat address(64) + port(2) + identity(32) + eph_pk(32) = 130 bytes
+     * - EXTEND2:   typed link specifiers + eph_pk (Tor-aligned) */
     uint8_t extend_data[256];
     size_t off = 0;
-    uint8_t n_spec = 0;
-    size_t n_spec_off = off++;
+    uint8_t relay_cmd;
 
-    struct in_addr ia4;
-    struct in6_addr ia6;
-    if (inet_pton(AF_INET, next->address, &ia4) == 1) {
-        extend_data[off++] = MOOR_LS_IPV4;
-        extend_data[off++] = 6;
-        memcpy(extend_data + off, &ia4, 4); off += 4;
-        extend_data[off++] = (uint8_t)(next->or_port >> 8);
-        extend_data[off++] = (uint8_t)(next->or_port);
-        n_spec++;
-    } else if (inet_pton(AF_INET6, next->address, &ia6) == 1) {
-        extend_data[off++] = MOOR_LS_IPV6;
-        extend_data[off++] = 18;
-        memcpy(extend_data + off, &ia6, 16); off += 16;
-        extend_data[off++] = (uint8_t)(next->or_port >> 8);
-        extend_data[off++] = (uint8_t)(next->or_port);
-        n_spec++;
+    if (ctx->pq_hop) {
+        /* EXTEND_PQ: flat 130-byte format (relay expects this) */
+        memset(extend_data, 0, 130);
+        memcpy(extend_data, next->address, strlen(next->address));
+        extend_data[64] = (uint8_t)(next->or_port >> 8);
+        extend_data[65] = (uint8_t)(next->or_port);
+        memcpy(extend_data + 66, next->identity_pk, 32);
+        memcpy(extend_data + 98, ctx->eph_pk, 32);
+        off = 130;
+        relay_cmd = RELAY_EXTEND_PQ;
     } else {
-        extend_data[off++] = MOOR_LS_IPV4;
-        extend_data[off++] = 6;
-        memset(extend_data + off, 0, 4); off += 4;
-        extend_data[off++] = (uint8_t)(next->or_port >> 8);
-        extend_data[off++] = (uint8_t)(next->or_port);
-        n_spec++;
-    }
-    extend_data[off++] = MOOR_LS_IDENTITY;
-    extend_data[off++] = 32;
-    memcpy(extend_data + off, next->identity_pk, 32); off += 32;
-    n_spec++;
-    extend_data[n_spec_off] = n_spec;
-    memcpy(extend_data + off, ctx->eph_pk, 32); off += 32;
+        /* EXTEND2: link specifier format */
+        uint8_t n_spec = 0;
+        size_t n_spec_off = off++;
 
-    /* Send as RELAY_EXTEND2 (or RELAY_EXTEND_PQ) via RELAY_EARLY */
-    uint8_t relay_cmd = ctx->pq_hop ? RELAY_EXTEND_PQ : RELAY_EXTEND2;
+        struct in_addr ia4;
+        struct in6_addr ia6;
+        if (inet_pton(AF_INET, next->address, &ia4) == 1) {
+            extend_data[off++] = MOOR_LS_IPV4;
+            extend_data[off++] = 6;
+            memcpy(extend_data + off, &ia4, 4); off += 4;
+            extend_data[off++] = (uint8_t)(next->or_port >> 8);
+            extend_data[off++] = (uint8_t)(next->or_port);
+            n_spec++;
+        } else if (inet_pton(AF_INET6, next->address, &ia6) == 1) {
+            extend_data[off++] = MOOR_LS_IPV6;
+            extend_data[off++] = 18;
+            memcpy(extend_data + off, &ia6, 16); off += 16;
+            extend_data[off++] = (uint8_t)(next->or_port >> 8);
+            extend_data[off++] = (uint8_t)(next->or_port);
+            n_spec++;
+        } else {
+            extend_data[off++] = MOOR_LS_IPV4;
+            extend_data[off++] = 6;
+            memset(extend_data + off, 0, 4); off += 4;
+            extend_data[off++] = (uint8_t)(next->or_port >> 8);
+            extend_data[off++] = (uint8_t)(next->or_port);
+            n_spec++;
+        }
+        extend_data[off++] = MOOR_LS_IDENTITY;
+        extend_data[off++] = 32;
+        memcpy(extend_data + off, next->identity_pk, 32); off += 32;
+        n_spec++;
+        extend_data[n_spec_off] = n_spec;
+        memcpy(extend_data + off, ctx->eph_pk, 32); off += 32;
+        relay_cmd = RELAY_EXTEND2;
+    }
     moor_cell_t cell;
     moor_cell_relay(&cell, circ->circuit_id, relay_cmd, 0,
                     extend_data, (uint16_t)off);
