@@ -706,6 +706,7 @@ static void ratelimit_refill_cb(void *arg) {
 static void circuit_timeout_cb(void *arg) {
     (void)arg;
     moor_circuit_check_timeouts();
+    moor_socks5_check_stream_timeouts();
 }
 
 /* Path bias timer: check guard circuit success rates */

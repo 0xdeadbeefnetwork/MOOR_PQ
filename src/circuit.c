@@ -1771,6 +1771,14 @@ void moor_circuit_check_timeouts(void) {
             age > MOOR_CIRCUIT_TIMEOUT) {
             LOG_WARN("circuit %u timed out during build (age=%llu s)",
                      circ->circuit_id, (unsigned long long)age);
+            /* Send DESTROY while connection is still alive --
+             * invalidate_circuit closes it, preventing destroy() from
+             * sending (conn gets nullified). */
+            if (circ->conn && circ->conn->state == CONN_STATE_OPEN) {
+                moor_cell_t dcell;
+                moor_cell_destroy(&dcell, circ->circuit_id);
+                moor_connection_send_cell(circ->conn, &dcell);
+            }
             moor_socks5_invalidate_circuit(circ);
             moor_circuit_destroy(circ);
             continue;
@@ -1792,12 +1800,22 @@ void moor_circuit_check_timeouts(void) {
                 if (age > MOOR_CIRCUIT_ROTATE_SECS * 2) {
                     LOG_WARN("force-rotating circuit %u with active streams (age=%llu s)",
                              circ->circuit_id, (unsigned long long)age);
+                    if (circ->conn && circ->conn->state == CONN_STATE_OPEN) {
+                        moor_cell_t dcell;
+                        moor_cell_destroy(&dcell, circ->circuit_id);
+                        moor_connection_send_cell(circ->conn, &dcell);
+                    }
                     moor_socks5_invalidate_circuit(circ);
                     moor_circuit_destroy(circ);
                 }
             } else {
                 LOG_INFO("rotating idle circuit %u (age=%llu s)",
                          circ->circuit_id, (unsigned long long)age);
+                if (circ->conn && circ->conn->state == CONN_STATE_OPEN) {
+                    moor_cell_t dcell;
+                    moor_cell_destroy(&dcell, circ->circuit_id);
+                    moor_connection_send_cell(circ->conn, &dcell);
+                }
                 moor_socks5_invalidate_circuit(circ);
                 moor_circuit_destroy(circ);
             }
@@ -1839,6 +1857,11 @@ int moor_circuit_oom_kill(int target_free) {
             LOG_INFO("OOM: killing idle circuit %u (idle %llu s)",
                      circ->circuit_id,
                      (unsigned long long)(now - circ->last_cell_time));
+            if (circ->conn && circ->conn->state == CONN_STATE_OPEN) {
+                moor_cell_t dcell;
+                moor_cell_destroy(&dcell, circ->circuit_id);
+                moor_connection_send_cell(circ->conn, &dcell);
+            }
             moor_socks5_invalidate_circuit(circ);
             moor_circuit_destroy(circ);
             killed++;
@@ -1858,6 +1881,11 @@ int moor_circuit_oom_kill(int target_free) {
         LOG_INFO("OOM: killing oldest circuit %u (age %llu s)",
                  oldest->circuit_id,
                  (unsigned long long)(now - oldest->created_at));
+        if (oldest->conn && oldest->conn->state == CONN_STATE_OPEN) {
+            moor_cell_t dcell;
+            moor_cell_destroy(&dcell, oldest->circuit_id);
+            moor_connection_send_cell(oldest->conn, &dcell);
+        }
         moor_socks5_invalidate_circuit(oldest);
         moor_circuit_destroy(oldest);
         killed++;

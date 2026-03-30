@@ -446,6 +446,7 @@ static void prebuilt_ready_cb(int fd, int events, void *arg) {
                                       client->target_addr,
                                       client->target_port) == 0) {
             client->state = SOCKS5_STATE_CONNECTED;
+            client->begin_sent_at = (uint64_t)time(NULL);
             LOG_INFO("stream %u opened for queued clearnet client -> %s",
                      client->stream_id, client->target_addr);
         } else {
@@ -602,6 +603,7 @@ static void hs_pending_complete(hs_pending_connect_t *pending) {
                                           client->target_addr,
                                           client->target_port) == 0) {
                 client->state = SOCKS5_STATE_CONNECTED;
+                client->begin_sent_at = (uint64_t)time(NULL);
                 LOG_INFO("HS: stream %u opened for queued client -> %s",
                          client->stream_id, client->target_addr);
             } else {
@@ -1069,6 +1071,26 @@ static int process_circuit_cell(moor_connection_t *conn, moor_cell_t *cell) {
             moor_circuit_destroy(dead);
             if (was_last) return 1; /* connection freed */
             break;
+        }
+
+        /* Also check prebuilt pool -- guard may have torn down a circuit
+         * (relay died, OOM, idle timeout) while it sat waiting for
+         * assignment.  Without this, dead circuits stay in the pool and
+         * get assigned to SOCKS5 clients whose streams then hang. */
+        for (int pi = 0; pi < g_prebuilt_pool_count; pi++) {
+            if (g_prebuilt_pool[pi].conn == conn &&
+                g_prebuilt_pool[pi].circuit &&
+                cell->circuit_id == g_prebuilt_pool[pi].circuit->circuit_id) {
+                LOG_WARN("CELL_DESTROY for prebuilt circuit %u, "
+                         "removing from pool", cell->circuit_id);
+                int was_last = (conn->circuit_refcount <= 1);
+                moor_circuit_destroy(g_prebuilt_pool[pi].circuit);
+                /* Swap with last entry to keep pool contiguous */
+                g_prebuilt_pool[pi] =
+                    g_prebuilt_pool[--g_prebuilt_pool_count];
+                if (was_last) return 1;
+                break;
+            }
         }
         return 0;
     }
@@ -1812,6 +1834,7 @@ int moor_socks5_handle_request(moor_socks5_client_t *client,
      * This prevents the browser from sending data before the tunnel is ready.
      * (Tor-style deferred reply) */
     client->state = SOCKS5_STATE_CONNECTED;
+    client->begin_sent_at = (uint64_t)time(NULL);
 
     return 0;
 }
@@ -2002,12 +2025,12 @@ void moor_socks5_invalidate_circuit(moor_circuit_t *circ) {
         }
     }
 
-    /* NULL out circuit cache entries pointing to this circuit */
+    /* NULL out circuit cache entries pointing to this circuit,
+     * then remove fully-dead entries to prevent cache bloat. */
     for (int i = 0; i < g_circuit_cache_count; i++) {
         circuit_cache_entry_t *e = &g_circuit_cache[i];
         if (e->circuit == circ) {
             e->circuit = NULL;
-            /* Also clean up the connection associated with this entry */
             if (e->conn) {
                 moor_event_remove(e->conn->fd);
                 moor_connection_close(e->conn);
@@ -2028,6 +2051,62 @@ void moor_socks5_invalidate_circuit(moor_circuit_t *circ) {
                 }
             }
         }
+
+        /* Remove entry if primary circuit is dead and no live extra legs */
+        if (!e->circuit) {
+            int has_live = 0;
+            for (int j = 0; j < e->num_extra; j++) {
+                if (e->extra_circuits[j]) { has_live = 1; break; }
+            }
+            if (!has_live) {
+                g_circuit_cache[i] = g_circuit_cache[--g_circuit_cache_count];
+                i--; /* re-check swapped entry */
+            }
+        }
+    }
+}
+
+/* Check for SOCKS5 clients stuck waiting for RELAY_CONNECTED.
+ * Called periodically from the circuit timeout timer (every 10s).
+ * Without this, a dead circuit (guard killed it, exit unresponsive)
+ * leaves clients hanging for 600-1200s until circuit rotation. */
+#define MOOR_STREAM_CONNECT_TIMEOUT 30  /* seconds */
+void moor_socks5_check_stream_timeouts(void) {
+    uint64_t now = (uint64_t)time(NULL);
+    for (int i = 0; i < MAX_SOCKS5_CLIENTS; i++) {
+        moor_socks5_client_t *c = &g_socks5_clients[i];
+        if (c->client_fd < 0 || c->state != SOCKS5_STATE_CONNECTED)
+            continue;
+        if (c->begin_sent_at == 0 || now < c->begin_sent_at)
+            continue;
+        if (now - c->begin_sent_at < MOOR_STREAM_CONNECT_TIMEOUT)
+            continue;
+
+        LOG_WARN("stream %u: CONNECTED timeout (%us) for %s, closing",
+                 c->stream_id, MOOR_STREAM_CONNECT_TIMEOUT,
+                 c->target_addr);
+
+        /* Send SOCKS5 failure (host unreachable) */
+        uint8_t fail[] = { 0x05, 0x04, 0x00, 0x01, 0,0,0,0, 0,0 };
+        send(c->client_fd, (char *)fail, sizeof(fail), MSG_NOSIGNAL);
+
+        /* Send RELAY_END to free the stream slot on the circuit */
+        if (c->circuit && c->stream_id != 0) {
+            moor_cell_t end_cell;
+            moor_cell_relay(&end_cell, c->circuit->circuit_id,
+                           RELAY_END, c->stream_id, NULL, 0);
+            moor_circuit_encrypt_forward(c->circuit, &end_cell);
+            if (c->circuit->conn)
+                moor_connection_send_cell(c->circuit->conn, &end_cell);
+            moor_stream_t *s = moor_circuit_find_stream(c->circuit,
+                                                         c->stream_id);
+            if (s) s->stream_id = 0;
+        }
+        moor_event_remove(c->client_fd);
+        close(c->client_fd);
+        c->client_fd = -1;
+        c->circuit = NULL;
+        c->stream_id = 0;
     }
 }
 
