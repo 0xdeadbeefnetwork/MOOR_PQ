@@ -1657,60 +1657,16 @@ int moor_relay_handle_create_pq(moor_connection_t *conn,
         return -1;
     }
 
-    /* PQ hybrid: read KEM ciphertext (1088 bytes) from link after CREATED_PQ.
-     * Client sends CT immediately after receiving CREATED_PQ.
-     * Wait for data with timeout, then read. No silent fallback — if KEM
-     * fails, the CREATE fails (client always sends CT for CREATE_PQ). */
-    uint8_t kem_ct[MOOR_KEM_CT_LEN];
-    size_t kem_got = 0;
-    while (kem_got < MOOR_KEM_CT_LEN) {
-        if (wait_for_readable(conn->fd, 5000) <= 0) {
-            LOG_ERROR("CREATE_PQ: timeout waiting for KEM ciphertext");
-            moor_circuit_free(circ);
-            moor_crypto_wipe(eph_sk, 32);
-            moor_crypto_wipe(our_curve_sk, 32);
-            moor_crypto_wipe(key_seed, 32);
-            return -1;
-        }
-        ssize_t n = moor_connection_recv_raw(conn, kem_ct + kem_got,
-                                              MOOR_KEM_CT_LEN - kem_got);
-        if (n <= 0) {
-            LOG_ERROR("CREATE_PQ: failed to read KEM ciphertext (%zd)", n);
-            moor_circuit_free(circ);
-            moor_crypto_wipe(eph_sk, 32);
-            moor_crypto_wipe(our_curve_sk, 32);
-            moor_crypto_wipe(key_seed, 32);
-            return -1;
-        }
-        kem_got += (size_t)n;
-    }
-
-    /* Decapsulate: recover shared secret from client's ciphertext */
-    {
-        uint8_t kem_ss[MOOR_KEM_SS_LEN];
-        if (moor_kem_decapsulate(kem_ss, kem_ct, g_relay_config.kem_sk) != 0) {
-            LOG_ERROR("CREATE_PQ: KEM decapsulation failed");
-            moor_crypto_wipe(kem_ss, MOOR_KEM_SS_LEN);
-            moor_circuit_free(circ);
-            moor_crypto_wipe(eph_sk, 32);
-            moor_crypto_wipe(our_curve_sk, 32);
-            moor_crypto_wipe(key_seed, 32);
-            return -1;
-        }
-
-        /* Derive hybrid circuit keys: combine DH key_seed + KEM shared secret */
-        moor_crypto_circuit_kx_hybrid(
-            circ->relay_forward_key, circ->relay_backward_key,
-            circ->relay_forward_digest, circ->relay_backward_digest,
-            key_seed, kem_ss);
-
-        circ->relay_forward_nonce = 0;
-        circ->relay_backward_nonce = 0;
-
-        moor_crypto_wipe(kem_ss, MOOR_KEM_SS_LEN);
-        LOG_INFO("CREATE_PQ handled (PQ hybrid CKE): circuit %u", cell->circuit_id);
-        goto done;
-    }
+    /* PQ hybrid: KEM ciphertext arrives as CELL_KEM_CT cells (non-blocking).
+     * Store DH key_seed and mark circuit as pending KEM CT.
+     * When all 1088 bytes arrive via relay_handle_kem_ct_cell(), the circuit
+     * keys are derived and the circuit becomes operational. */
+    memcpy(circ->pq_key_seed, key_seed, 32);
+    circ->pq_kem_ct_len = 0;
+    circ->pq_kem_pending = 1;
+    LOG_INFO("CREATE_PQ: DH done, awaiting KEM CT cells for circuit %u",
+             cell->circuit_id);
+    goto done;
 
 done:
     moor_crypto_wipe(eph_sk, 32);
@@ -2753,18 +2709,22 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                                            relay_conn_read_cb, next_conn);
                         moor_circuit_register(circ);
 
-                        /* Forward buffered KEM CT to next hop */
+                        /* Forward buffered KEM CT to next hop as CELL_KEM_CT */
                         if (circ->pq_kem_ct_len > 0) {
-                            size_t kem_sent = 0;
-                            while (kem_sent < MOOR_KEM_CT_LEN) {
-                                ssize_t n = moor_connection_send_raw(next_conn,
-                                                circ->pq_kem_ct + kem_sent,
-                                                MOOR_KEM_CT_LEN - kem_sent);
-                                if (n <= 0) {
-                                    LOG_ERROR("EXTEND_PQ (frag): failed to forward KEM CT");
+                            size_t ct_off = 0;
+                            while (ct_off < MOOR_KEM_CT_LEN) {
+                                size_t chunk = MOOR_KEM_CT_LEN - ct_off;
+                                if (chunk > MOOR_CELL_PAYLOAD) chunk = MOOR_CELL_PAYLOAD;
+                                moor_cell_t kem_cell;
+                                kem_cell.circuit_id = circ->next_circuit_id;
+                                kem_cell.command = CELL_KEM_CT;
+                                memset(kem_cell.payload, 0, MOOR_CELL_PAYLOAD);
+                                memcpy(kem_cell.payload, circ->pq_kem_ct + ct_off, chunk);
+                                if (moor_connection_send_cell(next_conn, &kem_cell) != 0) {
+                                    LOG_ERROR("EXTEND_PQ (frag): failed to forward KEM CT cell");
                                     return -1;
                                 }
-                                kem_sent += (size_t)n;
+                                ct_off += chunk;
                             }
                             LOG_INFO("EXTEND_PQ (frag): forwarded %zu bytes KEM CT",
                                      circ->pq_kem_ct_len);
@@ -2940,18 +2900,22 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                                    relay_conn_read_cb, next_conn);
                 moor_circuit_register(circ);
 
-                /* Forward buffered KEM CT to next hop as raw bytes over the link */
+                /* Forward buffered KEM CT to next hop as CELL_KEM_CT cells */
                 {
-                    size_t sent = 0;
-                    while (sent < MOOR_KEM_CT_LEN) {
-                        ssize_t n = moor_connection_send_raw(next_conn,
-                                        circ->pq_kem_ct + sent,
-                                        MOOR_KEM_CT_LEN - sent);
-                        if (n <= 0) {
-                            LOG_ERROR("EXTEND_PQ: failed to forward KEM CT");
+                    size_t ct_off = 0;
+                    while (ct_off < MOOR_KEM_CT_LEN) {
+                        size_t chunk = MOOR_KEM_CT_LEN - ct_off;
+                        if (chunk > MOOR_CELL_PAYLOAD) chunk = MOOR_CELL_PAYLOAD;
+                        moor_cell_t kem_cell;
+                        kem_cell.circuit_id = circ->next_circuit_id;
+                        kem_cell.command = CELL_KEM_CT;
+                        memset(kem_cell.payload, 0, MOOR_CELL_PAYLOAD);
+                        memcpy(kem_cell.payload, circ->pq_kem_ct + ct_off, chunk);
+                        if (moor_connection_send_cell(next_conn, &kem_cell) != 0) {
+                            LOG_ERROR("EXTEND_PQ: failed to forward KEM CT cell");
                             return -1;
                         }
-                        sent += (size_t)n;
+                        ct_off += chunk;
                     }
                 }
                 LOG_INFO("EXTEND_PQ: forwarded %zu bytes KEM CT to next hop",
@@ -3548,6 +3512,51 @@ int moor_relay_process_cell(moor_connection_t *conn,
         return moor_relay_handle_relay(conn, cell);
     case CELL_DESTROY:
         return moor_relay_handle_destroy(conn, cell);
+    case CELL_KEM_CT: {
+        /* KEM ciphertext fragment for PQ hybrid CREATE.
+         * Accumulate in circuit's pq_kem_ct buffer.  When all 1088 bytes
+         * arrive, finish KEM decapsulation + hybrid key derivation. */
+        moor_circuit_t *circ = moor_circuit_find(cell->circuit_id, conn);
+        if (!circ || !circ->pq_kem_pending) {
+            LOG_WARN("CELL_KEM_CT for unknown/non-pending circuit %u",
+                     cell->circuit_id);
+            return 0;
+        }
+        size_t space = MOOR_KEM_CT_LEN - circ->pq_kem_ct_len;
+        size_t chunk = MOOR_CELL_PAYLOAD;
+        if (chunk > space) chunk = space;
+        memcpy(circ->pq_kem_ct + circ->pq_kem_ct_len,
+               cell->payload, chunk);
+        circ->pq_kem_ct_len += chunk;
+
+        if (circ->pq_kem_ct_len >= MOOR_KEM_CT_LEN) {
+            /* All KEM CT received -- decapsulate and derive keys */
+            uint8_t kem_ss[MOOR_KEM_SS_LEN];
+            if (moor_kem_decapsulate(kem_ss, circ->pq_kem_ct,
+                                      g_relay_config.kem_sk) != 0) {
+                LOG_ERROR("CREATE_PQ: KEM decapsulation failed (circuit %u)",
+                          circ->circuit_id);
+                moor_crypto_wipe(kem_ss, MOOR_KEM_SS_LEN);
+                moor_crypto_wipe(circ->pq_key_seed, 32);
+                circ->pq_kem_pending = 0;
+                moor_relay_handle_destroy(conn, cell);
+                return -1;
+            }
+            moor_crypto_circuit_kx_hybrid(
+                circ->relay_forward_key, circ->relay_backward_key,
+                circ->relay_forward_digest, circ->relay_backward_digest,
+                circ->pq_key_seed, kem_ss);
+            circ->relay_forward_nonce = 0;
+            circ->relay_backward_nonce = 0;
+            moor_crypto_wipe(kem_ss, MOOR_KEM_SS_LEN);
+            moor_crypto_wipe(circ->pq_key_seed, 32);
+            circ->pq_kem_pending = 0;
+            circ->pq_kem_ct_len = 0;
+            LOG_INFO("CREATE_PQ: KEM CT complete, circuit %u ready (PQ hybrid)",
+                     circ->circuit_id);
+        }
+        return 0;
+    }
     case CELL_PADDING:
         return 0;
     default:

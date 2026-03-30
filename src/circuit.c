@@ -822,20 +822,29 @@ int moor_circuit_create_pq(moor_circuit_t *circ,
         return -1;
     }
 
-    /* Send KEM ciphertext (1088 bytes) over the encrypted link */
-    size_t sent = 0;
-    while (sent < MOOR_KEM_CT_LEN) {
-        ssize_t n = moor_connection_send_raw(circ->conn,
-                                              kem_ct + sent,
-                                              MOOR_KEM_CT_LEN - sent);
-        if (n <= 0) {
-            LOG_ERROR("CKE PQ: failed to send KEM ciphertext");
-            moor_crypto_wipe(eph_sk, 32);
-            moor_crypto_wipe(key_seed, 32);
-            moor_crypto_wipe(kem_ss, MOOR_KEM_SS_LEN);
-            return -1;
+    /* Send KEM ciphertext (1088 bytes) as CELL_KEM_CT cells.
+     * Fragmented into ceil(1088/509) = 3 cells (509 + 509 + 70 bytes).
+     * Uses cell framing instead of raw bytes so the send is non-blocking
+     * (cells are queued via the scheduler output queue). */
+    {
+        size_t ct_off = 0;
+        while (ct_off < MOOR_KEM_CT_LEN) {
+            size_t chunk = MOOR_KEM_CT_LEN - ct_off;
+            if (chunk > MOOR_CELL_PAYLOAD) chunk = MOOR_CELL_PAYLOAD;
+            moor_cell_t kem_cell;
+            kem_cell.circuit_id = circ->circuit_id;
+            kem_cell.command = CELL_KEM_CT;
+            memset(kem_cell.payload, 0, MOOR_CELL_PAYLOAD);
+            memcpy(kem_cell.payload, kem_ct + ct_off, chunk);
+            if (moor_connection_send_cell(circ->conn, &kem_cell) != 0) {
+                LOG_ERROR("CKE PQ: failed to send KEM CT cell");
+                moor_crypto_wipe(eph_sk, 32);
+                moor_crypto_wipe(key_seed, 32);
+                moor_crypto_wipe(kem_ss, MOOR_KEM_SS_LEN);
+                return -1;
+            }
+            ct_off += chunk;
         }
-        sent += (size_t)n;
     }
 
     /* Derive PQ hybrid circuit keys */
@@ -2031,13 +2040,13 @@ int moor_circuit_build(moor_circuit_t *circ,
 
     /* EXTEND to middle */
     if ((middle->features & NODE_FEATURE_PQ) && !sodium_is_zero(middle->kem_pk, 1184))
-        { if (moor_circuit_extend(circ, middle) != 0) return -1; }
+        { if (moor_circuit_extend_pq(circ, middle) != 0) return -1; }
     else
         { if (moor_circuit_extend(circ, middle) != 0) return -1; }
 
     /* EXTEND to exit */
     if ((exit_relay->features & NODE_FEATURE_PQ) && !sodium_is_zero(exit_relay->kem_pk, 1184))
-        { if (moor_circuit_extend(circ, exit_relay) != 0) return -1; }
+        { if (moor_circuit_extend_pq(circ, exit_relay) != 0) return -1; }
     else
         { if (moor_circuit_extend(circ, exit_relay) != 0) return -1; }
 
@@ -2176,13 +2185,13 @@ int moor_circuit_build_bridge(moor_circuit_t *circ,
 
     /* EXTEND to middle */
     if ((middle->features & NODE_FEATURE_PQ) && !sodium_is_zero(middle->kem_pk, 1184))
-        { if (moor_circuit_extend(circ, middle) != 0) return -1; }
+        { if (moor_circuit_extend_pq(circ, middle) != 0) return -1; }
     else
         { if (moor_circuit_extend(circ, middle) != 0) return -1; }
 
     /* EXTEND to exit */
     if ((exit_relay->features & NODE_FEATURE_PQ) && !sodium_is_zero(exit_relay->kem_pk, 1184))
-        { if (moor_circuit_extend(circ, exit_relay) != 0) return -1; }
+        { if (moor_circuit_extend_pq(circ, exit_relay) != 0) return -1; }
     else
         { if (moor_circuit_extend(circ, exit_relay) != 0) return -1; }
 
@@ -3333,20 +3342,414 @@ moor_circuit_t *moor_circuit_find_by_isolation(const char *key) {
     return NULL;
 }
 
-/* ---- Async circuit building ---- */
+/* ---- Non-blocking async circuit building (state machine) ----
+ *
+ * Replaces the blocking builder thread.  All I/O is non-blocking:
+ *   SEND cell → set state → return to event loop →
+ *   cell arrives via circuit_read_cb / process_circuit_cell →
+ *   moor_circuit_build_handle_created / _handle_extended →
+ *   advance state → SEND next cell → repeat until 3 hops.
+ *
+ * Connection multiplexing is natural: moor_connection_find_by_identity()
+ * reuses existing guard connections (safe — single-threaded main loop). */
+
+static void cbuild_send_create(moor_circuit_t *circ);
+static void cbuild_send_extend(moor_circuit_t *circ, int hop_idx);
+static void cbuild_send_next_onion_skin(moor_circuit_t *circ);
 
 static void cbuild_finish(moor_circuit_t *circ, int status) {
     moor_cbuild_ctx_t *ctx = circ->build_ctx;
     if (!ctx) return;
+
+    /* Remove build timeout timer */
+    if (ctx->timeout_timer_id >= 0)
+        moor_event_remove_timer(ctx->timeout_timer_id);
+
     void (*cb)(moor_circuit_t *, int, void *) = ctx->on_complete;
     void *arg = ctx->on_complete_arg;
+
+    if (status != 0) {
+        /* Failure: clean up connection refcount safely */
+        moor_connection_t *conn = circ->conn;
+        moor_circuit_unregister(circ);
+        if (conn) {
+            if (conn->circuit_refcount > 0)
+                conn->circuit_refcount--;
+            /* Only close if no other circuits share this connection */
+            if (conn->circuit_refcount <= 0 &&
+                conn->state == CONN_STATE_OPEN) {
+                moor_event_remove(conn->fd);
+                moor_connection_close(conn);
+            }
+        }
+        circ->conn = NULL;
+    }
+
     moor_crypto_wipe(ctx, sizeof(*ctx));
     free(ctx);
     circ->build_ctx = NULL;
     if (cb) cb(circ, status, arg);
 }
 
-/* Called when async guard connection completes */
+/* Build timeout: kill circuit if build takes too long */
+static void cbuild_timeout_cb(void *arg) {
+    moor_circuit_t *circ = (moor_circuit_t *)arg;
+    if (!circ->build_ctx) return;
+    LOG_WARN("async circuit %u: build timeout", circ->circuit_id);
+    circ->build_ctx->timeout_timer_id = -1; /* prevent double-remove */
+    cbuild_finish(circ, -1);
+}
+
+/* ---- Send CREATE (non-blocking) ---- */
+static void cbuild_send_create(moor_circuit_t *circ) {
+    moor_cbuild_ctx_t *ctx = circ->build_ctx;
+    const moor_node_descriptor_t *guard = &ctx->path[0];
+
+    memcpy(circ->hops[0].node_id, guard->identity_pk, 32);
+
+    /* Convert identity to Curve25519 for DH */
+    if (moor_crypto_ed25519_to_curve25519_pk(ctx->relay_curve_pk,
+                                              guard->identity_pk) != 0) {
+        LOG_ERROR("cbuild: curve25519 conversion failed");
+        cbuild_finish(circ, -1);
+        return;
+    }
+
+    /* Generate ephemeral keypair (stored in ctx across event loop) */
+    moor_crypto_box_keygen(ctx->eph_pk, ctx->eph_sk);
+
+    ctx->pq_hop = (guard->features & NODE_FEATURE_PQ) &&
+                  !sodium_is_zero(guard->kem_pk, 1184);
+
+    /* Send CREATE or CREATE_PQ */
+    moor_cell_t cell;
+    moor_cell_create(&cell, circ->circuit_id, guard->identity_pk, ctx->eph_pk);
+    if (ctx->pq_hop)
+        cell.command = CELL_CREATE_PQ;
+
+    if (moor_connection_send_cell(circ->conn, &cell) != 0) {
+        cbuild_finish(circ, -1);
+        return;
+    }
+
+    ctx->state = ctx->pq_hop ? CBUILD_WAIT_CREATED_PQ : CBUILD_WAIT_CREATED;
+    if (circ->build_started_ms == 0)
+        circ->build_started_ms = moor_time_ms();
+    LOG_DEBUG("cbuild: circuit %u CREATE%s sent to guard",
+              circ->circuit_id, ctx->pq_hop ? "_PQ" : "");
+}
+
+/* ---- Handle CREATED/CREATED_PQ response ---- */
+int moor_circuit_build_handle_created(moor_circuit_t *circ,
+                                       const moor_cell_t *cell) {
+    moor_cbuild_ctx_t *ctx = circ->build_ctx;
+    if (!ctx) return -1;
+    if (ctx->state != CBUILD_WAIT_CREATED &&
+        ctx->state != CBUILD_WAIT_CREATED_PQ)
+        return -1;
+
+    int expected_cmd = ctx->pq_hop ? CELL_CREATED_PQ : CELL_CREATED;
+    if (cell->command != expected_cmd) {
+        LOG_ERROR("cbuild: expected %s, got cmd %d",
+                  ctx->pq_hop ? "CREATED_PQ" : "CREATED", cell->command);
+        cbuild_finish(circ, -1);
+        return 0;
+    }
+
+    /* Extract relay_eph_pk + auth_tag */
+    uint8_t relay_eph_pk[32], recv_auth_tag[32];
+    memcpy(relay_eph_pk, cell->payload, 32);
+    memcpy(recv_auth_tag, cell->payload + 32, 32);
+
+    /* DH */
+    uint8_t dh1[32], dh2[32];
+    if (moor_crypto_dh(dh1, ctx->eph_sk, relay_eph_pk) != 0 ||
+        moor_crypto_dh(dh2, ctx->eph_sk, ctx->relay_curve_pk) != 0) {
+        moor_crypto_wipe(dh1, 32);
+        moor_crypto_wipe(dh2, 32);
+        cbuild_finish(circ, -1);
+        return 0;
+    }
+
+    /* Derive key_seed + verify auth */
+    uint8_t key_seed[32], expected_auth[32];
+    cke_derive(key_seed, expected_auth, dh1, dh2,
+               ctx->path[0].identity_pk, ctx->eph_pk, relay_eph_pk);
+    moor_crypto_wipe(dh1, 32);
+    moor_crypto_wipe(dh2, 32);
+
+    if (sodium_memcmp(recv_auth_tag, expected_auth, 32) != 0) {
+        LOG_ERROR("cbuild: CREATE auth tag mismatch");
+        moor_crypto_wipe(key_seed, 32);
+        cbuild_finish(circ, -1);
+        return 0;
+    }
+
+    if (ctx->pq_hop) {
+        /* PQ: KEM encapsulate and send CT as cells */
+        if (moor_kem_encapsulate(ctx->kem_ct, ctx->kem_ss,
+                                  ctx->path[0].kem_pk) != 0) {
+            LOG_ERROR("cbuild: KEM encapsulation failed");
+            moor_crypto_wipe(key_seed, 32);
+            cbuild_finish(circ, -1);
+            return 0;
+        }
+        /* Send KEM CT as CELL_KEM_CT cells */
+        size_t ct_off = 0;
+        while (ct_off < MOOR_KEM_CT_LEN) {
+            size_t chunk = MOOR_KEM_CT_LEN - ct_off;
+            if (chunk > MOOR_CELL_PAYLOAD) chunk = MOOR_CELL_PAYLOAD;
+            moor_cell_t kem_cell;
+            kem_cell.circuit_id = circ->circuit_id;
+            kem_cell.command = CELL_KEM_CT;
+            memset(kem_cell.payload, 0, MOOR_CELL_PAYLOAD);
+            memcpy(kem_cell.payload, ctx->kem_ct + ct_off, chunk);
+            if (moor_connection_send_cell(circ->conn, &kem_cell) != 0) {
+                moor_crypto_wipe(key_seed, 32);
+                cbuild_finish(circ, -1);
+                return 0;
+            }
+            ct_off += chunk;
+        }
+        /* Derive hybrid keys */
+        moor_crypto_circuit_kx_hybrid(
+            circ->hops[0].forward_key, circ->hops[0].backward_key,
+            circ->hops[0].forward_digest, circ->hops[0].backward_digest,
+            key_seed, ctx->kem_ss);
+        moor_crypto_wipe(ctx->kem_ss, 32);
+    } else {
+        /* Classical key derivation */
+        moor_crypto_kdf(circ->hops[0].forward_key, 32, key_seed, 1, "moorFWD!");
+        moor_crypto_kdf(circ->hops[0].backward_key, 32, key_seed, 2, "moorBWD!");
+        moor_crypto_hash(circ->hops[0].forward_digest, key_seed, 32);
+        moor_crypto_hash_keyed(circ->hops[0].backward_digest,
+                               key_seed, 32, circ->hops[0].backward_key);
+    }
+
+    circ->hops[0].forward_nonce = 0;
+    circ->hops[0].backward_nonce = 0;
+    circ->num_hops = 1;
+
+    moor_crypto_wipe(key_seed, 32);
+    moor_crypto_wipe(ctx->eph_sk, 32);
+
+    LOG_INFO("circuit %u: hop 0 established (%s CKE)",
+             circ->circuit_id, ctx->pq_hop ? "PQ hybrid" : "classical");
+
+    cbuild_send_next_onion_skin(circ);
+    return 0;
+}
+
+/* ---- The driver: decide what to do next ---- */
+static void cbuild_send_next_onion_skin(moor_circuit_t *circ) {
+    if (circ->num_hops >= MOOR_CIRCUIT_HOPS) {
+        /* All hops done! */
+        moor_cbuild_ctx_t *ctx = circ->build_ctx;
+        ctx->state = CBUILD_READY;
+
+        /* Record CBT sample */
+        if (circ->build_started_ms > 0) {
+            uint64_t build_time = moor_time_ms() - circ->build_started_ms;
+            if (!g_cbt_initialized) { moor_cbt_init(&g_cbt); g_cbt_initialized = 1; }
+            moor_cbt_record(&g_cbt, build_time);
+            LOG_DEBUG("CBT: build %llums, adaptive timeout %llums",
+                      (unsigned long long)build_time,
+                      (unsigned long long)g_cbt.timeout_ms);
+        }
+        /* Record path bias success */
+        moor_pathbias_count_build_success(&g_pathbias_guard_state,
+                                           circ->hops[0].node_id);
+
+        LOG_INFO("circuit %u built: %d hops (non-blocking)",
+                 circ->circuit_id, circ->num_hops);
+        cbuild_finish(circ, 0);
+        return;
+    }
+
+    /* Send EXTEND for the next hop */
+    cbuild_send_extend(circ, circ->num_hops);
+}
+
+/* ---- Send EXTEND (non-blocking) ---- */
+static void cbuild_send_extend(moor_circuit_t *circ, int hop_idx) {
+    moor_cbuild_ctx_t *ctx = circ->build_ctx;
+    const moor_node_descriptor_t *next = &ctx->path[hop_idx];
+
+    /* Convert identity to Curve25519 */
+    if (moor_crypto_ed25519_to_curve25519_pk(ctx->relay_curve_pk,
+                                              next->identity_pk) != 0) {
+        cbuild_finish(circ, -1);
+        return;
+    }
+
+    /* Generate ephemeral keypair */
+    moor_crypto_box_keygen(ctx->eph_pk, ctx->eph_sk);
+
+    ctx->pq_hop = (next->features & NODE_FEATURE_PQ) &&
+                  !sodium_is_zero(next->kem_pk, 1184);
+
+    /* PQ: send KEM_OFFER cells first (buffered by relay before EXTEND) */
+    if (ctx->pq_hop) {
+        if (moor_kem_encapsulate(ctx->kem_ct, ctx->kem_ss, next->kem_pk) != 0) {
+            LOG_ERROR("cbuild: KEM encapsulation failed for hop %d", hop_idx);
+            cbuild_finish(circ, -1);
+            return;
+        }
+        size_t ct_off = 0;
+        while (ct_off < MOOR_KEM_CT_LEN) {
+            size_t chunk = MOOR_KEM_CT_LEN - ct_off;
+            if (chunk > MOOR_RELAY_DATA) chunk = MOOR_RELAY_DATA;
+            moor_cell_t kem_cell;
+            moor_cell_relay(&kem_cell, circ->circuit_id, RELAY_KEM_OFFER,
+                           0, ctx->kem_ct + ct_off, (uint16_t)chunk);
+            moor_circuit_encrypt_forward(circ, &kem_cell);
+            if (moor_connection_send_cell(circ->conn, &kem_cell) != 0) {
+                cbuild_finish(circ, -1);
+                return;
+            }
+            ct_off += chunk;
+        }
+    }
+
+    /* Build EXTEND2 payload with link specifiers */
+    uint8_t extend_data[256];
+    size_t off = 0;
+    uint8_t n_spec = 0;
+    size_t n_spec_off = off++;
+
+    struct in_addr ia4;
+    struct in6_addr ia6;
+    if (inet_pton(AF_INET, next->address, &ia4) == 1) {
+        extend_data[off++] = MOOR_LS_IPV4;
+        extend_data[off++] = 6;
+        memcpy(extend_data + off, &ia4, 4); off += 4;
+        extend_data[off++] = (uint8_t)(next->or_port >> 8);
+        extend_data[off++] = (uint8_t)(next->or_port);
+        n_spec++;
+    } else if (inet_pton(AF_INET6, next->address, &ia6) == 1) {
+        extend_data[off++] = MOOR_LS_IPV6;
+        extend_data[off++] = 18;
+        memcpy(extend_data + off, &ia6, 16); off += 16;
+        extend_data[off++] = (uint8_t)(next->or_port >> 8);
+        extend_data[off++] = (uint8_t)(next->or_port);
+        n_spec++;
+    } else {
+        extend_data[off++] = MOOR_LS_IPV4;
+        extend_data[off++] = 6;
+        memset(extend_data + off, 0, 4); off += 4;
+        extend_data[off++] = (uint8_t)(next->or_port >> 8);
+        extend_data[off++] = (uint8_t)(next->or_port);
+        n_spec++;
+    }
+    extend_data[off++] = MOOR_LS_IDENTITY;
+    extend_data[off++] = 32;
+    memcpy(extend_data + off, next->identity_pk, 32); off += 32;
+    n_spec++;
+    extend_data[n_spec_off] = n_spec;
+    memcpy(extend_data + off, ctx->eph_pk, 32); off += 32;
+
+    /* Send as RELAY_EXTEND2 (or RELAY_EXTEND_PQ) via RELAY_EARLY */
+    uint8_t relay_cmd = ctx->pq_hop ? RELAY_EXTEND_PQ : RELAY_EXTEND2;
+    moor_cell_t cell;
+    moor_cell_relay(&cell, circ->circuit_id, relay_cmd, 0,
+                    extend_data, (uint16_t)off);
+    cell.command = CELL_RELAY_EARLY;
+    if (moor_circuit_encrypt_forward(circ, &cell) != 0 ||
+        moor_connection_send_cell(circ->conn, &cell) != 0) {
+        cbuild_finish(circ, -1);
+        return;
+    }
+
+    ctx->state = (hop_idx == 1) ? CBUILD_WAIT_EXTENDED_MID
+                                : CBUILD_WAIT_EXTENDED_EXIT;
+    LOG_DEBUG("cbuild: circuit %u EXTEND%s sent for hop %d",
+              circ->circuit_id, ctx->pq_hop ? "_PQ" : "", hop_idx);
+}
+
+/* ---- Handle RELAY_EXTENDED response ---- */
+int moor_circuit_build_handle_extended(moor_circuit_t *circ,
+                                        uint8_t relay_cmd,
+                                        const uint8_t *data, size_t len) {
+    moor_cbuild_ctx_t *ctx = circ->build_ctx;
+    if (!ctx) return -1;
+    if (ctx->state != CBUILD_WAIT_EXTENDED_MID &&
+        ctx->state != CBUILD_WAIT_EXTENDED_EXIT)
+        return -1;
+
+    if (relay_cmd != RELAY_EXTENDED && relay_cmd != RELAY_EXTENDED2 &&
+        relay_cmd != RELAY_EXTENDED_PQ) {
+        LOG_ERROR("cbuild: unexpected relay cmd %d during EXTEND", relay_cmd);
+        cbuild_finish(circ, -1);
+        return 0;
+    }
+
+    if (len < 64) {
+        LOG_ERROR("cbuild: EXTENDED payload too short (%zu)", len);
+        cbuild_finish(circ, -1);
+        return 0;
+    }
+
+    /* Extract relay_eph_pk + auth_tag */
+    uint8_t relay_eph_pk[32], recv_auth_tag[32];
+    memcpy(relay_eph_pk, data, 32);
+    memcpy(recv_auth_tag, data + 32, 32);
+
+    int hop = circ->num_hops;
+    const moor_node_descriptor_t *next = &ctx->path[hop];
+
+    /* DH */
+    uint8_t dh1[32], dh2[32];
+    if (moor_crypto_dh(dh1, ctx->eph_sk, relay_eph_pk) != 0 ||
+        moor_crypto_dh(dh2, ctx->eph_sk, ctx->relay_curve_pk) != 0) {
+        moor_crypto_wipe(dh1, 32);
+        moor_crypto_wipe(dh2, 32);
+        cbuild_finish(circ, -1);
+        return 0;
+    }
+
+    uint8_t key_seed[32], expected_auth[32];
+    cke_derive(key_seed, expected_auth, dh1, dh2,
+               next->identity_pk, ctx->eph_pk, relay_eph_pk);
+    moor_crypto_wipe(dh1, 32);
+    moor_crypto_wipe(dh2, 32);
+
+    if (sodium_memcmp(recv_auth_tag, expected_auth, 32) != 0) {
+        LOG_ERROR("cbuild: EXTEND auth tag mismatch for hop %d", hop);
+        moor_crypto_wipe(key_seed, 32);
+        cbuild_finish(circ, -1);
+        return 0;
+    }
+
+    /* Derive hop keys */
+    if (ctx->pq_hop && relay_cmd == RELAY_EXTENDED_PQ) {
+        moor_crypto_circuit_kx_hybrid(
+            circ->hops[hop].forward_key, circ->hops[hop].backward_key,
+            circ->hops[hop].forward_digest, circ->hops[hop].backward_digest,
+            key_seed, ctx->kem_ss);
+        moor_crypto_wipe(ctx->kem_ss, 32);
+    } else {
+        moor_crypto_kdf(circ->hops[hop].forward_key, 32, key_seed, 1, "moorFWD!");
+        moor_crypto_kdf(circ->hops[hop].backward_key, 32, key_seed, 2, "moorBWD!");
+        moor_crypto_hash(circ->hops[hop].forward_digest, key_seed, 32);
+        moor_crypto_hash_keyed(circ->hops[hop].backward_digest,
+                               key_seed, 32, circ->hops[hop].backward_key);
+    }
+    circ->hops[hop].forward_nonce = 0;
+    circ->hops[hop].backward_nonce = 0;
+    memcpy(circ->hops[hop].node_id, next->identity_pk, 32);
+    circ->num_hops++;
+
+    moor_crypto_wipe(key_seed, 32);
+    moor_crypto_wipe(ctx->eph_sk, 32);
+
+    LOG_INFO("circuit %u: extended to hop %d (%s CKE)",
+             circ->circuit_id, hop, ctx->pq_hop ? "PQ" : "classical");
+
+    cbuild_send_next_onion_skin(circ);
+    return 0;
+}
+
+/* Called when async guard connection completes (Step 4) */
 static void cbuild_on_connect(moor_connection_t *conn, int status, void *arg) {
     moor_circuit_t *circ = (moor_circuit_t *)arg;
     moor_cbuild_ctx_t *ctx = circ->build_ctx;
@@ -3354,7 +3757,6 @@ static void cbuild_on_connect(moor_connection_t *conn, int status, void *arg) {
 
     if (status != 0) {
         LOG_ERROR("async circuit build: guard connect failed");
-        ctx->state = CBUILD_FAILED;
         cbuild_finish(circ, -1);
         return;
     }
@@ -3362,51 +3764,18 @@ static void cbuild_on_connect(moor_connection_t *conn, int status, void *arg) {
     circ->conn = conn;
     conn->circuit_refcount++;
 
-    /* CREATE with guard — PQ hybrid if relay supports Kyber768 */
-    memcpy(circ->hops[0].node_id, ctx->path[0].identity_pk, 32);
-    if ((ctx->path[0].features & NODE_FEATURE_PQ) &&
-        !sodium_is_zero(ctx->path[0].kem_pk, 1184)) {
-        if (moor_circuit_create_pq(circ, ctx->path[0].identity_pk,
-                                    ctx->path[0].kem_pk) != 0) {
-            ctx->state = CBUILD_FAILED;
-            cbuild_finish(circ, -1);
-            return;
-        }
-    } else {
-        if (moor_circuit_create(circ, ctx->path[0].identity_pk) != 0) {
-            ctx->state = CBUILD_FAILED;
-            cbuild_finish(circ, -1);
-            return;
-        }
-    }
-    ctx->state = CBUILD_EXTENDING_MID;
+    /* Register in hash table so process_circuit_cell can find us */
+    moor_circuit_register(circ);
 
-    /* EXTEND to middle — PQ if supported */
-    {
-        const moor_node_descriptor_t *mid = &ctx->path[1];
-        int pq = (mid->features & NODE_FEATURE_PQ) && !sodium_is_zero(mid->kem_pk, 1184);
-        if ((pq ? moor_circuit_extend(circ, mid) : moor_circuit_extend(circ, mid)) != 0) {
-            ctx->state = CBUILD_FAILED;
-            cbuild_finish(circ, -1);
-            return;
-        }
-    }
-    ctx->state = CBUILD_EXTENDING_EXIT;
+    /* Register connection in event loop for incoming cells.
+     * circuit_read_cb is declared in socks5.c -- we use the extern. */
+    extern void moor_socks5_circuit_read_cb(int fd, int events, void *arg);
+    moor_set_nonblocking(conn->fd);
+    moor_event_add(conn->fd, MOOR_EVENT_READ,
+                   moor_socks5_circuit_read_cb, conn);
 
-    /* EXTEND to exit — PQ if supported */
-    {
-        const moor_node_descriptor_t *ext = &ctx->path[2];
-        int pq = (ext->features & NODE_FEATURE_PQ) && !sodium_is_zero(ext->kem_pk, 1184);
-        if ((pq ? moor_circuit_extend(circ, ext) : moor_circuit_extend(circ, ext)) != 0) {
-            ctx->state = CBUILD_FAILED;
-            cbuild_finish(circ, -1);
-            return;
-        }
-    }
-
-    ctx->state = CBUILD_READY;
-    LOG_INFO("async circuit %u built: 3 hops", circ->circuit_id);
-    cbuild_finish(circ, 0);
+    /* Send CREATE (non-blocking) */
+    cbuild_send_create(circ);
 }
 
 int moor_circuit_build_async(moor_circuit_t *circ,
@@ -3428,7 +3797,13 @@ int moor_circuit_build_async(moor_circuit_t *circ,
     ctx->on_complete_arg = arg;
     ctx->start_ms = moor_time_ms();
     ctx->state = CBUILD_CONNECTING;
+    ctx->timeout_timer_id = -1;
     circ->build_ctx = ctx;
+
+    /* Build timeout: kill if not done within adaptive CBT or 15s default */
+    uint64_t timeout = g_cbt_initialized ? moor_cbt_get_timeout(&g_cbt) : 15000;
+    ctx->timeout_timer_id = moor_event_add_timer(timeout,
+                                                  cbuild_timeout_cb, circ);
 
     /* Select path */
     uint8_t exclude[96];
@@ -3480,4 +3855,11 @@ int moor_circuit_build_async(moor_circuit_t *circ,
 void moor_circuit_build_cancel(moor_circuit_t *circ) {
     if (circ->build_ctx)
         circ->build_ctx->cancelled = 1;
+}
+
+/* Abort a building circuit immediately (e.g. on CELL_DESTROY).
+ * Cleans up connection refcount, unregisters from hash table. */
+void moor_circuit_build_abort(moor_circuit_t *circ) {
+    if (circ->build_ctx)
+        cbuild_finish(circ, -1);
 }

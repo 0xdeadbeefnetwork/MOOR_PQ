@@ -21,7 +21,6 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <pthread.h>
 #endif
 
 #define MAX_SOCKS5_CLIENTS 128
@@ -92,312 +91,33 @@ static int  process_circuit_cell(moor_connection_t *conn, moor_cell_t *cell);
 static void extend_dispatch_cell(moor_connection_t *conn, moor_cell_t *cell);
 static const char *extract_domain(const char *addr);
 
-/* ---- Prebuilt circuit pool + builder thread (#200) ----
- * Builder thread creates circuits in the background.
- * When ready, it pushes to a result queue and signals the main thread
- * via a pipe (Unix) or loopback socket pair (Windows).
- * Main thread pops from the result queue and assigns to waiting clients. */
+/* ---- Prebuilt circuit pool (non-blocking, main-thread) ----
+ * Replaces the builder thread with a timer-driven async builder.
+ * All circuit building happens on the main event loop thread via
+ * moor_circuit_build_async() state machine.  Connections are naturally
+ * shared via moor_connection_find_by_identity() (single-threaded). */
 
 #define PREBUILT_POOL_SIZE 8
-#define PREBUILT_QUEUE_SIZE 16
+#define MAX_CONCURRENT_BUILDS 2
 
 typedef struct {
     moor_circuit_t  *circuit;
     moor_connection_t *conn;
 } prebuilt_entry_t;
 
-/* Ready queue: builder thread pushes, main thread pops */
-static prebuilt_entry_t g_prebuilt_results[PREBUILT_QUEUE_SIZE];
-static int g_prebuilt_res_head = 0, g_prebuilt_res_tail = 0, g_prebuilt_res_count = 0;
-
 /* Pool on main thread: prebuilt circuits ready for assignment */
 static prebuilt_entry_t g_prebuilt_pool[PREBUILT_POOL_SIZE];
 static int g_prebuilt_pool_count = 0;
+static int g_inflight_builds = 0;
+static int g_prebuilt_timer_id = -1;
 
-/* Builder thread state */
-static volatile int g_builder_running = 0;
-static volatile int g_builder_shutdown = 0;
-
-#ifdef _WIN32
-static CRITICAL_SECTION g_builder_mutex;
-static CRITICAL_SECTION g_consensus_mutex;
-static HANDLE g_builder_thread;
-static SOCKET g_builder_notify_send = INVALID_SOCKET;
-static SOCKET g_builder_notify_recv = INVALID_SOCKET;
-#else
-static pthread_mutex_t g_builder_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t g_consensus_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_t g_builder_thread;
-static int g_builder_notify_pipe[2] = {-1, -1};
-#endif
-
-static void builder_lock(void) {
-#ifdef _WIN32
-    EnterCriticalSection(&g_builder_mutex);
-#else
-    pthread_mutex_lock(&g_builder_mutex);
-#endif
-}
-
-static void builder_unlock(void) {
-#ifdef _WIN32
-    LeaveCriticalSection(&g_builder_mutex);
-#else
-    pthread_mutex_unlock(&g_builder_mutex);
-#endif
-}
-
-static void consensus_lock(void) {
-#ifdef _WIN32
-    EnterCriticalSection(&g_consensus_mutex);
-#else
-    pthread_mutex_lock(&g_consensus_mutex);
-#endif
-}
-
-static void consensus_unlock(void) {
-#ifdef _WIN32
-    LeaveCriticalSection(&g_consensus_mutex);
-#else
-    pthread_mutex_unlock(&g_consensus_mutex);
-#endif
-}
-
-/* Thread-safe consensus update (builder thread may be reading) */
+/* No locking needed -- everything is single-threaded now */
 int moor_socks5_update_consensus(const moor_consensus_t *fresh) {
-    consensus_lock();
-    int ret = moor_consensus_copy(&g_client_consensus, fresh);
-    consensus_unlock();
-    return ret;
+    return moor_consensus_copy(&g_client_consensus, fresh);
 }
 
-/* Push a completed circuit to the result queue (called from builder thread) */
-static void builder_push_result(moor_circuit_t *circ, moor_connection_t *conn) {
-    builder_lock();
-    if (g_prebuilt_res_count < PREBUILT_QUEUE_SIZE) {
-        g_prebuilt_results[g_prebuilt_res_tail].circuit = circ;
-        g_prebuilt_results[g_prebuilt_res_tail].conn = conn;
-        g_prebuilt_res_tail = (g_prebuilt_res_tail + 1) % PREBUILT_QUEUE_SIZE;
-        g_prebuilt_res_count++;
-    } else {
-        /* Queue full -- free directly. Do NOT call moor_circuit_destroy()
-         * from builder thread: it sends cells, touches event loop, etc.
-         * These prebuilt circuits have no streams, safe to just free. */
-        LOG_WARN("prebuilt result queue full, discarding circuit %u", circ->circuit_id);
-        if (conn && conn->fd >= 0) {
-            close(conn->fd);
-            conn->fd = -1;
-        }
-        moor_circuit_free(circ);
-        if (conn) moor_connection_free(conn);
-    }
-    builder_unlock();
-}
-
-/* Pop a completed circuit from the result queue (called from main thread) */
-static int builder_pop_result(prebuilt_entry_t *out) {
-    builder_lock();
-    if (g_prebuilt_res_count == 0) {
-        builder_unlock();
-        return 0;
-    }
-    *out = g_prebuilt_results[g_prebuilt_res_head];
-    g_prebuilt_res_head = (g_prebuilt_res_head + 1) % PREBUILT_QUEUE_SIZE;
-    g_prebuilt_res_count--;
-    builder_unlock();
-    return 1;
-}
-
-/* How many prebuilt circuits are needed */
-static int builder_need_count(void) {
-    builder_lock();
-    int need = PREBUILT_POOL_SIZE - g_prebuilt_pool_count - g_prebuilt_res_count;
-    builder_unlock();
-    return need > 0 ? need : 0;
-}
-
-/* Builder thread main loop */
-#ifdef _WIN32
-static unsigned __stdcall builder_thread_func(void *arg) {
-#else
-static void *builder_thread_func(void *arg) {
-#endif
-    (void)arg;
-    extern moor_config_t g_config;
-
-    while (!g_builder_shutdown) {
-        /* Check if pool needs filling */
-        int need = builder_need_count();
-        if (need <= 0) {
-            /* Sleep briefly and re-check */
-#ifdef _WIN32
-            Sleep(500);
-#else
-            usleep(500000);
-#endif
-            continue;
-        }
-
-        /* Snapshot consensus under lock (main thread may update it) */
-        moor_consensus_t local_cons;
-        memset(&local_cons, 0, sizeof(local_cons));
-        consensus_lock();
-        int copy_ok = moor_consensus_copy(&local_cons, &g_client_consensus);
-        consensus_unlock();
-        if (copy_ok != 0 || local_cons.num_relays < 3) {
-            moor_consensus_cleanup(&local_cons);
-#ifdef _WIN32
-            Sleep(2000);
-#else
-            usleep(2000000);
-#endif
-            continue;
-        }
-
-        /* Allocate and build one circuit */
-        moor_connection_t *conn = moor_connection_alloc();
-        moor_circuit_t *circ = moor_circuit_alloc();
-        if (!conn || !circ) {
-            if (conn) moor_connection_free(conn);
-            if (circ) moor_circuit_free(circ);
-            moor_consensus_cleanup(&local_cons);
-            /* Pool exhausted -- back off */
-#ifdef _WIN32
-            Sleep(2000);
-#else
-            usleep(2000000);
-#endif
-            continue;
-        }
-
-        int ret;
-        if (g_config.use_bridges && g_config.num_bridges > 0) {
-            int bi = randombytes_uniform(g_config.num_bridges);
-            ret = moor_circuit_build_bridge(circ, conn,
-                                             &local_cons,
-                                             g_socks5_config.identity_pk,
-                                             g_socks5_config.identity_sk,
-                                             &g_config.bridges[bi], 1);
-        } else {
-            ret = moor_circuit_build(circ, conn,
-                                      &local_cons,
-                                      g_socks5_config.identity_pk,
-                                      g_socks5_config.identity_sk, 1);
-        }
-
-        moor_consensus_cleanup(&local_cons);
-
-        /* Pace builds: 500ms between circuits prevents overwhelming the
-         * guard relay with simultaneous handshakes. Pool fills in ~4s. */
-#ifdef _WIN32
-        Sleep(500);
-#else
-        usleep(500000);
-#endif
-
-        if (ret != 0) {
-            LOG_WARN("prebuilt circuit build failed, retrying...");
-            moor_circuit_free(circ);
-            if (conn->fd >= 0) {
-                close(conn->fd);
-                conn->fd = -1;
-            }
-            moor_connection_free(conn);
-            /* Network liveness: if network appears dead, back off longer */
-            if (!moor_liveness_is_live()) {
-                LOG_INFO("network offline, pausing circuit builds (30s)");
-#ifdef _WIN32
-                Sleep(30000);
-#else
-                usleep(30000000);
-#endif
-                continue;
-            }
-            /* Brief backoff on failure */
-#ifdef _WIN32
-            Sleep(1000);
-#else
-            usleep(1000000);
-#endif
-            continue;
-        }
-
-        /* Sync conn if circuit_build reused (shouldn't with skip=1, but safe) */
-        if (circ->conn != conn) {
-            moor_connection_free(conn);
-            conn = circ->conn;
-        }
-
-        /* Bootstrap: first successful circuit means we're ready */
-        moor_bootstrap_report(BOOT_CIRCUIT_READY);
-        moor_bootstrap_report(BOOT_DONE);
-        moor_liveness_note_activity();
-
-        /* Push to result queue and signal main thread */
-        builder_push_result(circ, conn);
-
-#ifdef _WIN32
-        {
-            char byte = 1;
-            send(g_builder_notify_send, &byte, 1, 0);
-        }
-#else
-        {
-            uint8_t byte = 1;
-            ssize_t wr = write(g_builder_notify_pipe[1], &byte, 1);
-            (void)wr;
-        }
-#endif
-
-        LOG_INFO("prebuilt circuit %u ready (pool %d/%d)",
-                 circ->circuit_id, g_prebuilt_pool_count + 1, PREBUILT_POOL_SIZE);
-    }
-
-#ifdef _WIN32
-    return 0;
-#else
-    return NULL;
-#endif
-}
-
-/* Event callback: builder thread signaled that a circuit is ready */
-static void prebuilt_ready_cb(int fd, int events, void *arg) {
-    (void)fd; (void)events; (void)arg;
-
-    /* Drain notification pipe/socket */
-#ifdef _WIN32
-    char drain[64];
-    recv(g_builder_notify_recv, drain, sizeof(drain), 0);
-#else
-    uint8_t drain[64];
-    ssize_t rd = read(g_builder_notify_pipe[0], drain, sizeof(drain));
-    (void)rd;
-#endif
-
-    /* Pop all ready circuits into pool */
-    prebuilt_entry_t entry;
-    while (builder_pop_result(&entry)) {
-        if (g_prebuilt_pool_count < PREBUILT_POOL_SIZE) {
-            g_prebuilt_pool[g_prebuilt_pool_count++] = entry;
-
-            /* Builder thread leaves sockets in blocking mode.
-             * MUST set non-blocking before adding to event loop,
-             * otherwise recv() in circuit_read_cb blocks the entire
-             * main thread and kills all SOCKS processing. */
-            moor_set_nonblocking(entry.conn->fd);
-
-            /* Register guard connection in event loop */
-            entry.conn->on_other_cell = extend_dispatch_cell;
-            moor_event_add(entry.conn->fd, MOOR_EVENT_READ,
-                           circuit_read_cb, entry.conn);
-        } else {
-            /* Overflow -- should not happen, destroy */
-            moor_circuit_destroy(entry.circuit);
-        }
-    }
-
-    /* Assign prebuilt circuits to BUILDING clearnet clients.
-     * Scan once: for each waiting client, try to pop from pool. */
+/* Assign prebuilt circuits to BUILDING clearnet clients */
+static void assign_circuits_to_waiting_clients(void) {
     for (int i = 0; i < MAX_SOCKS5_CLIENTS && g_prebuilt_pool_count > 0; i++) {
         moor_socks5_client_t *client = &g_socks5_clients[i];
         if (client->client_fd < 0 ||
@@ -405,7 +125,6 @@ static void prebuilt_ready_cb(int fd, int events, void *arg) {
             moor_is_moor_address(client->target_addr))
             continue;
 
-        /* Check if there's already a cached circuit for this domain */
         const char *domain = extract_domain(client->target_addr);
         circuit_cache_entry_t *existing_entry = NULL;
         for (int ci = 0; ci < g_circuit_cache_count; ci++) {
@@ -419,11 +138,9 @@ static void prebuilt_ready_cb(int fd, int events, void *arg) {
         }
 
         if (existing_entry) {
-            /* Another client already got a circuit for this domain */
             client->circuit = existing_entry->circuit;
         } else if (g_prebuilt_pool_count > 0 &&
                    g_circuit_cache_count < MAX_CIRCUIT_CACHE) {
-            /* Pop a prebuilt circuit and assign to this domain */
             prebuilt_entry_t pb = g_prebuilt_pool[--g_prebuilt_pool_count];
             int idx = g_circuit_cache_count;
             circuit_cache_entry_t *ce = &g_circuit_cache[idx];
@@ -438,10 +155,9 @@ static void prebuilt_ready_cb(int fd, int events, void *arg) {
             LOG_INFO("assigned prebuilt circuit %u to domain %s",
                      pb.circuit->circuit_id, domain);
         } else {
-            continue; /* pool empty or cache full */
+            continue;
         }
 
-        /* Open stream and transition client */
         if (moor_circuit_open_stream(client->circuit, &client->stream_id,
                                       client->target_addr,
                                       client->target_port) == 0) {
@@ -460,108 +176,71 @@ static void prebuilt_ready_cb(int fd, int events, void *arg) {
     }
 }
 
+/* Async build completion callback */
+static void prebuilt_build_complete(moor_circuit_t *circ, int status, void *arg) {
+    (void)arg;
+    g_inflight_builds--;
+
+    if (status != 0) {
+        LOG_WARN("prebuilt async circuit build failed");
+        /* cbuild_finish already cleaned up conn refcount + freed circuit */
+        return;
+    }
+
+    /* Circuit is fully built -- add to prebuilt pool */
+    if (g_prebuilt_pool_count < PREBUILT_POOL_SIZE) {
+        prebuilt_entry_t *e = &g_prebuilt_pool[g_prebuilt_pool_count++];
+        e->circuit = circ;
+        e->conn = circ->conn;
+        /* Connection is already in event loop (registered by cbuild_on_connect) */
+    } else {
+        moor_circuit_destroy(circ);
+        return;
+    }
+
+    moor_bootstrap_report(BOOT_CIRCUIT_READY);
+    moor_bootstrap_report(BOOT_DONE);
+    moor_liveness_note_activity();
+
+    LOG_INFO("prebuilt circuit %u ready (pool %d/%d)",
+             circ->circuit_id, g_prebuilt_pool_count, PREBUILT_POOL_SIZE);
+
+    /* Try to assign to waiting clients */
+    assign_circuits_to_waiting_clients();
+}
+
+/* Timer callback: kick off async builds to fill the pool */
+static void prebuilt_timer_cb(void *arg) {
+    (void)arg;
+
+    if (g_client_consensus.num_relays < 3) return;
+    if (g_inflight_builds >= MAX_CONCURRENT_BUILDS) return;
+    if (g_prebuilt_pool_count + g_inflight_builds >= PREBUILT_POOL_SIZE) return;
+
+    moor_connection_t *conn = moor_connection_alloc();
+    moor_circuit_t *circ = moor_circuit_alloc();
+    if (!conn || !circ) {
+        if (conn) moor_connection_free(conn);
+        if (circ) moor_circuit_free(circ);
+        return;
+    }
+
+    if (moor_circuit_build_async(circ, conn, &g_client_consensus,
+                                  g_socks5_config.identity_pk,
+                                  g_socks5_config.identity_sk,
+                                  prebuilt_build_complete, NULL) != 0) {
+        moor_circuit_free(circ);
+        moor_connection_free(conn);
+        return;
+    }
+
+    g_inflight_builds++;
+}
+
 /* Pop a prebuilt circuit from the pool for immediate use */
 static prebuilt_entry_t *prebuilt_pop(void) {
     if (g_prebuilt_pool_count <= 0) return NULL;
     return &g_prebuilt_pool[--g_prebuilt_pool_count];
-}
-
-/* Start the builder thread */
-static int builder_start(void) {
-    if (g_builder_running) return 0;
-    g_builder_shutdown = 0;
-
-#ifdef _WIN32
-    InitializeCriticalSection(&g_builder_mutex);
-    InitializeCriticalSection(&g_consensus_mutex);
-    /* Create loopback socket pair for notification */
-    {
-        SOCKET listener = INVALID_SOCKET, client = INVALID_SOCKET, server = INVALID_SOCKET;
-        struct sockaddr_in addr;
-        int addrlen = sizeof(addr);
-
-        listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (listener == INVALID_SOCKET) return -1;
-
-        BOOL exclusive = TRUE;
-        setsockopt(listener, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
-                   (const char *)&exclusive, sizeof(exclusive));
-
-        memset(&addr, 0, sizeof(addr));
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        addr.sin_port = 0;
-        if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-            closesocket(listener);
-            return -1;
-        }
-        getsockname(listener, (struct sockaddr *)&addr, &addrlen);
-        listen(listener, 1);
-
-        client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        connect(client, (struct sockaddr *)&addr, sizeof(addr));
-        server = accept(listener, NULL, NULL);
-        closesocket(listener);
-
-        g_builder_notify_recv = server;
-        g_builder_notify_send = client;
-
-        u_long nonblock = 1;
-        ioctlsocket(g_builder_notify_recv, FIONBIO, &nonblock);
-    }
-
-    uintptr_t h = _beginthreadex(NULL, 0, builder_thread_func, NULL, 0, NULL);
-    if (h == 0) return -1;
-    g_builder_thread = (HANDLE)h;
-
-    moor_event_add((int)g_builder_notify_recv, MOOR_EVENT_READ,
-                   prebuilt_ready_cb, NULL);
-#else
-    if (pipe(g_builder_notify_pipe) != 0) return -1;
-
-    if (pthread_create(&g_builder_thread, NULL, builder_thread_func, NULL) != 0) {
-        close(g_builder_notify_pipe[0]);
-        close(g_builder_notify_pipe[1]);
-        return -1;
-    }
-
-    moor_event_add(g_builder_notify_pipe[0], MOOR_EVENT_READ,
-                   prebuilt_ready_cb, NULL);
-#endif
-
-    g_builder_running = 1;
-    LOG_INFO("circuit builder thread started (pool size %d)", PREBUILT_POOL_SIZE);
-    return 0;
-}
-
-static void builder_stop(void) {
-    if (!g_builder_running) return;
-    g_builder_shutdown = 1;
-
-#ifdef _WIN32
-    WaitForSingleObject(g_builder_thread, 5000);
-    CloseHandle(g_builder_thread);
-    moor_event_remove((int)g_builder_notify_recv);
-    closesocket(g_builder_notify_recv);
-    closesocket(g_builder_notify_send);
-    DeleteCriticalSection(&g_builder_mutex);
-    DeleteCriticalSection(&g_consensus_mutex);
-#else
-    pthread_join(g_builder_thread, NULL);
-    moor_event_remove(g_builder_notify_pipe[0]);
-    close(g_builder_notify_pipe[0]);
-    close(g_builder_notify_pipe[1]);
-#endif
-
-    /* Destroy remaining prebuilt circuits */
-    for (int i = 0; i < g_prebuilt_pool_count; i++) {
-        if (g_prebuilt_pool[i].circuit)
-            moor_circuit_destroy(g_prebuilt_pool[i].circuit);
-    }
-    g_prebuilt_pool_count = 0;
-
-    g_builder_running = 0;
-    LOG_INFO("circuit builder thread stopped");
 }
 
 /* Complete a pending HS connect after RENDEZVOUS2 received */
@@ -856,159 +535,30 @@ static circuit_cache_entry_t *get_circuit_for_domain(const char *domain,
         return entry;
     }
 
-    /* Pool empty -- fall back to synchronous build (first request before
-     * builder thread has filled the pool, or all circuits consumed) */
-    int idx = g_circuit_cache_count;
-    circuit_cache_entry_t *entry = &g_circuit_cache[idx];
-    memset(entry, 0, sizeof(*entry));
-    snprintf(entry->domain, sizeof(entry->domain), "%s", domain);
-    snprintf(entry->isolation_key, sizeof(entry->isolation_key), "%s", iso_key);
-
-    entry->conn = moor_connection_alloc();
-    entry->circuit = moor_circuit_alloc();
-    if (!entry->conn || !entry->circuit) {
-        if (entry->conn) moor_connection_free(entry->conn);
-        if (entry->circuit) moor_circuit_free(entry->circuit);
-        return NULL;
-    }
-
-    extern moor_config_t g_config;
-    {
-        /* Happy eyeballs: try two circuit builds to different guards.
-         * If the first succeeds, use it immediately.
-         * If it fails, fall back to the second attempt. */
-        int build_ret;
-        if (g_config.use_bridges && g_config.num_bridges > 0) {
-            int bridge_idx = randombytes_uniform(g_config.num_bridges);
-            build_ret = moor_circuit_build_bridge(entry->circuit, entry->conn,
-                                                   &g_client_consensus,
-                                                   g_socks5_config.identity_pk,
-                                                   g_socks5_config.identity_sk,
-                                                   &g_config.bridges[bridge_idx], 0);
-        } else {
-            build_ret = moor_circuit_build(entry->circuit, entry->conn,
-                                            &g_client_consensus,
-                                            g_socks5_config.identity_pk,
-                                            g_socks5_config.identity_sk, 0);
-        }
-        if (build_ret != 0) {
-            /* First attempt failed — happy eyeballs: try a different guard */
-            LOG_WARN("circuit build attempt 1 failed for %s, trying alternate guard", domain);
-            moor_circuit_free(entry->circuit);
-            if (entry->conn->fd >= 0) {
-                close(entry->conn->fd);
-                entry->conn->fd = -1;
-            }
-            moor_connection_free(entry->conn);
-
-            entry->conn = moor_connection_alloc();
-            entry->circuit = moor_circuit_alloc();
-            if (!entry->conn || !entry->circuit) {
-                if (entry->conn) moor_connection_free(entry->conn);
-                if (entry->circuit) moor_circuit_free(entry->circuit);
-                return NULL;
-            }
-
-            if (g_config.use_bridges && g_config.num_bridges > 0) {
-                int bridge_idx = randombytes_uniform(g_config.num_bridges);
-                build_ret = moor_circuit_build_bridge(entry->circuit, entry->conn,
-                                                       &g_client_consensus,
-                                                       g_socks5_config.identity_pk,
-                                                       g_socks5_config.identity_sk,
-                                                       &g_config.bridges[bridge_idx], 0);
+    /* Pool empty -- return NULL so caller enters SOCKS5_STATE_BUILDING.
+     * The prebuilt timer will fill the pool asynchronously.  Kick an
+     * immediate build to minimize wait time for the first request. */
+    if (g_inflight_builds < MAX_CONCURRENT_BUILDS &&
+        g_client_consensus.num_relays >= 3) {
+        moor_connection_t *bc = moor_connection_alloc();
+        moor_circuit_t *bcirc = moor_circuit_alloc();
+        if (bc && bcirc) {
+            if (moor_circuit_build_async(bcirc, bc, &g_client_consensus,
+                                          g_socks5_config.identity_pk,
+                                          g_socks5_config.identity_sk,
+                                          prebuilt_build_complete, NULL) == 0) {
+                g_inflight_builds++;
+                LOG_INFO("on-demand async build started for %s", domain);
             } else {
-                build_ret = moor_circuit_build(entry->circuit, entry->conn,
-                                                &g_client_consensus,
-                                                g_socks5_config.identity_pk,
-                                                g_socks5_config.identity_sk, 0);
+                moor_circuit_free(bcirc);
+                moor_connection_free(bc);
             }
-            if (build_ret != 0) {
-                LOG_ERROR("circuit build failed for %s (both attempts)", domain);
-                moor_circuit_free(entry->circuit);
-                if (entry->conn->fd >= 0) {
-                    close(entry->conn->fd);
-                    entry->conn->fd = -1;
-                }
-                moor_connection_free(entry->conn);
-                return NULL;
-            }
-            LOG_INFO("circuit build attempt 2 succeeded for %s", domain);
+        } else {
+            if (bc) moor_connection_free(bc);
+            if (bcirc) moor_circuit_free(bcirc);
         }
     }
-
-    /* circuit_build may reuse an existing guard connection, so sync
-       entry->conn with what the circuit is actually using */
-    if (entry->circuit->conn != entry->conn) {
-        moor_connection_free(entry->conn);
-        entry->conn = entry->circuit->conn;
-    }
-
-    /* Conflux: build additional circuit legs if enabled */
-    entry->conflux = NULL;
-    entry->num_extra = 0;
-    if (g_socks5_config.conflux && g_socks5_config.conflux_legs > 1) {
-        moor_conflux_set_t *cset = moor_conflux_create(entry->circuit);
-        if (cset) {
-            int legs = g_socks5_config.conflux_legs;
-            if (legs > MOOR_CONFLUX_MAX_LEGS) legs = MOOR_CONFLUX_MAX_LEGS;
-            for (int l = 1; l < legs; l++) {
-                moor_connection_t *ec = moor_connection_alloc();
-                moor_circuit_t *circ = moor_circuit_alloc();
-                if (!ec || !circ) {
-                    if (ec) moor_connection_free(ec);
-                    if (circ) moor_circuit_free(circ);
-                    break;
-                }
-                int leg_ret;
-                if (g_config.use_bridges && g_config.num_bridges > 0) {
-                    int bi = randombytes_uniform(g_config.num_bridges);
-                    leg_ret = moor_circuit_build_bridge(circ, ec,
-                                &g_client_consensus,
-                                g_socks5_config.identity_pk,
-                                g_socks5_config.identity_sk,
-                                &g_config.bridges[bi], 0);
-                } else {
-                    leg_ret = moor_circuit_build(circ, ec,
-                                &g_client_consensus,
-                                g_socks5_config.identity_pk,
-                                g_socks5_config.identity_sk, 0);
-                }
-                if (leg_ret != 0) {
-                    moor_circuit_free(circ);
-                    moor_connection_free(ec);
-                    LOG_WARN("conflux: failed to build leg %d for %s", l, domain);
-                    break;
-                }
-                /* Send RELAY_CONFLUX_LINK to exit on this leg */
-                moor_cell_t link_cell;
-                moor_cell_relay(&link_cell, circ->circuit_id,
-                               RELAY_CONFLUX_LINK, 0,
-                               cset->set_id, sizeof(cset->set_id));
-                moor_circuit_encrypt_forward(circ, &link_cell);
-                moor_connection_send_cell(circ->conn, &link_cell);
-
-                /* Register in event loop */
-                moor_set_nonblocking(ec->fd);
-                ec->on_other_cell = extend_dispatch_cell;
-                moor_event_add(ec->fd, MOOR_EVENT_READ,
-                               circuit_read_cb, ec);
-
-                moor_conflux_add_leg(cset, circ);
-                entry->extra_circuits[l - 1] = circ;
-                entry->extra_conns[l - 1] = ec;
-                entry->num_extra++;
-                LOG_INFO("conflux: leg %d built for %s (circuit %u)",
-                         l, domain, circ->circuit_id);
-            }
-            entry->conflux = cset;
-        }
-    }
-
-    g_circuit_cache_count++;
-    LOG_INFO("new isolated circuit for %s (circuit %u%s)",
-             domain, entry->circuit->circuit_id,
-             entry->conflux ? " [conflux]" : "");
-    return entry;
+    return NULL;  /* caller sets SOCKS5_STATE_BUILDING */
 }
 
 /* Find SOCKS5 client by stream_id on a given circuit */
@@ -1092,8 +642,26 @@ static int process_circuit_cell(moor_connection_t *conn, moor_cell_t *cell) {
                 break;
             }
         }
+
+        /* Also check building circuits (async builder) */
+        {
+            moor_circuit_t *bcirc = moor_circuit_find(cell->circuit_id, conn);
+            if (bcirc && bcirc->build_ctx) {
+                LOG_WARN("CELL_DESTROY for building circuit %u",
+                         cell->circuit_id);
+                moor_circuit_build_abort(bcirc);
+            }
+        }
         return 0;
     }
+    /* Handle CREATED/CREATED_PQ for building circuits (non-blocking builder) */
+    if (cell->command == CELL_CREATED || cell->command == CELL_CREATED_PQ) {
+        moor_circuit_t *bcirc = moor_circuit_find(cell->circuit_id, conn);
+        if (bcirc && bcirc->build_ctx)
+            moor_circuit_build_handle_created(bcirc, cell);
+        return 0;
+    }
+
     if (cell->command != CELL_RELAY) return 0;
 
     /* Find the circuit and its cache entry across all entries
@@ -1124,7 +692,31 @@ static int process_circuit_cell(moor_connection_t *conn, moor_cell_t *cell) {
             }
         }
     }
-    if (!circ || !entry) return 0;
+    if (!circ) {
+        /* Hash table fallback: check building circuits (not yet in cache).
+         * Building circuits are registered in g_circ_ht when CREATE is sent
+         * but not added to g_circuit_cache until build completes. */
+        moor_circuit_t *bcirc = moor_circuit_find(cell->circuit_id, conn);
+        if (bcirc && bcirc->build_ctx) {
+            /* Decrypt through existing hops */
+            if (moor_circuit_decrypt_backward(bcirc, cell) != 0)
+                return 0;
+            moor_relay_payload_t brelay;
+            moor_relay_unpack(&brelay, cell->payload);
+            if (brelay.recognized != 0)
+                return 0;
+            if (brelay.relay_command == RELAY_EXTENDED ||
+                brelay.relay_command == RELAY_EXTENDED2 ||
+                brelay.relay_command == RELAY_EXTENDED_PQ) {
+                moor_circuit_build_handle_extended(bcirc, brelay.relay_command,
+                                                    brelay.data,
+                                                    brelay.data_length);
+            }
+            return 0;
+        }
+        return 0;
+    }
+    if (!entry) return 0;
 
     /* Decrypt all onion layers */
     if (moor_circuit_decrypt_backward(circ, cell) != 0) {
@@ -1407,6 +999,12 @@ static void circuit_read_cb(int fd, int events, void *arg) {
     }
 }
 
+/* Public wrapper for circuit_read_cb -- called from circuit.c
+ * when async circuit builder registers a new guard connection. */
+void moor_socks5_circuit_read_cb(int fd, int events, void *arg) {
+    circuit_read_cb(fd, events, arg);
+}
+
 /* Event callback: data arrived from a SOCKS5 application client */
 static void socks_client_read_cb(int fd, int events, void *arg) {
     (void)events;
@@ -1513,10 +1111,11 @@ int moor_socks5_start(const moor_socks5_config_t *config) {
                   r->identity_pk[2], r->identity_pk[3], r->flags);
     }
 
-    /* Start builder thread to pre-fill circuit pool */
+    /* Start prebuilt circuit pool timer (replaces builder thread) */
     if (g_client_consensus.num_relays >= 3) {
-        if (builder_start() != 0)
-            LOG_WARN("failed to start circuit builder thread (non-fatal)");
+        g_prebuilt_timer_id = moor_event_add_timer(500, prebuilt_timer_cb, NULL);
+        LOG_INFO("prebuilt circuit pool timer started (pool size %d, max %d concurrent)",
+                 PREBUILT_POOL_SIZE, MAX_CONCURRENT_BUILDS);
     }
 
     int listen_fd = moor_listen(config->listen_addr, config->listen_port);
@@ -1948,8 +1547,7 @@ int moor_socks5_forward_to_client(moor_socks5_client_t *client,
 }
 
 void moor_socks5_clear_circuit_cache(void) {
-    /* Stop builder thread during NEWNYM -- it will be restarted on next start */
-    builder_stop();
+    /* Cancel in-flight builds during NEWNYM */
 
     /* Invalidate all active clients' circuit pointers first to prevent UAF */
     for (int i = 0; i < MAX_SOCKS5_CLIENTS; i++) {
