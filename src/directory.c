@@ -309,6 +309,16 @@ int moor_da_add_relay(moor_da_config_t *config,
         return -1;
     }
 
+    /* Reject old protocol versions that would desync wire framing.
+     * NODE_FEATURES_REQUIRED is set in moor.h -- currently requires
+     * CELL_KEM (v0.8+) for cell-based KEM ciphertext transport. */
+    if ((desc->features & NODE_FEATURES_REQUIRED) != NODE_FEATURES_REQUIRED) {
+        LOG_WARN("DA: rejecting descriptor from %s -- missing required features "
+                 "(has 0x%x, need 0x%x)", desc->address,
+                 desc->features, NODE_FEATURES_REQUIRED);
+        return -1;
+    }
+
     /* Reject relays advertising private/reserved addresses */
     if (da_is_private_address(desc->address)) {
         LOG_WARN("DA: rejecting descriptor with private address %s", desc->address);

@@ -3522,8 +3522,16 @@ int moor_relay_process_cell(moor_connection_t *conn,
                      cell->circuit_id);
             return 0;
         }
+        /* Auth: verify the KEM CT comes from the same connection that
+         * sent CREATE_PQ.  Prevents a malicious peer on a shared link
+         * from injecting KEM CT for another circuit's handshake. */
+        if (circ->prev_conn != conn) {
+            LOG_WARN("CELL_KEM_CT sender mismatch for circuit %u "
+                     "(expected prev_conn, got different conn)", cell->circuit_id);
+            return 0;
+        }
         size_t space = MOOR_KEM_CT_LEN - circ->pq_kem_ct_len;
-        size_t chunk = MOOR_CELL_PAYLOAD;
+        size_t chunk = (MOOR_CELL_PAYLOAD < space) ? MOOR_CELL_PAYLOAD : space;
         if (chunk > space) chunk = space;
         memcpy(circ->pq_kem_ct + circ->pq_kem_ct_len,
                cell->payload, chunk);
@@ -3741,6 +3749,8 @@ int moor_relay_register(const moor_relay_config_t *config) {
 
     /* All relays support PQ circuit crypto (CREATE_PQ / EXTEND_PQ) */
     desc.features |= NODE_FEATURE_PQ;
+    /* CELL_KEM_CT wire format (v0.8+) -- required by DAs to join network */
+    desc.features |= NODE_FEATURE_CELL_KEM;
     memcpy(desc.kem_pk, config->kem_pk, MOOR_KEM_PK_LEN);
 
     /* Copy key rotation fields */

@@ -318,16 +318,20 @@ static void hs_pending_fail(hs_pending_connect_t *pending) {
         }
     }
 
-    /* Clean up RP circuit */
-    if (pending->rp_conn) {
+    /* Clean up RP circuit -- destroy first so DESTROY cell is sent
+     * while connection is still alive, then close connection. */
+    if (pending->rp_circ) {
+        moor_circuit_destroy(pending->rp_circ);
+        pending->rp_circ = NULL;
+    }
+    /* Connection may already be closed by circuit_destroy if refcount hit 0.
+     * Only close manually if it's still open. */
+    if (pending->rp_conn && pending->rp_conn->state == CONN_STATE_OPEN) {
         moor_event_remove(pending->rp_conn->fd);
         moor_connection_close(pending->rp_conn);
     }
-    if (pending->rp_circ)
-        moor_circuit_destroy(pending->rp_circ);
 
     LOG_ERROR("HS: connect failed");
-    pending->rp_circ = NULL;
     pending->rp_conn = NULL;
     pending->active = 0;
 }
@@ -478,8 +482,29 @@ static const char *extract_domain(const char *addr) {
 static void circuit_cache_evict_oldest(void) {
     if (g_circuit_cache_count <= 0) return;
     circuit_cache_entry_t *oldest = &g_circuit_cache[0];
-    if (oldest->circuit)
-        moor_socks5_invalidate_circuit(oldest->circuit);
+
+    /* Send DESTROY cells while connections are still alive, then
+     * invalidate (which closes connections and NULLs pointers).
+     * Previous order leaked circuits because invalidate NULLed the
+     * pointer before destroy could free the circuit object. */
+    for (int j = 0; j < oldest->num_extra; j++) {
+        if (oldest->extra_circuits[j]) {
+            if (oldest->extra_circuits[j]->conn &&
+                oldest->extra_circuits[j]->conn->state == CONN_STATE_OPEN) {
+                moor_cell_t dcell;
+                moor_cell_destroy(&dcell, oldest->extra_circuits[j]->circuit_id);
+                moor_connection_send_cell(oldest->extra_circuits[j]->conn, &dcell);
+            }
+        }
+    }
+    if (oldest->circuit && oldest->circuit->conn &&
+        oldest->circuit->conn->state == CONN_STATE_OPEN) {
+        moor_cell_t dcell;
+        moor_cell_destroy(&dcell, oldest->circuit->circuit_id);
+        moor_connection_send_cell(oldest->circuit->conn, &dcell);
+    }
+
+    /* Now invalidate (cleans up SOCKS clients, closes connections) */
     for (int j = 0; j < oldest->num_extra; j++) {
         if (oldest->extra_circuits[j])
             moor_socks5_invalidate_circuit(oldest->extra_circuits[j]);
@@ -488,12 +513,8 @@ static void circuit_cache_evict_oldest(void) {
         moor_conflux_free(oldest->conflux);
         oldest->conflux = NULL;
     }
-    for (int j = 0; j < oldest->num_extra; j++) {
-        if (oldest->extra_circuits[j])
-            moor_circuit_destroy(oldest->extra_circuits[j]);
-    }
     if (oldest->circuit)
-        moor_circuit_destroy(oldest->circuit);
+        moor_socks5_invalidate_circuit(oldest->circuit);
     memmove(&g_circuit_cache[0], &g_circuit_cache[1],
             sizeof(circuit_cache_entry_t) * (MAX_CIRCUIT_CACHE - 1));
     g_circuit_cache_count--;
@@ -615,11 +636,24 @@ static int process_circuit_cell(moor_connection_t *conn, moor_cell_t *cell) {
                     c->stream_id = 0;
                 }
             }
-            /* Remove cache entry (swap with last) */
-            int was_last = (conn->circuit_refcount <= 1);
+            /* Remove cache entry (swap with last).
+             * Do NOT let moor_circuit_destroy close the connection --
+             * we're inside circuit_read_cb processing cells on it.
+             * Decrement refcount manually, free circuit without sending
+             * DESTROY back (we received DESTROY, don't echo it). */
+            e->circuit = NULL;
+            e->conn = NULL;
             g_circuit_cache[ci] = g_circuit_cache[--g_circuit_cache_count];
-            moor_circuit_destroy(dead);
-            if (was_last) return 1; /* connection freed */
+
+            moor_connection_t *dconn = dead->conn;
+            moor_circuit_free(dead); /* decrements refcount, zeroes slot */
+
+            if (dconn && dconn->circuit_refcount <= 0) {
+                /* Last circuit on this connection -- close it */
+                moor_event_remove(dconn->fd);
+                moor_connection_close(dconn);
+                return 1; /* connection freed, caller must stop */
+            }
             break;
         }
 
@@ -1140,6 +1174,7 @@ int moor_socks5_accept(int listen_fd) {
             memset(&g_socks5_clients[i], 0, sizeof(moor_socks5_client_t));
             g_socks5_clients[i].client_fd = fd;
             g_socks5_clients[i].state = SOCKS5_STATE_GREETING;
+            g_socks5_clients[i].begin_sent_at = (uint64_t)time(NULL); /* idle timeout baseline */
 
             /* Capture client source address for ISO_CLIENTADDR isolation */
             if (peer_addr.ss_family == AF_INET6) {
@@ -1669,13 +1704,32 @@ void moor_socks5_invalidate_circuit(moor_circuit_t *circ) {
  * Without this, a dead circuit (guard killed it, exit unresponsive)
  * leaves clients hanging for 600-1200s until circuit rotation. */
 #define MOOR_STREAM_CONNECT_TIMEOUT 30  /* seconds */
+#define MOOR_SOCKS5_IDLE_TIMEOUT    15  /* seconds for GREETING/AUTH/REQUEST/BUILDING */
 void moor_socks5_check_stream_timeouts(void) {
     uint64_t now = (uint64_t)time(NULL);
     for (int i = 0; i < MAX_SOCKS5_CLIENTS; i++) {
         moor_socks5_client_t *c = &g_socks5_clients[i];
-        if (c->client_fd < 0 || c->state != SOCKS5_STATE_CONNECTED)
-            continue;
+        if (c->client_fd < 0) continue;
         if (c->begin_sent_at == 0 || now < c->begin_sent_at)
+            continue;
+
+        /* Idle timeout for pre-streaming states (GREETING/AUTH/REQUEST/BUILDING).
+         * Prevents slot exhaustion DoS from clients that connect and send nothing. */
+        if (c->state != SOCKS5_STATE_CONNECTED &&
+            c->state != SOCKS5_STATE_STREAMING) {
+            if (now - c->begin_sent_at >= MOOR_SOCKS5_IDLE_TIMEOUT) {
+                LOG_DEBUG("SOCKS5 idle timeout fd=%d state=%d", c->client_fd, c->state);
+                moor_event_remove(c->client_fd);
+                close(c->client_fd);
+                c->client_fd = -1;
+                c->circuit = NULL;
+                c->stream_id = 0;
+            }
+            continue;
+        }
+
+        /* Stream CONNECTED timeout (waiting for RELAY_CONNECTED) */
+        if (c->state != SOCKS5_STATE_CONNECTED)
             continue;
         if (now - c->begin_sent_at < MOOR_STREAM_CONNECT_TIMEOUT)
             continue;

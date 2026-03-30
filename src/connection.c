@@ -1095,9 +1095,11 @@ int moor_connection_send_cell(moor_connection_t *conn,
                               const moor_cell_t *cell) {
     if (!conn || conn->state != CONN_STATE_OPEN) return -1;
 
-    /* Check nonce BEFORE encrypt to prevent keystream reuse (#195) */
+    /* Check nonce BEFORE encrypt to prevent keystream reuse (#195).
+     * Kill the connection -- it can never send again safely. */
     if (conn->send_nonce == UINT64_MAX) {
-        LOG_ERROR("send nonce exhausted");
+        LOG_ERROR("send nonce exhausted -- killing connection fd=%d", conn->fd);
+        conn->state = CONN_STATE_NONE;
         return -1;
     }
 
@@ -1127,6 +1129,12 @@ int moor_connection_send_cell(moor_connection_t *conn,
      * for the event loop to flush when the socket becomes writable.
      * This prevents blocking the main thread on slow connections
      * (Tor-aligned: cells are always queued, never blocking). */
+    /* Nonce is consumed by the encrypt above -- MUST be incremented
+     * regardless of whether the send succeeds, to prevent catastrophic
+     * AEAD nonce reuse (two different plaintexts encrypted with same
+     * nonce breaks ChaCha20-Poly1305 authentication). */
+    conn->send_nonce++;
+
     size_t sent = 0;
     while (sent < total) {
         ssize_t n = conn_send(conn, wire + sent, total - sent);
@@ -1135,7 +1143,13 @@ int moor_connection_send_cell(moor_connection_t *conn,
         } else if (n == 0 || (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))) {
             /* Socket buffer full — queue remaining bytes */
             if (moor_queue_push(&conn->outq, wire + sent, (uint16_t)(total - sent), cell->circuit_id) != 0) {
-                LOG_WARN("output queue full, dropping cell");
+                /* Queue full after partial write: framing is irrecoverable.
+                 * Some bytes are on the wire, the rest are lost. The peer
+                 * will see a truncated frame and fail to decrypt. Kill the
+                 * connection to prevent desync. */
+                LOG_ERROR("output queue full after partial write -- "
+                          "connection framing corrupt, killing fd=%d", conn->fd);
+                conn->state = CONN_STATE_NONE;
                 return -1;
             }
             /* Tell event loop to notify us when writable */
@@ -1147,8 +1161,6 @@ int moor_connection_send_cell(moor_connection_t *conn,
             return -1;
         }
     }
-
-    conn->send_nonce++;
 
     /* Bump monitoring stats */
     moor_stats_t *stats = moor_monitor_stats();
@@ -1212,7 +1224,8 @@ int moor_connection_recv_cell(moor_connection_t *conn, moor_cell_t *cell) {
 
     /* Check nonce BEFORE decrypt to prevent keystream reuse (#195) */
     if (conn->recv_nonce == UINT64_MAX) {
-        LOG_ERROR("recv nonce exhausted");
+        LOG_ERROR("recv nonce exhausted -- killing connection fd=%d", conn->fd);
+        conn->state = CONN_STATE_NONE;
         return -1;
     }
 
