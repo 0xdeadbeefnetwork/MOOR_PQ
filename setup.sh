@@ -8,6 +8,11 @@
 # Or non-interactive:
 #   curl -sL .../setup.sh | sudo bash -s -- --role exit --nickname MYRELAY --ip 1.2.3.4
 
+# Wrap in a function so the entire script is downloaded before execution.
+# Without this, `curl | bash` feeds the script line-by-line and tools
+# like make/git can consume lines from stdin, breaking the script.
+main() {
+
 set -euo pipefail
 
 # When run via `curl | bash`, stdin is the script itself.
@@ -281,3 +286,6 @@ else
     echo "   journalctl -u moor --no-pager -n 30"
     exit 1
 fi
+
+} # end main()
+main "$@"
