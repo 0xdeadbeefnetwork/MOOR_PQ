@@ -10,6 +10,15 @@
 
 set -euo pipefail
 
+# When run via `curl | bash`, stdin is the script itself.
+# Redirect interactive reads from /dev/tty so prompts work.
+if [[ ! -t 0 ]]; then
+    exec 3</dev/tty || { echo "Error: cannot read from terminal (use --role/--nickname flags for non-interactive)"; exit 1; }
+    STDIN_FD=3
+else
+    STDIN_FD=0
+fi
+
 REPO_URL="https://github.com/0xdeadbeefnetwork/MOOR_PQ"
 ROLE=""
 NICKNAME=""
@@ -66,7 +75,7 @@ if [[ -z "$ROLE" ]]; then
     echo "   3) exit      - Exit relay (forwards traffic to the internet)"
     echo "   4) guard     - Guard relay (entry point for circuits)"
     echo ""
-    read -rp " Choose [1-4] (default: 1): " choice
+    read -rp " Choose [1-4] (default: 1): " choice <&$STDIN_FD
     case "${choice:-1}" in
         1|relay)  ROLE="relay" ;;
         2|middle) ROLE="middle" ;;
@@ -78,7 +87,7 @@ fi
 
 if [[ -z "$NICKNAME" ]]; then
     echo ""
-    read -rp " Relay nickname: " NICKNAME
+    read -rp " Relay nickname: " NICKNAME <&$STDIN_FD
     [[ -n "$NICKNAME" ]] || die "Nickname required."
 fi
 # Sanitize nickname (alphanumeric + underscore only)
@@ -91,19 +100,19 @@ if [[ -z "$ADVERTISE" ]]; then
     ADVERTISE=$(detect_ip)
     if [[ -n "$ADVERTISE" ]]; then
         echo "$ADVERTISE"
-        read -rp " Use this IP? [Y/n]: " yn
+        read -rp " Use this IP? [Y/n]: " yn <&$STDIN_FD
         if [[ "${yn:-y}" =~ ^[Nn] ]]; then
-            read -rp " Enter your public IP: " ADVERTISE
+            read -rp " Enter your public IP: " ADVERTISE <&$STDIN_FD
         fi
     else
         echo "couldn't detect"
-        read -rp " Enter your public IP: " ADVERTISE
+        read -rp " Enter your public IP: " ADVERTISE <&$STDIN_FD
     fi
     [[ -n "$ADVERTISE" ]] || die "Public IP required."
 fi
 
 echo ""
-read -rp " Contact info (email/URL, optional, press Enter to skip): " CONTACT_INFO
+read -rp " Contact info (email/URL, optional, press Enter to skip): " CONTACT_INFO <&$STDIN_FD
 
 echo ""
 echo " ----------------------------------------"
@@ -115,7 +124,7 @@ echo "  Contact:  $CONTACT_INFO"
 fi
 echo " ----------------------------------------"
 echo ""
-read -rp " Look good? [Y/n]: " confirm
+read -rp " Look good? [Y/n]: " confirm <&$STDIN_FD
 [[ "${confirm:-y}" =~ ^[Yy]|^$ ]] || { echo " Aborted."; exit 0; }
 
 # ---- install dependencies ----
