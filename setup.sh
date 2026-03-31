@@ -180,8 +180,17 @@ echo "  done"
 
 echo "[3/5] Building moor..."
 cd "$BUILD_DIR"
-./configure >/dev/null 2>&1
-make -j"$(nproc)" >/dev/null 2>&1 || die "Build failed. Check: make -C $BUILD_DIR"
+chmod +x configure 2>/dev/null
+if ! ./configure > /tmp/moor_build.log 2>&1; then
+    echo "  configure failed:"
+    tail -5 /tmp/moor_build.log
+    die "Run manually: cd $BUILD_DIR && ./configure && make"
+fi
+if ! make -j"$(nproc)" >> /tmp/moor_build.log 2>&1; then
+    echo "  build failed:"
+    tail -10 /tmp/moor_build.log
+    die "Run manually: cd $BUILD_DIR && make"
+fi
 install -m 755 moor /usr/local/bin/moor
 echo "  installed /usr/local/bin/moor"
 
