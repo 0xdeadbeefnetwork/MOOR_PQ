@@ -2359,7 +2359,13 @@ int moor_da_probe_relays(moor_da_config_t *config) {
             bw.self_reported_bw = relay->bandwidth;
             if (moor_bw_auth_measure(&bw, relay->address, relay->or_port,
                                       256 * 1024) == 0 && bw.measured_bw > 0) {
-                relay->verified_bandwidth = bw.measured_bw;
+                /* Cap DA measurement: TCP echo overestimates real relay
+                 * throughput.  Use min(measured, self-reported * 1.5) to
+                 * prevent one fast link from dominating path selection. */
+                uint64_t cap = relay->bandwidth + (relay->bandwidth / 2);
+                if (cap < 1000000) cap = 1000000; /* minimum 1 MB/s */
+                relay->verified_bandwidth = bw.measured_bw < cap ?
+                    bw.measured_bw : cap;
                 measured++;
                 LOG_DEBUG("DA bw-auth: %s:%u measured=%llu self=%llu effective=%llu",
                          relay->address, relay->or_port,
