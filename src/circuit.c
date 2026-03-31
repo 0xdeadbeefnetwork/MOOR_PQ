@@ -1,4 +1,5 @@
 #include "moor/moor.h"
+#include "moor/conflux.h"
 #include "moor/mix.h"
 #include "moor/transport_shade.h"
 #include "moor/transport_mirage.h"
@@ -315,6 +316,13 @@ static void circ_free_unlocked(moor_circuit_t *circ) {
         moor_monitor_stats()->circuits_active--;
     if (circ->conn && circ->conn->circuit_refcount > 0)
         circ->conn->circuit_refcount--;
+    if (circ->prev_conn && circ->prev_conn->circuit_refcount > 0)
+        circ->prev_conn->circuit_refcount--;
+    if (circ->next_conn && circ->next_conn->circuit_refcount > 0)
+        circ->next_conn->circuit_refcount--;
+    /* Detach from conflux set so legs don't hold dangling pointers */
+    if (circ->conflux)
+        moor_conflux_leg_failed(circ->conflux, circ);
     if (circ->rp_partner) {
         circ->rp_partner->rp_partner = NULL;
         circ->rp_partner = NULL;
@@ -1750,13 +1758,18 @@ int moor_circuit_destroy(moor_circuit_t *circ) {
     LOG_INFO("circuit %u destroyed", circ->circuit_id);
     moor_monitor_notify_circ(circ->circuit_id, "CLOSED");
 
-    /* Save connection pointer before free wipes it */
+    /* Save connection pointer and its fd before free wipes circ.
+     * After moor_circuit_free, conn->circuit_refcount is decremented.
+     * Only close the connection if refcount hit 0, it's still open,
+     * and its fd matches what we saved (guards against pool slot reuse
+     * if the connection was already freed and reallocated). */
     moor_connection_t *conn = circ->conn;
+    int saved_fd = conn ? conn->fd : -1;
     moor_circuit_free(circ);
 
-    /* Only close underlying connection when no more circuits use it */
     if (conn && conn->circuit_refcount <= 0 &&
-        conn->state == CONN_STATE_OPEN) {
+        conn->state == CONN_STATE_OPEN && conn->fd == saved_fd &&
+        saved_fd >= 0) {
         moor_event_remove(conn->fd);
         moor_connection_close(conn);
     }
@@ -3401,13 +3414,15 @@ static void cbuild_finish(moor_circuit_t *circ, int status) {
     free(ctx);
     circ->build_ctx = NULL;
 
+    /* Invoke callback BEFORE freeing the circuit on failure, so the
+     * callback never receives a dangling pointer to a zeroed pool slot. */
+    if (cb) cb(circ, status, arg);
+
     if (status != 0) {
         /* Free the circuit pool slot so it can be reused.
-         * Must happen AFTER ctx is freed (circ_free_unlocked wipes the slot). */
+         * Must happen AFTER callback returns. */
         moor_circuit_free(circ);
     }
-
-    if (cb) cb(circ, status, arg);
 }
 
 /* Build timeout: kill circuit if build takes too long */

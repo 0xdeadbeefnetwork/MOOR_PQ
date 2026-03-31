@@ -73,11 +73,12 @@ static int g_circuit_cache_count = 0;
  * Does NOT remove from cache — circuit stays available for reuse. */
 moor_circuit_t *moor_socks5_get_any_circuit(void) {
     for (int i = 0; i < g_circuit_cache_count; i++) {
+        /* Use circuit->conn (authoritative) not cache entry->conn (stale) */
         if (g_circuit_cache[i].circuit &&
             g_circuit_cache[i].circuit->circuit_id != 0 &&
             g_circuit_cache[i].circuit->num_hops >= 3 &&
-            g_circuit_cache[i].conn &&
-            g_circuit_cache[i].conn->state == CONN_STATE_OPEN)
+            g_circuit_cache[i].circuit->conn &&
+            g_circuit_cache[i].circuit->conn->state == CONN_STATE_OPEN)
             return g_circuit_cache[i].circuit;
     }
     return NULL;
@@ -335,17 +336,12 @@ static void hs_pending_fail(hs_pending_connect_t *pending) {
         }
     }
 
-    /* Clean up RP circuit -- destroy first so DESTROY cell is sent
-     * while connection is still alive, then close connection. */
+    /* Clean up RP circuit.  moor_circuit_destroy handles connection
+     * closure when refcount hits 0 -- don't close manually (UAF if
+     * destroy already freed the conn and the pool slot was reused). */
     if (pending->rp_circ) {
         moor_circuit_destroy(pending->rp_circ);
         pending->rp_circ = NULL;
-    }
-    /* Connection may already be closed by circuit_destroy if refcount hit 0.
-     * Only close manually if it's still open. */
-    if (pending->rp_conn && pending->rp_conn->state == CONN_STATE_OPEN) {
-        moor_event_remove(pending->rp_conn->fd);
-        moor_connection_close(pending->rp_conn);
     }
 
     LOG_ERROR("HS: connect failed");
@@ -521,17 +517,22 @@ static void circuit_cache_evict_oldest(void) {
         moor_connection_send_cell(oldest->circuit->conn, &dcell);
     }
 
-    /* Now invalidate (cleans up SOCKS clients, closes connections) */
+    /* Invalidate SOCKS clients, then destroy circuits.
+     * moor_circuit_destroy handles connection closure via refcount. */
     for (int j = 0; j < oldest->num_extra; j++) {
-        if (oldest->extra_circuits[j])
+        if (oldest->extra_circuits[j]) {
             moor_socks5_invalidate_circuit(oldest->extra_circuits[j]);
+            moor_circuit_destroy(oldest->extra_circuits[j]);
+        }
     }
     if (oldest->conflux) {
         moor_conflux_free(oldest->conflux);
         oldest->conflux = NULL;
     }
-    if (oldest->circuit)
+    if (oldest->circuit) {
         moor_socks5_invalidate_circuit(oldest->circuit);
+        moor_circuit_destroy(oldest->circuit);
+    }
     memmove(&g_circuit_cache[0], &g_circuit_cache[1],
             sizeof(circuit_cache_entry_t) * (MAX_CIRCUIT_CACHE - 1));
     g_circuit_cache_count--;
@@ -990,46 +991,30 @@ static void circuit_read_cb(int fd, int events, void *arg) {
     if (ret < 0) {
         LOG_ERROR("guard connection lost (fd=%d)", conn->fd);
 
-        /* Invalidate all circuit cache entries using this connection,
-         * and clean up SOCKS5 clients BEFORE closing connection (#199).
-         * This avoids comparing freed pointer (UB) and ensures all
-         * SOCKS5 clients are properly torn down. */
+        /* Connection is dead -- clean up all circuits and SOCKS5 clients
+         * using it.  Use moor_circuit_free (not destroy) because:
+         * 1. The connection is already dead, no point sending DESTROY cells
+         * 2. moor_circuit_destroy could close the conn (refcount→0),
+         *    causing double-free when we close it below */
         for (int i = 0; i < g_circuit_cache_count; i++) {
             circuit_cache_entry_t *e = &g_circuit_cache[i];
             int affected = 0;
 
             if (e->conn == conn) {
-                /* Clean up SOCKS5 clients on this circuit's streams */
                 if (e->circuit) {
-                    for (int s = 0; s < MAX_SOCKS5_CLIENTS; s++) {
-                        if (g_socks5_clients[s].client_fd >= 0 &&
-                            g_socks5_clients[s].circuit == e->circuit) {
-                            /* Send SOCKS5 error if still in handshake (#123) */
-                            if (g_socks5_clients[s].state == SOCKS5_STATE_CONNECTED) {
-                                uint8_t fail[] = {0x05,0x04,0x00,0x01,
-                                                  0,0,0,0,0,0};
-                                send(g_socks5_clients[s].client_fd,
-                                     (char *)fail, sizeof(fail), MSG_NOSIGNAL);
-                            }
-                            moor_event_remove(g_socks5_clients[s].client_fd);
-                            close(g_socks5_clients[s].client_fd);
-                            g_socks5_clients[s].client_fd = -1;
-                            g_socks5_clients[s].circuit = NULL;
-                            g_socks5_clients[s].stream_id = 0;
-                        }
-                    }
-                    moor_circuit_destroy(e->circuit);
+                    moor_socks5_invalidate_circuit(e->circuit);
+                    moor_circuit_free(e->circuit);
                     e->circuit = NULL;
                 }
                 e->conn = NULL;
                 affected = 1;
             }
 
-            /* Also check extra conflux legs */
             for (int j = 0; j < e->num_extra; j++) {
                 if (e->extra_conns[j] == conn) {
                     if (e->extra_circuits[j]) {
-                        moor_circuit_destroy(e->extra_circuits[j]);
+                        moor_socks5_invalidate_circuit(e->extra_circuits[j]);
+                        moor_circuit_free(e->extra_circuits[j]);
                         e->extra_circuits[j] = NULL;
                     }
                     e->extra_conns[j] = NULL;
@@ -1043,8 +1028,20 @@ static void circuit_read_cb(int fd, int events, void *arg) {
             }
         }
 
-        /* Now close the connection — moor_circuit_nullify_conn will find
-         * no remaining circuits (all destroyed above, circuit_id=0). */
+        /* Also clean HS pending entries using this connection */
+        for (int i = 0; i < MAX_HS_PENDING; i++) {
+            if (g_hs_pending[i].active && g_hs_pending[i].rp_conn == conn) {
+                if (g_hs_pending[i].rp_circ) {
+                    moor_circuit_free(g_hs_pending[i].rp_circ);
+                    g_hs_pending[i].rp_circ = NULL;
+                }
+                g_hs_pending[i].rp_conn = NULL;
+                g_hs_pending[i].active = 0;
+            }
+        }
+
+        /* Close the connection once -- moor_connection_close calls
+         * moor_circuit_nullify_conn to clean any remaining refs. */
         moor_event_remove(conn->fd);
         moor_connection_close(conn);
     }
@@ -1374,8 +1371,8 @@ int moor_socks5_handle_request(moor_socks5_client_t *client,
                 strcmp(g_circuit_cache[i].isolation_key, client->isolation_key) == 0 &&
                 g_circuit_cache[i].circuit &&
                 g_circuit_cache[i].circuit->circuit_id != 0 &&
-                g_circuit_cache[i].conn &&
-                g_circuit_cache[i].conn->state == CONN_STATE_OPEN) {
+                g_circuit_cache[i].circuit->conn &&
+                g_circuit_cache[i].circuit->conn->state == CONN_STATE_OPEN) {
                 client->circuit = g_circuit_cache[i].circuit;
                 hs_cached = 1;
                 LOG_DEBUG("HS: reusing cached circuit");
@@ -1457,6 +1454,9 @@ int moor_socks5_handle_request(moor_socks5_client_t *client,
         const char *domain = extract_domain(client->target_addr);
         circuit_cache_entry_t *entry = get_circuit_for_domain(
             domain, client->isolation_key);
+        /* Refresh conn from circuit (authoritative after nullify_conn) */
+        if (entry && entry->circuit && entry->circuit->conn)
+            entry->conn = entry->circuit->conn;
         if (!entry || !entry->conn || entry->conn->fd < 0 ||
             entry->conn->state != CONN_STATE_OPEN) {
             uint8_t fail[] = { 0x05, 0x04, 0x00, 0x01, 0,0,0,0, 0,0 };
@@ -1622,17 +1622,16 @@ void moor_socks5_clear_circuit_cache(void) {
         for (int j = 0; j < e->num_extra; j++) {
             if (e->extra_circuits[j])
                 moor_circuit_destroy(e->extra_circuits[j]);
-            if (e->extra_conns[j]) {
-                moor_event_remove(e->extra_conns[j]->fd);
-                moor_connection_close(e->extra_conns[j]);
-            }
+            /* moor_circuit_destroy handles conn closure via refcount */
+            e->extra_circuits[j] = NULL;
+            e->extra_conns[j] = NULL;
         }
         if (e->circuit)
             moor_circuit_destroy(e->circuit);
-        if (e->conn) {
-            moor_event_remove(e->conn->fd);
-            moor_connection_close(e->conn);
-        }
+        /* Don't manually close conn -- destroy handles it when
+         * refcount hits 0.  Manual close here caused double-free. */
+        e->circuit = NULL;
+        e->conn = NULL;
     }
     g_circuit_cache_count = 0;
     LOG_INFO("circuit cache cleared (NEWNYM)");
@@ -1679,24 +1678,15 @@ void moor_socks5_invalidate_circuit(moor_circuit_t *circ) {
     /* NULL out circuit cache entries pointing to this circuit,
      * then remove fully-dead entries to prevent cache bloat.
      *
-     * IMPORTANT: with connection multiplexing, multiple cache entries
-     * may share the same guard connection.  Only close the connection
-     * when circuit_refcount drops to 0 (no other circuits use it).
-     * Closing a shared connection kills ALL circuits on it. */
+     * DO NOT close connections here -- moor_circuit_destroy handles
+     * connection closure when circuit_refcount hits 0.  Closing here
+     * caused double-free/UAF when invalidate + destroy both tried to
+     * close the same connection. */
     for (int i = 0; i < g_circuit_cache_count; i++) {
         circuit_cache_entry_t *e = &g_circuit_cache[i];
         if (e->circuit == circ) {
             e->circuit = NULL;
-            if (e->conn) {
-                /* Only close if this is the last circuit on the connection.
-                 * refcount not yet decremented (destroy runs after us),
-                 * so <= 1 means we're the only one left. */
-                if (e->conn->circuit_refcount <= 1) {
-                    moor_event_remove(e->conn->fd);
-                    moor_connection_close(e->conn);
-                }
-                e->conn = NULL;
-            }
+            e->conn = NULL;
             if (e->conflux) {
                 moor_conflux_free(e->conflux);
                 e->conflux = NULL;
@@ -1705,13 +1695,7 @@ void moor_socks5_invalidate_circuit(moor_circuit_t *circ) {
         for (int j = 0; j < e->num_extra; j++) {
             if (e->extra_circuits[j] == circ) {
                 e->extra_circuits[j] = NULL;
-                if (e->extra_conns[j]) {
-                    if (e->extra_conns[j]->circuit_refcount <= 1) {
-                        moor_event_remove(e->extra_conns[j]->fd);
-                        moor_connection_close(e->extra_conns[j]);
-                    }
-                    e->extra_conns[j] = NULL;
-                }
+                e->extra_conns[j] = NULL;
             }
         }
 

@@ -1213,11 +1213,15 @@ static int resolve_dns_encrypted(const char *hostname, char *ip_out, size_t ip_l
 /* DHT store for HS descriptor distribution */
 moor_dht_store_t g_dht_store;
 
-/* Rendezvous point cookie table: maps cookies to client circuits */
+/* Rendezvous point cookie table: maps cookies to client circuits.
+ * Stores circuit_id + conn for lookup instead of raw circ pointer
+ * to avoid UAF if circuit is freed by OOM/timeout before RENDEZVOUS1. */
 #define MAX_RP_COOKIES 64
 typedef struct {
     uint8_t cookie[MOOR_RENDEZVOUS_COOKIE_LEN];
-    moor_circuit_t *circ;
+    moor_circuit_t *circ;        /* may be stale -- validate via circuit_id */
+    uint32_t circuit_id;         /* for safe lookup after potential free */
+    moor_connection_t *conn;     /* connection the circuit was on */
     int valid;
     time_t created_at;
 } rp_cookie_entry_t;
@@ -2525,6 +2529,8 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                         memcpy(g_rp_cookies[i].cookie, relay.data,
                                MOOR_RENDEZVOUS_COOKIE_LEN);
                         g_rp_cookies[i].circ = circ;
+                        g_rp_cookies[i].circuit_id = circ->circuit_id;
+                        g_rp_cookies[i].conn = circ->prev_conn;
                         g_rp_cookies[i].valid = 1;
                         g_rp_cookies[i].created_at = now;
                         stored = 1;
@@ -2555,14 +2561,24 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                              relay.data_length);
                     return -1;
                 }
-                /* Find client circuit by cookie */
+                /* Find client circuit by cookie.  Validate the stored
+                 * circuit pointer via moor_circuit_find (safe hash lookup)
+                 * in case the circuit was freed since ESTABLISH_RENDEZVOUS. */
                 moor_circuit_t *client_circ = NULL;
                 int cookie_idx = -1;
                 for (int i = 0; i < MAX_RP_COOKIES; i++) {
                     if (g_rp_cookies[i].valid &&
                         sodium_memcmp(g_rp_cookies[i].cookie, relay.data,
                                       MOOR_RENDEZVOUS_COOKIE_LEN) == 0) {
-                        client_circ = g_rp_cookies[i].circ;
+                        /* Validate: look up by stored IDs, not raw pointer */
+                        client_circ = moor_circuit_find(
+                            g_rp_cookies[i].circuit_id,
+                            g_rp_cookies[i].conn);
+                        if (!client_circ) {
+                            LOG_WARN("RENDEZVOUS1: cookie matched but circuit "
+                                     "%u already freed", g_rp_cookies[i].circuit_id);
+                            g_rp_cookies[i].valid = 0;
+                        }
                         cookie_idx = i;
                         break;
                     }
@@ -3052,9 +3068,12 @@ int moor_relay_handle_relay(moor_connection_t *conn,
             } else if (moor_connection_send_cell(circ->prev_conn, &work) != 0) {
                 LOG_WARN("backward send failed, closing prev_conn (circuit %u)",
                          circ->circuit_id);
-                moor_event_remove(circ->prev_conn->fd);
-                moor_connection_close(circ->prev_conn);
+                moor_connection_t *dead_conn = circ->prev_conn;
                 circ->prev_conn = NULL;
+                if (!moor_circuit_conn_in_use(dead_conn)) {
+                    moor_event_remove(dead_conn->fd);
+                    moor_connection_close(dead_conn);
+                }
                 /* Propagate DESTROY downstream so next hop tears down too.
                  * Without this, next_conn's circuit leaks resources. */
                 if (circ->next_conn && circ->next_conn->state == CONN_STATE_OPEN) {
