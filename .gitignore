@@ -1,7 +1,7 @@
 obj/
 obj_afl/
-moor
-moor.exe
+/moor
+/moor.exe
 moor_keygen
 moor-top
 test_*
