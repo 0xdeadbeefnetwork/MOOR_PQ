@@ -48,7 +48,10 @@ static char g_hs_dir[256] = "./hs_keys";
 static uint16_t g_hs_local_port = 8080;
 static char g_advertise_addr[64] = "";
 static uint32_t g_relay_flags = NODE_FLAG_RUNNING | NODE_FLAG_STABLE;
-static uint64_t g_bandwidth = 1000000; /* 1 MB/s default */
+static volatile uint64_t g_bandwidth = 1000000; /* 1 MB/s default */
+/* Selftest thread writes measured BW here; main thread picks it up */
+static volatile uint64_t g_selftest_bw = 0;
+static volatile int g_selftest_done = 0;
 static char g_data_dir[256] = "";
 static char g_da_peers[512] = "";  /* comma-separated "ip:port,ip:port,..." */
 static int g_padding = 0;
@@ -557,6 +560,16 @@ static void relay_dir_accept_cb(int fd, int events, void *arg) {
 
 static void relay_periodic_cb(void *arg) {
     (void)arg;
+    /* Pick up selftest result (written by selftest thread, read here
+     * in the main event loop -- no lock needed, volatile ensures
+     * visibility, and we only read g_selftest_done once). */
+    if (g_selftest_done) {
+        g_selftest_done = 0;
+        g_relay_cfg.bandwidth = g_selftest_bw;
+        g_bandwidth = g_selftest_bw;
+        if (!g_is_bridge)
+            moor_relay_register(&g_relay_cfg);
+    }
     /* Sample observed bandwidth before re-registration so the descriptor
      * advertises min(configured, observed) — Tor-aligned. */
     moor_monitor_sample_observed_bw();
@@ -592,15 +605,14 @@ static void *relay_selftest_thread(void *arg) {
         uint64_t capped = bw.measured_bw;
         if (capped > 50 * 1024 * 1024)
             capped = 50 * 1024 * 1024;  /* 50 MB/s cap for self-tests */
-        g_relay_cfg.bandwidth = capped;
-        g_bandwidth = capped;
+        /* Don't touch g_relay_cfg from this thread -- store result for
+         * main thread to pick up in relay_periodic_cb (avoids data race). */
+        g_selftest_bw = capped;
+        g_selftest_done = 1;
         LOG_INFO("auto-bandwidth: measured %llu bytes/sec (raw=%llu, advertised %llu)",
                  (unsigned long long)capped,
                  (unsigned long long)bw.measured_bw,
                  (unsigned long long)bw.self_reported_bw);
-        /* Re-register with updated bandwidth */
-        if (!g_is_bridge)
-            moor_relay_register(&g_relay_cfg);
     } else {
         LOG_WARN("auto-bandwidth: self-test failed, using default %llu bytes/sec",
                  (unsigned long long)g_relay_cfg.bandwidth);

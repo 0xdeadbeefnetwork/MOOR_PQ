@@ -165,8 +165,12 @@ static int da_channel_open(da_encrypted_channel_t *ch,
     uint8_t hello[64];
     memcpy(hello, our_identity_pk, 32);
     memcpy(hello + 32, eph_pk, 32);
-    send(ch->fd, "DA_LINK\n", 8, MSG_NOSIGNAL);
-    send(ch->fd, (char *)hello, 64, MSG_NOSIGNAL);
+    if (send(ch->fd, "DA_LINK\n", 8, MSG_NOSIGNAL) != 8 ||
+        send(ch->fd, (char *)hello, 64, MSG_NOSIGNAL) != 64) {
+        close(ch->fd); ch->fd = -1;
+        moor_crypto_wipe(eph_sk, 32);
+        return -1;
+    }
 
     /* Read response: peer_identity_pk(32) + "OK" */
     uint8_t resp[34];
@@ -187,10 +191,20 @@ static int da_channel_open(da_encrypted_channel_t *ch,
 
     /* Derive session keys: DH(our_ephemeral, peer_static_curve) */
     uint8_t peer_curve_pk[32];
-    moor_crypto_ed25519_to_curve25519_pk(peer_curve_pk, peer_identity_pk);
+    if (moor_crypto_ed25519_to_curve25519_pk(peer_curve_pk, peer_identity_pk) != 0) {
+        LOG_ERROR("DA channel: ed25519_to_curve25519 failed (invalid peer key)");
+        close(ch->fd); ch->fd = -1;
+        moor_crypto_wipe(eph_sk, 32);
+        return -1;
+    }
 
     uint8_t shared[32];
-    moor_crypto_dh(shared, eph_sk, peer_curve_pk);
+    if (moor_crypto_dh(shared, eph_sk, peer_curve_pk) != 0) {
+        LOG_ERROR("DA channel: DH failed (invalid peer key)");
+        close(ch->fd); ch->fd = -1;
+        moor_crypto_wipe(eph_sk, 32);
+        return -1;
+    }
     moor_crypto_wipe(eph_sk, 32);
 
     /* HKDF: derive send_key and recv_key */
@@ -248,10 +262,18 @@ static int da_channel_accept(da_encrypted_channel_t *ch, int client_fd,
 
     /* Derive session keys: DH(our_static_curve_sk, initiator_ephemeral_pk) */
     uint8_t our_curve_sk[32];
-    moor_crypto_ed25519_to_curve25519_sk(our_curve_sk, our_identity_sk);
+    if (moor_crypto_ed25519_to_curve25519_sk(our_curve_sk, our_identity_sk) != 0) {
+        LOG_ERROR("DA channel: ed25519_to_curve25519_sk failed");
+        moor_crypto_wipe(our_curve_sk, 32);
+        return -1;
+    }
 
     uint8_t shared[32];
-    moor_crypto_dh(shared, our_curve_sk, eph_pk);
+    if (moor_crypto_dh(shared, our_curve_sk, eph_pk) != 0) {
+        LOG_ERROR("DA channel: DH failed (invalid initiator ephemeral key)");
+        moor_crypto_wipe(our_curve_sk, 32);
+        return -1;
+    }
     moor_crypto_wipe(our_curve_sk, 32);
 
     /* Note: initiator's send_key = our recv_key and vice versa */
@@ -267,7 +289,10 @@ static int da_channel_accept(da_encrypted_channel_t *ch, int client_fd,
     memcpy(resp, our_identity_pk, 32);
     resp[32] = 'O';
     resp[33] = 'K';
-    send(client_fd, (char *)resp, 34, MSG_NOSIGNAL);
+    if (send(client_fd, (char *)resp, 34, MSG_NOSIGNAL) != 34) {
+        LOG_WARN("DA channel: failed to send accept response");
+        return -1;
+    }
 
     return 0;
 }
@@ -1589,8 +1614,9 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
             len_buf[1] = (uint8_t)(len >> 16);
             len_buf[2] = (uint8_t)(len >> 8);
             len_buf[3] = (uint8_t)(len);
-            send(client_fd, (char *)len_buf, 4, MSG_NOSIGNAL);
-            send(client_fd, (char *)buf, len, MSG_NOSIGNAL);
+            if (send(client_fd, (char *)len_buf, 4, MSG_NOSIGNAL) != 4 ||
+                send(client_fd, (char *)buf, len, MSG_NOSIGNAL) != len)
+                LOG_DEBUG("consensus send failed (fd=%d)", client_fd);
         } else {
             send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
         }
@@ -2534,8 +2560,11 @@ int moor_client_fetch_hs_descriptor(moor_hs_descriptor_t *desc,
     if (fd < 0) return -1;
 
     moor_set_socket_timeout(fd, MOOR_DA_REQUEST_TIMEOUT);
-    send(fd, "HS_LOOKUP\n", 10, MSG_NOSIGNAL);
-    send(fd, (char *)address_hash, 32, MSG_NOSIGNAL);
+    if (send(fd, "HS_LOOKUP\n", 10, MSG_NOSIGNAL) != 10 ||
+        send(fd, (char *)address_hash, 32, MSG_NOSIGNAL) != 32) {
+        close(fd);
+        return -1;
+    }
 
     /* Read response */
     uint8_t len_buf[4];

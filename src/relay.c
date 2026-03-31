@@ -2693,9 +2693,9 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                                                       &create_cell) != 0)
                             return -1;
 
-                        moor_cell_t created_resp;
+                        moor_cell_t created_resp = {0};
                         int ret;
-                        uint64_t ext_pq_deadline = (uint64_t)time(NULL) + 30;
+                        uint64_t ext_pq_deadline = (uint64_t)time(NULL) + 10;
                         for (;;) {
                             ret = moor_connection_recv_cell(next_conn,
                                                             &created_resp);
@@ -2708,11 +2708,11 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                             }
                             if (ret < 0) break;
                             if ((uint64_t)time(NULL) >= ext_pq_deadline) {
-                                LOG_ERROR("EXTEND_PQ: cumulative timeout (30s)");
+                                LOG_ERROR("EXTEND_PQ: timeout (10s)");
                                 ret = -1;
                                 break;
                             }
-                            if (wait_for_readable(next_conn->fd, 5000) <= 0) {
+                            if (wait_for_readable(next_conn->fd, 3000) <= 0) {
                                 LOG_ERROR("EXTEND_PQ: timeout waiting for CREATED_PQ");
                                 ret = -1;
                                 break;
@@ -2857,9 +2857,9 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                     return -1;
 
                 /* Wait for CREATED_PQ from next hop */
-                moor_cell_t created_resp;
+                moor_cell_t created_resp = {0};
                 int ret;
-                uint64_t ext_pq2_deadline = (uint64_t)time(NULL) + 30;
+                uint64_t ext_pq2_deadline = (uint64_t)time(NULL) + 10;
                 for (;;) {
                     ret = moor_connection_recv_cell(next_conn, &created_resp);
                     if (ret > 0) {
@@ -2871,11 +2871,11 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                     }
                     if (ret < 0) break;
                     if ((uint64_t)time(NULL) >= ext_pq2_deadline) {
-                        LOG_ERROR("EXTEND_PQ: cumulative timeout (30s)");
+                        LOG_ERROR("EXTEND_PQ: timeout (10s)");
                         ret = -1;
                         break;
                     }
-                    if (wait_for_readable(next_conn->fd, 5000) <= 0) {
+                    if (wait_for_readable(next_conn->fd, 3000) <= 0) {
                         LOG_ERROR("EXTEND_PQ: timeout waiting for CREATED_PQ");
                         ret = -1;
                         break;
@@ -3666,9 +3666,14 @@ static int relay_register_single(const moor_relay_config_t *config,
     msg[pow_off + 13] = (uint8_t)(pow_timestamp >> 16);
     msg[pow_off + 14] = (uint8_t)(pow_timestamp >> 8);
     msg[pow_off + 15] = (uint8_t)(pow_timestamp);
-    send(fd, (char *)msg, (int)total_len, MSG_NOSIGNAL);
+    ssize_t sent = send(fd, (char *)msg, (int)total_len, MSG_NOSIGNAL);
     sodium_memzero(msg, total_len);
     free(msg);
+    if (sent != (ssize_t)total_len) {
+        LOG_WARN("relay_register: send failed (%zd/%zu)", sent, total_len);
+        close(fd);
+        return -1;
+    }
 
     char resp[64];
     ssize_t rn = recv(fd, resp, sizeof(resp), 0);
