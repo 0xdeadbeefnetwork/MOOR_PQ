@@ -1,12 +1,13 @@
 #!/bin/bash
-# MOOR Relay Setup
-# One command to fetch, build, configure, and start a MOOR relay.
+# MOOR Setup
+# One command to fetch, build, configure, and start a MOOR relay or hidden service.
 #
 # Usage:
 #   curl -sL https://raw.githubusercontent.com/0xdeadbeefnetwork/MOOR_PQ/main/setup.sh | sudo bash
 #
 # Or non-interactive:
 #   curl -sL .../setup.sh | sudo bash -s -- --role exit --nickname MYRELAY --ip 1.2.3.4
+#   curl -sL .../setup.sh | sudo bash -s -- --role hs --hs-port 8080
 
 # Wrap in a function so the entire script is downloaded before execution.
 # Without this, `curl | bash` feeds the script line-by-line and tools
@@ -29,6 +30,8 @@ ROLE=""
 NICKNAME=""
 ADVERTISE=""
 OR_PORT="9001"
+HS_PORT=""
+HS_DIR=""
 CONF_DIR="/etc/moor"
 DATA_DIR="/var/lib/moor"
 BUILD_DIR="/opt/moor"
@@ -49,8 +52,11 @@ while [[ $# -gt 0 ]]; do
         --nickname) NICKNAME="$2"; shift 2 ;;
         --ip)       ADVERTISE="$2"; shift 2 ;;
         --port)     OR_PORT="$2"; shift 2 ;;
+        --hs-port)  HS_PORT="$2"; shift 2 ;;
+        --hs-dir)   HS_DIR="$2"; shift 2 ;;
         --help|-h)
-            echo "Usage: sudo $0 [--role exit|middle|guard|relay] [--nickname NAME] [--ip ADDR] [--port PORT]"
+            echo "Usage: sudo $0 [--role exit|middle|guard|relay|hs] [--nickname NAME] [--ip ADDR] [--port PORT]"
+            echo "       sudo $0 --role hs --hs-port 8080 [--hs-dir /path]"
             exit 0 ;;
         *) die "Unknown option: $1" ;;
     esac
@@ -66,68 +72,95 @@ cat << 'BANNER'
  | |  | | |_| | |_| |  _ <
  |_|  |_|\___/ \___/|_| \_\
 
- Post-Quantum Anonymous Relay Setup
+ Post-Quantum Anonymous Network Setup
 
 BANNER
 
 # ---- interactive prompts ----
 
 if [[ -z "$ROLE" ]]; then
-    echo " What kind of node do you want to run?"
+    echo " What do you want to run?"
     echo ""
     echo "   1) relay     - General relay, DA assigns flags based on performance"
     echo "   2) middle    - Middle-only relay (never guard or exit)"
     echo "   3) exit      - Exit relay (forwards traffic to the internet)"
     echo "   4) guard     - Guard relay (entry point for circuits)"
+    echo "   5) hs        - Hidden service (host a .moor site)"
     echo ""
-    read -rp " Choose [1-4] (default: 1): " choice <&$STDIN_FD
+    read -rp " Choose [1-5] (default: 1): " choice <&$STDIN_FD
     case "${choice:-1}" in
         1|relay)  ROLE="relay" ;;
         2|middle) ROLE="middle" ;;
         3|exit)   ROLE="exit" ;;
         4|guard)  ROLE="guard" ;;
+        5|hs)     ROLE="hs" ;;
         *) die "Invalid choice." ;;
     esac
 fi
 
-if [[ -z "$NICKNAME" ]]; then
-    echo ""
-    read -rp " Relay nickname: " NICKNAME <&$STDIN_FD
-    [[ -n "$NICKNAME" ]] || die "Nickname required."
+IS_HS=0
+if [[ "$ROLE" == "hs" ]]; then
+    IS_HS=1
 fi
-# Sanitize nickname (alphanumeric + underscore only)
-NICKNAME=$(echo "$NICKNAME" | tr -cd 'A-Za-z0-9_')
-[[ -n "$NICKNAME" ]] || die "Nickname must contain at least one alphanumeric character."
 
-if [[ -z "$ADVERTISE" ]]; then
-    echo ""
-    echo -n " Detecting public IP... "
-    ADVERTISE=$(detect_ip)
-    if [[ -n "$ADVERTISE" ]]; then
-        echo "$ADVERTISE"
-        read -rp " Use this IP? [Y/n]: " yn <&$STDIN_FD
-        if [[ "${yn:-y}" =~ ^[Nn] ]]; then
+if [[ $IS_HS -eq 0 ]]; then
+    # ---- relay prompts ----
+    if [[ -z "$NICKNAME" ]]; then
+        echo ""
+        read -rp " Relay nickname: " NICKNAME <&$STDIN_FD
+        [[ -n "$NICKNAME" ]] || die "Nickname required."
+    fi
+    NICKNAME=$(echo "$NICKNAME" | tr -cd 'A-Za-z0-9_')
+    [[ -n "$NICKNAME" ]] || die "Nickname must contain at least one alphanumeric character."
+
+    if [[ -z "$ADVERTISE" ]]; then
+        echo ""
+        echo -n " Detecting public IP... "
+        ADVERTISE=$(detect_ip)
+        if [[ -n "$ADVERTISE" ]]; then
+            echo "$ADVERTISE"
+            read -rp " Use this IP? [Y/n]: " yn <&$STDIN_FD
+            if [[ "${yn:-y}" =~ ^[Nn] ]]; then
+                read -rp " Enter your public IP: " ADVERTISE <&$STDIN_FD
+            fi
+        else
+            echo "couldn't detect"
             read -rp " Enter your public IP: " ADVERTISE <&$STDIN_FD
         fi
-    else
-        echo "couldn't detect"
-        read -rp " Enter your public IP: " ADVERTISE <&$STDIN_FD
+        [[ -n "$ADVERTISE" ]] || die "Public IP required."
     fi
-    [[ -n "$ADVERTISE" ]] || die "Public IP required."
+
+    echo ""
+    read -rp " Contact info (email/URL, optional, press Enter to skip): " CONTACT_INFO <&$STDIN_FD
+
+    echo ""
+    echo " ----------------------------------------"
+    echo "  Role:     $ROLE"
+    echo "  Nickname: $NICKNAME"
+    echo "  Address:  $ADVERTISE:$OR_PORT"
+    if [[ -n "${CONTACT_INFO:-}" ]]; then
+    echo "  Contact:  $CONTACT_INFO"
+    fi
+    echo " ----------------------------------------"
+else
+    # ---- hidden service prompts ----
+    if [[ -z "$HS_PORT" ]]; then
+        echo ""
+        read -rp " Local service port to proxy (e.g. 8080, 80, 443): " HS_PORT <&$STDIN_FD
+        [[ -n "$HS_PORT" ]] || die "Service port required."
+    fi
+    [[ "$HS_PORT" =~ ^[0-9]+$ ]] || die "Port must be a number."
+
+    HS_DIR="${HS_DIR:-$DATA_DIR/hs_keys}"
+
+    echo ""
+    echo " ----------------------------------------"
+    echo "  Role:     hidden service"
+    echo "  Proxying: localhost:$HS_PORT"
+    echo "  Keys:     $HS_DIR"
+    echo " ----------------------------------------"
 fi
 
-echo ""
-read -rp " Contact info (email/URL, optional, press Enter to skip): " CONTACT_INFO <&$STDIN_FD
-
-echo ""
-echo " ----------------------------------------"
-echo "  Role:     $ROLE"
-echo "  Nickname: $NICKNAME"
-echo "  Address:  $ADVERTISE:$OR_PORT"
-if [[ -n "${CONTACT_INFO:-}" ]]; then
-echo "  Contact:  $CONTACT_INFO"
-fi
-echo " ----------------------------------------"
 echo ""
 read -rp " Look good? [Y/n]: " confirm <&$STDIN_FD
 [[ "${confirm:-y}" =~ ^[Yy]|^$ ]] || { echo " Aborted."; exit 0; }
@@ -206,16 +239,37 @@ fi
 mkdir -p "$DATA_DIR" "$CONF_DIR"
 chown "$MOOR_USER:$MOOR_USER" "$DATA_DIR"
 
-# Build role config line
-ROLE_LINE=""
-case "$ROLE" in
-    relay)  ;; # no extra flag, DA decides
-    middle) ROLE_LINE="MiddleOnly 1" ;;
-    exit)   ROLE_LINE="Exit 1" ;;
-    guard)  ROLE_LINE="Guard 1" ;;
-esac
+if [[ $IS_HS -eq 1 ]]; then
+    # ---- hidden service config ----
+    mkdir -p "$HS_DIR"
+    chown "$MOOR_USER:$MOOR_USER" "$HS_DIR"
+    chmod 700 "$HS_DIR"
 
-cat > "$CONF_DIR/moor.conf" << EOF
+    cat > "$CONF_DIR/moor.conf" << EOF
+# MOOR Hidden Service Configuration
+# Generated $(date -u +%Y-%m-%d) by setup.sh
+# Edit and restart: sudo systemctl restart moor
+
+Mode hs
+HiddenServiceDir $HS_DIR
+HiddenServicePort $HS_PORT
+Verbose 1
+
+# Directory authorities (default MOOR network)
+DAAddress 107.174.70.38
+DAPort 9030
+EOF
+else
+    # ---- relay config ----
+    ROLE_LINE=""
+    case "$ROLE" in
+        relay)  ;; # no extra flag, DA decides
+        middle) ROLE_LINE="MiddleOnly 1" ;;
+        exit)   ROLE_LINE="Exit 1" ;;
+        guard)  ROLE_LINE="Guard 1" ;;
+    esac
+
+    cat > "$CONF_DIR/moor.conf" << EOF
 # MOOR Relay Configuration
 # Generated $(date -u +%Y-%m-%d) by setup.sh
 # Edit and restart: sudo systemctl restart moor
@@ -242,9 +296,9 @@ ExitPolicy reject *:25
 ExitPolicy reject *:135-139
 ExitPolicy reject *:445
 ExitPolicy reject *:6881-6999
-#ExitPolicy reject *:6881-6999
 #ExitPolicy accept *:*
 EOF
+fi
 
 echo "  wrote $CONF_DIR/moor.conf"
 
@@ -252,9 +306,15 @@ echo "  wrote $CONF_DIR/moor.conf"
 
 echo "[5/5] Starting..."
 
+if [[ $IS_HS -eq 1 ]]; then
+    SVC_DESC="MOOR Hidden Service (port $HS_PORT)"
+else
+    SVC_DESC="MOOR Relay ($NICKNAME)"
+fi
+
 cat > /etc/systemd/system/moor.service << EOF
 [Unit]
-Description=MOOR Relay ($NICKNAME)
+Description=$SVC_DESC
 After=network-online.target
 Wants=network-online.target
 
@@ -279,11 +339,33 @@ sleep 3
 if systemctl is-active --quiet moor; then
     echo ""
     echo " ========================================"
-    echo "  MOOR relay is live!"
-    echo " ========================================"
-    echo ""
-    echo "  $NICKNAME ($ROLE) @ $ADVERTISE:$OR_PORT"
-    echo ""
+    if [[ $IS_HS -eq 1 ]]; then
+        # Wait a moment for keys to generate
+        sleep 5
+        MOOR_ADDR=""
+        if [[ -f "$HS_DIR/hostname" ]]; then
+            MOOR_ADDR=$(cat "$HS_DIR/hostname")
+        fi
+        echo "  MOOR hidden service is live!"
+        echo " ========================================"
+        echo ""
+        if [[ -n "$MOOR_ADDR" ]]; then
+        echo "  Address:  $MOOR_ADDR"
+        else
+        echo "  Address:  (generating... check $HS_DIR/hostname)"
+        fi
+        echo "  Proxying: localhost:$HS_PORT"
+        echo "  Keys:     $HS_DIR"
+        echo ""
+        echo "  PQ hybrid e2e: X25519 + Kyber768 (automatic)"
+        echo ""
+    else
+        echo "  MOOR relay is live!"
+        echo " ========================================"
+        echo ""
+        echo "  $NICKNAME ($ROLE) @ $ADVERTISE:$OR_PORT"
+        echo ""
+    fi
     echo "  Config:   sudo nano $CONF_DIR/moor.conf"
     echo "  Logs:     journalctl -u moor -f"
     echo "  Restart:  sudo systemctl restart moor"
@@ -291,7 +373,7 @@ if systemctl is-active --quiet moor; then
     echo ""
 else
     echo ""
-    echo " Relay failed to start. Check:"
+    echo " Service failed to start. Check:"
     echo "   journalctl -u moor --no-pager -n 30"
     exit 1
 fi
