@@ -78,12 +78,32 @@ Or set up manually:
 
 See [docs/configuration.md](docs/configuration.md) for all options.
 
+### Run a hidden service
+
+Host a service reachable only through the MOOR network at a `.moor` address:
+
+```
+# Start a hidden service that proxies to a local web server on port 8080
+./moor --mode hs --hs-dir ./hs_keys --hs-port 8080 -v
+
+# Your .moor address is printed on startup and saved to hs_keys/hostname
+```
+
+Clients connect via SOCKS5:
+
+```
+curl -x socks5h://127.0.0.1:9050 http://your-address-here.moor/
+```
+
+The hidden service uses a 6-hop tunnel (3 client + 3 service) with PQ hybrid end-to-end encryption (X25519 + Kyber768). The rendezvous relay that bridges both sides sees only ciphertext. Vanguard relays protect the service from guard discovery attacks. Proof-of-work prevents introduction flooding.
+
 ## Cryptography
 
 | Layer | Algorithm | What it protects |
 |-------|-----------|-----------------|
 | Link handshake | Noise_IK (X25519 + ChaCha20 + BLAKE2b) + Kyber768 | Connection between you and the first relay |
 | Circuit key exchange | X25519 + Kyber768 hybrid | Each hop of the 3-hop path |
+| HS e2e encryption | X25519 + Kyber768 hybrid (post-handshake KEM upgrade) | End-to-end between client and hidden service |
 | Onion encryption | ChaCha20 stream cipher (keys derived from PQ hybrid exchange) | Data in transit through the circuit |
 | Consensus signatures | Ed25519 + ML-DSA-65 (Dilithium3) | Integrity of the relay directory |
 | Hashing | BLAKE2b-256 | Internal integrity checks |
@@ -91,7 +111,7 @@ See [docs/configuration.md](docs/configuration.md) for all options.
 | KEM | ML-KEM-768 (Kyber768) | Post-quantum key encapsulation (NIST Level 3) |
 | PQ Signatures | ML-DSA-65 (Dilithium3) | Post-quantum signature verification (NIST Level 3) |
 
-All classical crypto via libsodium (audited, constant-time). PQ crypto via vendored NIST reference implementations.
+Every layer -- link, circuit, and hidden service end-to-end -- uses hybrid PQ cryptography. An attacker must break both X25519 and Kyber768 to decrypt anything, at any layer. All classical crypto via libsodium (audited, constant-time). PQ crypto via vendored NIST reference implementations.
 
 ## Current network
 

@@ -1,0 +1,1009 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MOOR &mdash; As Dark As It Gets</title>
+    <meta name="description" content="Post-quantum onion routing. 34,000 lines of C. Minimal dependencies. Cypherpunks write code.">
+    <link rel="icon" type="image/png" href="logo.png">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- Navigation -->
+<nav>
+    <div class="nav-inner">
+        <a href="#" class="nav-logo">MOOR</a>
+        <button class="nav-toggle" aria-label="Menu" onclick="document.querySelector('.nav-links').classList.toggle('open')">
+            <span></span><span></span><span></span>
+        </button>
+        <ul class="nav-links">
+            <li><a href="#features">Features</a></li>
+            <li><a href="#architecture">Architecture</a></li>
+            <li><a href="#wire">Wire Traffic</a></li>
+            <li><a href="#quickstart">Quick Start</a></li>
+            <li><a href="docs.html">Docs</a></li>
+            <li><a href="#download">Download</a></li>
+            <li><a href="https://github.com/0xdeadbeefnetwork/MOOR_PQ">GitHub</a></li>
+        </ul>
+    </div>
+</nav>
+
+<!-- Hero -->
+<section class="hero">
+    <div class="hero-content">
+        <img src="logo.png" alt="MOOR &mdash; As Dark As It Gets" class="hero-logo">
+        <div class="tagline">My Own Onion Router</div>
+        <p class="description">
+            Anonymous overlay network with 3-hop onion routing, post-quantum hybrid cryptography on every hop, every link, every signature,
+            hidden services, and traffic analysis resistance. ~34,000 lines of C across 40 source files. ~3,600 lines of vendored NIST PQ reference implementations.
+            Three dependencies. No OpenSSL.
+        </p>
+        <p class="cypherpunk-quote">
+            "Privacy is not a privilege granted by the powerful. It is a right exercised by the free."
+            <span class="attribution">&mdash; The MOOR License</span>
+        </p>
+        <div class="hero-buttons">
+            <a href="#download" class="btn btn-primary">Download v0.7.0</a>
+            <a href="#quickstart" class="btn btn-secondary">Quick Start</a>
+        </div>
+    </div>
+</section>
+
+<!-- Features -->
+<section id="features">
+    <h2 class="section-title">Features</h2>
+    <p class="section-subtitle">What ships in v0.7.0</p>
+
+    <!-- Cryptography -->
+    <div class="feature-category">
+        <div class="feature-category-label">Cryptography</div>
+        <div class="feature-grid">
+            <div class="feature-card">
+                <div class="card-icon">&#x1f6e1;</div>
+                <h3>Post-Quantum Hybrid Cryptography</h3>
+                <p>The quantum threat isn't the encryption &mdash; ChaCha20 with 256-bit keys already has 128-bit quantum security. The threat is the <em>key exchange</em>. A quantum computer running Shor's algorithm can break X25519 Diffie-Hellman and recover the symmetric keys from recorded traffic.</p>
+                <p>MOOR prevents this. At every hop, the ChaCha20 session key is derived from <em>both</em> an X25519 DH shared secret <em>and</em> a Kyber768 KEM shared secret, combined via BLAKE2b. An attacker must break both X25519 and Kyber768 (NIST Level 3) to recover any key. Quantum breaks X25519 but not Kyber768 &mdash; so the key survives, the encryption survives, the traffic stays sealed.</p>
+                <p>This isn't optional. There is no flag to disable it. Every circuit hop, every link handshake, every consensus signature uses hybrid classical + post-quantum cryptography. Traffic recorded today cannot be decrypted by a quantum computer tomorrow.</p>
+            </div>
+            <div class="feature-card">
+                <div class="card-icon">&#x1f50f;</div>
+                <h3>ML-DSA-65 Consensus Signatures</h3>
+                <p>Directory Authority signs consensus with Ed25519 + ML-DSA-65 (FIPS 204 Dilithium3) hybrid. Backward-compatible wire format with PQ magic bytes. Post-quantum authenticity for network state.</p>
+            </div>
+            <div class="feature-card">
+                <div class="card-icon">&#x26a1;</div>
+                <h3>Noise_IK Link Protocol</h3>
+                <p>1-RTT handshake. No certificate authority. The relay's Ed25519 identity key is the trust anchor. ChaCha20-Poly1305 + BLAKE2b. ~300 lines of implementation vs. hundreds of thousands for TLS.</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Routing & Privacy -->
+    <div class="feature-category">
+        <div class="feature-category-label">Routing &amp; Privacy</div>
+        <div class="feature-grid">
+            <div class="feature-card">
+                <div class="card-icon">&#x1f310;</div>
+                <h3>3-Hop Onion Routing</h3>
+                <p>Your traffic goes through 3 relays: Guard (sees your IP, not your destination), Middle (sees nothing), Exit (sees your destination, not your IP). No single relay can link you to what you're accessing. Relays are selected weighted by bandwidth, your guard stays the same for months to limit exposure, and no two relays in a circuit share the same network or country.</p>
+            </div>
+            <div class="feature-card">
+                <div class="card-icon">&#x1f3ad;</div>
+                <h3>Hidden Services</h3>
+                <p>Host a website or service that's only reachable through the MOOR network using a <code>.moor</code> address. Traffic between client and hidden service is end-to-end encrypted &mdash; even the relay that connects them sees only ciphertext. Service descriptors are stored encrypted across multiple relays. Vanguard relays protect your service from guard discovery attacks. Proof-of-work prevents denial-of-service flooding. OnionBalance lets you load-balance across multiple backend servers.</p>
+            </div>
+            <div class="feature-card">
+                <div class="card-icon">&#x1f575;</div>
+                <h3>PIR for Hidden Service Lookups</h3>
+                <p>When you visit a <code>.moor</code> hidden service, the relay storing the service descriptor could learn which service you're looking for. MOOR prevents this: your lookup query is split across 2 relays, each seeing only random noise. Neither relay can determine which <code>.moor</code> address you requested. This eliminates the biggest metadata leak in hidden service lookups.</p>
+            </div>
+            <div class="feature-card">
+                <div class="card-icon">&#x1f512;</div>
+                <h3>End-to-End HS Encryption</h3>
+                <p>ChaCha20-Poly1305 AEAD on every RELAY_DATA cell between client and hidden service. Post-quantum hybrid key exchange (X25519 + Kyber768) at rendezvous &mdash; the X25519 handshake completes first, then Kyber768 KEM immediately upgrades the session to PQ hybrid. The RP relay &mdash; the node that bridges both sides &mdash; sees only ciphertext. Even a compromised rendezvous point cannot read your traffic.</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Traffic Analysis Resistance -->
+    <div class="feature-category">
+        <div class="feature-category-label">Traffic Analysis Resistance</div>
+        <div class="feature-grid">
+            <div class="feature-card">
+                <div class="card-icon">&#x1f4e1;</div>
+                <h3>Traffic Analysis Resistance</h3>
+                <p>All data travels in fixed 514-byte cells &mdash; a 10-byte message and a 498-byte page look identical on the wire. Even when you're not browsing, MOOR sends padding cells at a constant rate so an observer can't tell if you're active or idle. Each circuit gets a randomized padding pattern. Multi-path circuits can split your traffic across different routes simultaneously. Pluggable transports (Scramble, Shade, Mirage) disguise MOOR traffic as normal HTTPS.</p>
+            </div>
+            <div class="feature-card">
+                <div class="card-icon">&#x1f500;</div>
+                <h3>Poisson Relay Mixing</h3>
+                <p>Relays can hold each cell for a random delay before forwarding it. Real traffic and cover traffic share the same delay pool &mdash; an observer watching a relay's input and output can't correlate which incoming cell became which outgoing cell. The delay is configurable per-relay.</p>
+            </div>
+            <div class="feature-card">
+                <div class="card-icon">&#x1f9e9;</div>
+                <h3>WTF-PAD Adaptive Padding</h3>
+                <p>Intelligent padding that adapts to your traffic pattern. Three presets: <code>web</code> mimics normal browsing bursts, <code>stream</code> produces constant-rate flow, <code>generic</code> provides balanced coverage. Each circuit gets its own randomized padding schedule so no two circuits look alike, even from the same client.</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Network & Performance -->
+    <div class="feature-category">
+        <div class="feature-category-label">Network &amp; Performance</div>
+        <div class="feature-grid">
+            <div class="feature-card">
+                <div class="card-icon">&#x1f680;</div>
+                <h3>Vegas Congestion Control</h3>
+                <p>Smart congestion control that measures round-trip times and adjusts sending speed per-circuit, so one slow path doesn't kill your other connections. Relays can pause and resume individual streams when overloaded. Flow control cells are authenticated to prevent spoofing.</p>
+            </div>
+            <div class="feature-card">
+                <div class="card-icon">&#x26a1;</div>
+                <h3>Concurrent Circuit Building</h3>
+                <p>MOOR pre-builds a pool of 8 ready circuits in the background. When you open a new connection, you get an instant circuit instead of waiting for a 3-hop handshake. Pages from the same site share a circuit. Real web browsing works at usable speeds through 3 encrypted hops.</p>
+            </div>
+            <div class="feature-card">
+                <div class="card-icon">&#x1f510;</div>
+                <h3>Encrypted DNS (DoT)</h3>
+                <p>Exit relays resolve hostnames via DNS-over-TLS to Cloudflare, Quad9, and Google. Minimal TLS 1.3 client using only libsodium (X25519, ChaCha20-Poly1305, SHA-256). SPKI pinning for server authentication. No plaintext DNS fallback &mdash; if all providers fail, the stream is refused. DNS rebinding protection blocks internal IP resolution.</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Infrastructure -->
+    <div class="feature-category">
+        <div class="feature-category-label">Infrastructure</div>
+        <div class="feature-grid">
+            <div class="feature-card">
+                <div class="card-icon">&#x1f4e6;</div>
+                <h3>Single Binary, Minimal Dependencies</h3>
+                <p>Client, relay, DA, hidden service, BridgeDB, OnionBalance &mdash; all one binary. Dependencies: libsodium, zlib, pthreads. No OpenSSL. No runtime. Auditable by one person.</p>
+            </div>
+            <div class="feature-card">
+                <div class="card-icon">&#x1f5f3;</div>
+                <h3>Multi-DA Consensus Voting</h3>
+                <p>Multiple independent directory authorities vote on the list of relays in the network. Each DA measures relay bandwidth, assigns performance flags (Fast, Stable, Guard), and signs the consensus with both classical and post-quantum signatures. All DAs must agree &mdash; a single compromised DA cannot forge the network directory.</p>
+            </div>
+            <div class="feature-card">
+                <div class="card-icon">&#x1f309;</div>
+                <h3>Censorship Circumvention</h3>
+                <p>Bridge relays not listed in public consensus. BridgeDB distributes bridge addresses via HTTPS. Bridge Authority for trusted bridge management. Pluggable transports disguise MOOR traffic.</p>
+            </div>
+            <div class="feature-card">
+                <div class="card-icon">&#x1f9e0;</div>
+                <h3>Argon2id Memory-Hard PoW</h3>
+                <p>To join the network, a relay must solve a memory-hard proof-of-work puzzle (Argon2id, 256KB per hash). This prevents attackers from cheaply flooding the network with thousands of fake relays. GPUs get almost no advantage over CPUs. Hidden services can also require PoW from connecting clients to prevent denial-of-service.</p>
+            </div>
+        </div>
+    </div>
+</section>
+
+
+<!-- Architecture -->
+<section id="architecture">
+    <h2 class="section-title">Architecture</h2>
+    <p class="section-subtitle">Protocol overview</p>
+
+    <div class="arch-protocol arch-protocol-svg">
+      <svg viewBox="0 0 940 520" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="MOOR circuit construction sequence diagram">
+        <defs>
+          <marker id="ah" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#a87dbd"/></marker>
+          <marker id="ah-amber" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#c9a84c"/></marker>
+          <marker id="ah-dim" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#706860"/></marker>
+          <marker id="ah-left" markerWidth="8" markerHeight="6" refX="0" refY="3" orient="auto-start-reverse"><path d="M8,0 L0,3 L8,6" fill="#a87dbd"/></marker>
+        </defs>
+
+        <style>
+          text { font-family: 'JetBrains Mono', monospace; }
+          .entity { fill: #a87dbd; font-size: 13px; font-weight: 700; letter-spacing: 1px; }
+          .lifeline { stroke: #2e2636; stroke-width: 1; stroke-dasharray: 6,4; }
+          .msg { stroke: #a87dbd; stroke-width: 1.5; fill: none; }
+          .msg-amber { stroke: #c9a84c; stroke-width: 1.5; fill: none; }
+          .msg-dim { stroke: #706860; stroke-width: 1; fill: none; }
+          .label { fill: #ccc4b8; font-size: 10.5px; }
+          .label-sub { fill: #706860; font-size: 9.5px; }
+          .label-amber { fill: #c9a84c; font-size: 10.5px; }
+          .tunnel-line { stroke: #5a2d6e; stroke-width: 2; stroke-dasharray: 8,3; }
+          .tunnel-label { fill: #a87dbd; font-size: 11px; font-weight: 500; }
+          .phase { fill: #7a7268; font-size: 9px; letter-spacing: 2px; text-transform: uppercase; }
+          .node-box { fill: #0d0b0e; stroke: #2e2636; stroke-width: 1; rx: 3; }
+          .node-box-highlight { fill: #0d0b0e; stroke: #5a2d6e; stroke-width: 1.5; rx: 3; }
+        </style>
+
+        <!-- Entity boxes -->
+        <rect class="node-box-highlight" x="30" y="10" width="80" height="28"/>
+        <text class="entity" x="70" y="29" text-anchor="middle">Client</text>
+
+        <rect class="node-box" x="195" y="10" width="70" height="28"/>
+        <text class="entity" x="230" y="29" text-anchor="middle">Guard</text>
+
+        <rect class="node-box" x="375" y="10" width="70" height="28"/>
+        <text class="entity" x="410" y="29" text-anchor="middle">Middle</text>
+
+        <rect class="node-box" x="555" y="10" width="56" height="28"/>
+        <text class="entity" x="583" y="29" text-anchor="middle">Exit</text>
+
+        <rect class="node-box" x="720" y="10" width="100" height="28"/>
+        <text class="entity" x="770" y="29" text-anchor="middle">Destination</text>
+
+        <!-- Lifelines -->
+        <line class="lifeline" x1="70" y1="42" x2="70" y2="510"/>
+        <line class="lifeline" x1="230" y1="42" x2="230" y2="510"/>
+        <line class="lifeline" x1="410" y1="42" x2="410" y2="510"/>
+        <line class="lifeline" x1="583" y1="42" x2="583" y2="510"/>
+        <line class="lifeline" x1="770" y1="42" x2="770" y2="510"/>
+
+        <!-- Phase 1: Link to Guard -->
+        <text class="phase" x="12" y="68">Phase 1</text>
+        <line class="msg" x1="70" y1="80" x2="222" y2="80" marker-end="url(#ah)"/>
+        <text class="label" x="148" y="75" text-anchor="middle">Noise_IK + Kyber768</text>
+        <text class="label-sub" x="148" y="93" text-anchor="middle">1-RTT PQ hybrid link</text>
+
+        <line class="msg-amber" x1="70" y1="110" x2="222" y2="110" marker-end="url(#ah-amber)"/>
+        <text class="label-amber" x="148" y="105" text-anchor="middle">CREATE_PQ (X25519 + Kyber768)</text>
+
+        <line class="msg" x1="222" y1="130" x2="70" y2="130" marker-end="url(#ah-left)"/>
+        <text class="label" x="148" y="125" text-anchor="middle">CREATED</text>
+
+        <!-- Phase 2: Extend to Middle -->
+        <text class="phase" x="12" y="158">Phase 2</text>
+        <line class="msg-amber" x1="70" y1="170" x2="222" y2="170" marker-end="url(#ah-amber)"/>
+        <text class="label-amber" x="148" y="165" text-anchor="middle">RELAY_EARLY(EXTEND2)</text>
+
+        <line class="msg-dim" x1="230" y1="185" x2="402" y2="185" marker-end="url(#ah-dim)"/>
+        <text class="label-sub" x="318" y="180" text-anchor="middle">CREATE (CKE)</text>
+
+        <line class="msg-dim" x1="402" y1="200" x2="230" y2="200" marker-end="url(#ah-dim)"/>
+        <text class="label-sub" x="318" y="215" text-anchor="middle">CREATED</text>
+
+        <line class="msg" x1="222" y1="225" x2="70" y2="225" marker-end="url(#ah-left)"/>
+        <text class="label" x="148" y="240" text-anchor="middle">EXTENDED</text>
+
+        <!-- Phase 3: Extend to Exit -->
+        <text class="phase" x="12" y="263">Phase 3</text>
+        <line class="msg-amber" x1="70" y1="275" x2="222" y2="275" marker-end="url(#ah-amber)"/>
+        <text class="label-amber" x="148" y="270" text-anchor="middle">RELAY_EARLY(EXTEND2)</text>
+
+        <line class="msg-dim" x1="230" y1="290" x2="402" y2="290" marker-end="url(#ah-dim)"/>
+        <line class="msg-dim" x1="410" y1="300" x2="575" y2="300" marker-end="url(#ah-dim)"/>
+        <text class="label-sub" x="495" y="295" text-anchor="middle">CREATE (CKE)</text>
+
+        <line class="msg-dim" x1="575" y1="315" x2="410" y2="315" marker-end="url(#ah-dim)"/>
+        <line class="msg-dim" x1="402" y1="325" x2="230" y2="325" marker-end="url(#ah-dim)"/>
+        <text class="label-sub" x="495" y="330" text-anchor="middle">CREATED</text>
+
+        <line class="msg" x1="222" y1="340" x2="70" y2="340" marker-end="url(#ah-left)"/>
+        <text class="label" x="148" y="355" text-anchor="middle">EXTENDED</text>
+
+        <!-- Tunnel established -->
+        <line class="tunnel-line" x1="70" y1="380" x2="583" y2="380"/>
+        <text class="tunnel-label" x="327" y="375" text-anchor="middle">3-hop encrypted tunnel &mdash; ChaCha20 layered encryption (3 layers)</text>
+
+        <!-- Data flow -->
+        <text class="phase" x="12" y="408">Data</text>
+        <line class="msg-amber" x1="70" y1="420" x2="575" y2="420" marker-end="url(#ah-amber)"/>
+        <text class="label-amber" x="327" y="415" text-anchor="middle">RELAY_BEGIN</text>
+
+        <line class="msg-dim" x1="583" y1="435" x2="762" y2="435" marker-end="url(#ah-dim)"/>
+        <text class="label-sub" x="675" y="430" text-anchor="middle">TCP connect</text>
+
+        <line class="msg-dim" x1="762" y1="450" x2="583" y2="450" marker-end="url(#ah-dim)"/>
+        <text class="label-sub" x="675" y="465" text-anchor="middle">connected</text>
+
+        <line class="msg" x1="575" y1="470" x2="70" y2="470" marker-end="url(#ah-left)"/>
+        <text class="label" x="327" y="467" text-anchor="middle">RELAY_CONNECTED</text>
+
+        <line class="msg-amber" x1="70" y1="490" x2="762" y2="490" marker-end="url(#ah-amber)"/>
+        <text class="label-amber" x="420" y="505" text-anchor="middle">RELAY_DATA (onion-encrypted, peeled at each hop)</text>
+      </svg>
+    </div>
+
+    <div class="arch-details">
+        <div class="arch-item">
+            <h3>Fixed-Size Cells</h3>
+            <p>Every cell is exactly <code>514 bytes</code> plaintext (4-byte circuit ID, 1-byte command, 509-byte payload). On the wire: 2-byte length prefix + 514-byte ciphertext + 16-byte Poly1305 MAC = <code>532 bytes</code>. Relay cells carry an 11-byte header leaving <code>498 bytes</code> for data. No variable-length records. No size-based traffic analysis.</p>
+        </div>
+
+        <div class="arch-item">
+            <h3>Layered Hybrid Cryptography</h3>
+            <p>At each hop, the client and relay perform a hybrid key exchange: <code>X25519 DH</code> produces a classical shared secret, <code>Kyber768 KEM</code> produces a post-quantum shared secret. Both are combined via <code>BLAKE2b</code> to derive the <code>ChaCha20</code> session key. An attacker must break both algorithms to recover any hop's key. Each cell is then encrypted with 3 layers of ChaCha20 (one per hop) and sealed in a <code>ChaCha20-Poly1305 AEAD</code> link frame. Consensus is dual-signed with <code>Ed25519 + ML-DSA-65</code>.</p>
+        </div>
+
+        <div class="arch-item">
+            <h3>Event-Driven I/O</h3>
+            <p><code>epoll</code> on Linux, <code>select</code> on Windows, <code>poll</code> fallback elsewhere. Single-threaded event loop with a pthread crypto worker pool and a background circuit builder thread. Expensive Kyber operations are offloaded to workers, which signal completion via pipe fd back to the event loop.</p>
+        </div>
+
+        <div class="arch-item">
+            <h3>Hidden Service Rendezvous</h3>
+            <p>Client builds a 3-hop circuit to a rendezvous point. HS builds a 3-hop circuit to the same point. Result: a 6-hop tunnel with post-quantum hybrid end-to-end encryption (X25519 + Kyber768 &rarr; ChaCha20-Poly1305) &mdash; the rendezvous relay sees only ciphertext. Descriptor lookups use 2-server XOR PIR so no relay learns which <code>.moor</code> address was requested. <code>Vanguards</code> (L2/L3 restricted middle hops) protect the HS guard from discovery attacks.</p>
+        </div>
+    </div>
+</section>
+
+<!-- Wire Traffic -->
+<section id="wire">
+    <h2 class="section-title">Wire Traffic</h2>
+    <p class="section-subtitle">Live captures from the MOOR test network &mdash; March 2026</p>
+
+    <h3 class="hardening-title">Client &rarr; Guard &mdash; Your ISP's View</h3>
+
+    <p class="section-desc">
+        Real packet capture from a MOOR client fetching <code>http://example.com</code>
+        through a 3-hop circuit. Left: what you sent. Right: what an observer sees between you and the guard relay.
+        Three layers of ChaCha20 onion encryption inside a ChaCha20-Poly1305 AEAD link &mdash; nothing survives.
+    </p>
+
+    <div class="wire-compare">
+        <div class="wire-panel">
+            <div class="terminal">
+                <div class="terminal-header">
+                    <span class="terminal-dot red"></span>
+                    <span class="terminal-dot yellow"></span>
+                    <span class="terminal-dot green"></span>
+                    <span class="terminal-title">your request (plaintext)</span>
+                </div>
+<pre><code><span class="wire-plain">GET / HTTP/1.1
+Host: example.com
+User-Agent: curl/8.5.0
+Accept: */*</span>
+
+<span class="wire-plain-body">&lt;!doctype html&gt;
+&lt;html&gt;
+&lt;head&gt;
+    &lt;title&gt;Example Domain&lt;/title&gt;
+    &lt;meta charset="utf-8" /&gt;
+    ...
+&lt;/head&gt;
+&lt;body&gt;
+&lt;h1&gt;Example Domain&lt;/h1&gt;
+&lt;p&gt;This domain is for use in
+illustrative examples...&lt;/p&gt;
+&lt;/body&gt;
+&lt;/html&gt;</span></code></pre>
+            </div>
+        </div>
+
+        <div class="wire-arrow">
+            <svg viewBox="0 0 40 120" xmlns="http://www.w3.org/2000/svg">
+                <text x="20" y="30" fill="#5a2d6e" font-family="JetBrains Mono" font-size="8" text-anchor="middle">3 layers</text>
+                <text x="20" y="42" fill="#5a2d6e" font-family="JetBrains Mono" font-size="8" text-anchor="middle">ChaCha20</text>
+                <line x1="20" y1="52" x2="20" y2="100" stroke="#5a2d6e" stroke-width="1.5"/>
+                <polygon points="14,94 20,106 26,94" fill="#5a2d6e"/>
+            </svg>
+        </div>
+
+        <div class="wire-panel">
+            <div class="terminal">
+                <div class="terminal-header">
+                    <span class="terminal-dot red"></span>
+                    <span class="terminal-dot yellow"></span>
+                    <span class="terminal-dot green"></span>
+                    <span class="terminal-title">client &rarr; guard (tcpdump capture)</span>
+                </div>
+<pre><code><span class="wire-meta">198.51.100.47:52670 &rarr; 203.0.113.82:9001</span>
+<span class="wire-meta">length 532  |  3x ChaCha20 onion layers + ChaCha20-Poly1305 AEAD link</span>
+
+<span class="wire-hex">0212 053d 72b2 cc8f 27c0 cce7 0e2b 6e39</span>
+<span class="wire-hex">ae5b 2696 6bbd e0cf 8c9a 5365 863e 43d6</span>
+<span class="wire-hex">2ee3 70b8 20d5 bd13 7af6 e66d 0d95 ba57</span>
+<span class="wire-hex">943b a40f 731d 287a 33e3 ba59 fd85 7d79</span>
+<span class="wire-hex">2dd2 9c99 c981 a563 d908 f049 b16e 4880</span>
+<span class="wire-hex">1f91 0fba dc3e 8b14 4b93 e2a1 aef2 d0b5</span>
+<span class="wire-hex">be84 1e88 fd40 31f3 c711 f032 6973 5880</span>
+<span class="wire-hex">7b59 271a 4514 dbfe 9154 3dd3 20d4 71ff</span>
+<span class="wire-hex">b9cc c3bb c6b5 b93a 5931 209e 6d26 11f3</span>
+<span class="wire-hex">c0ea da05 6c0c 1d95 5ad4 1d43 f5c5 22f0</span>
+<span class="wire-hex">9e6f b649 3247 ca28 6ed1 e0db 673e e1c1</span>
+<span class="wire-hex">43d3 d617 7836 81cf ce90 9feb b891 ecc1</span>
+<span class="wire-hex">f13f da0f ab7e 1939 cddc 8e65 52ee 0f3f</span>
+<span class="wire-hex">b922 d8bd dedb 375e d9c4 4b74 ba63 836f</span>
+<span class="wire-hex">607c 9ce9 1fe2 4e62 5b4c 5145 92b1 f9ea</span>
+<span class="wire-hex">fa30 831f 8480 e36b 473c 2bbb .... ....</span></code></pre>
+            </div>
+        </div>
+    </div>
+
+    <h3 class="hardening-title">Guard Relay &mdash; Relay-to-Relay Link</h3>
+
+    <p class="section-desc">
+        Live capture at guard relay <code>86.54.28.132:9001</code>
+        on March 29, 2026. Inbound 532-byte cell from TURBINE (104.129.51.133).
+        Every relay-to-relay link is independently encrypted with Noise_IK + Kyber768.
+    </p>
+
+    <div class="terminal wire-single">
+        <div class="terminal-header">
+            <span class="terminal-dot red"></span>
+            <span class="terminal-dot yellow"></span>
+            <span class="terminal-dot green"></span>
+            <span class="terminal-title">TURBINE &rarr; DROPOUT (relay-to-relay link, tcpdump)</span>
+        </div>
+<pre><code><span class="wire-meta">104.129.51.133:38472 &rarr; 86.54.28.132:9001</span>
+<span class="wire-meta">length 532  |  Noise_IK + Kyber768 hybrid link</span>
+
+<span class="wire-hex">0212 7803 fc38 9da3 8419 97c1 41fd a462</span>
+<span class="wire-hex">5b3d cab0 304f e060 cccb 19a4 7f60 ebe1</span>
+<span class="wire-hex">1aa8 5e47 aa4e 2680 5404 e507 f907 a3bd</span>
+<span class="wire-hex">26d7 3c92 599c b782 e093 3da8 f090 6af5</span>
+<span class="wire-hex">d0bd a8fd 6da7 ca22 9cf4 982a ddf9 cdf6</span>
+<span class="wire-hex">f4fb ce70 5f7c 2d85 c4f6 18b3 4c6b 6746</span>
+<span class="wire-hex">4133 0513 c144 3bee 699c 7a35 f638 2477</span>
+<span class="wire-hex">074d b9da 04ab fe80 afe3 2843 6d99 2d18</span>
+<span class="wire-hex">71f9 801b d202 b13f 9b77 63e4 11af 669f</span>
+<span class="wire-hex">d983 4eaa 0672 575d 271c 00cd f28a 1f77</span>
+<span class="wire-hex">57c4 3e1d 6ed7 c411 2060 8dc9 442f 5a45</span>
+<span class="wire-hex">1f99 f751 c8b2 57b5 c219 1592 fc88 a3ad</span>
+<span class="wire-hex">ac1d 3d11 3d52 c1bf 1116 1311 f3d7 0b7e</span>
+<span class="wire-hex">f6ac d0a4 203d fa94 a3b9 5f03 b713 4cfe</span>
+<span class="wire-hex">7e19 5900 2aa6 3d77 7672 754e 31ac 93f9</span>
+<span class="wire-hex">94d6 adb5 86c2 44cf 10b3 8c46 ba27 16a2</span>
+<span class="wire-hex">35e3 1816 83f3 a5ac 40bd f625 .... ....</span></code></pre>
+    </div>
+
+    <h3 class="hardening-title">Exit Relay &mdash; Both Sides Encrypted</h3>
+
+    <p class="section-desc">
+        Live capture from exit relay <code>86.54.28.49:9001</code>
+        on March 29, 2026. Even the exit relay &mdash; the node that touches the destination &mdash;
+        sees ciphertext from the relay network (inbound) but sends cleartext to the destination (outbound). This is the anonymity tradeoff &mdash; use HTTPS for end-to-end encryption.
+    </p>
+
+    <div class="wire-compare">
+        <div class="wire-panel">
+            <div class="terminal">
+                <div class="terminal-header">
+                    <span class="terminal-dot red"></span>
+                    <span class="terminal-dot yellow"></span>
+                    <span class="terminal-dot green"></span>
+                    <span class="terminal-title">peer &rarr; exit relay (inbound cell)</span>
+                </div>
+<pre><code><span class="wire-meta">104.129.51.133:9001 &rarr; 86.54.28.49:33574</span>
+<span class="wire-meta">length 532  |  ChaCha20-Poly1305 AEAD link (1 onion layer remaining)</span>
+
+<span class="wire-hex">0212 a8c3 13e9 a4d3 c465 5768 645b fe23</span>
+<span class="wire-hex">43b3 4c90 984a 3bbd b97a a931 c237 5fe7</span>
+<span class="wire-hex">552c d866 7c1f bba9 6cee 65a5 98ad 9efa</span>
+<span class="wire-hex">57d5 f3a7 8488 b0e2 cad1 81de 15b0 ffc0</span>
+<span class="wire-hex">7fb2 7af7 3c2f 2afc cd57 70d1 9481 3216</span>
+<span class="wire-hex">4bc3 56d8 b923 db0a edea a807 7f06 6591</span>
+<span class="wire-hex">b7b8 16c4 e22b f9ae 2efa 1920 2575 a6e6</span>
+<span class="wire-hex">34f4 1c83 675b 2e7d f319 3575 fd70 ee77</span>
+<span class="wire-hex">ce56 a9d4 b885 c721 cd75 8361 936c 16ae</span>
+<span class="wire-hex">49b2 326b c95c 4f62 08be 9527 b637 b475</span>
+<span class="wire-hex">4e5d c0ae 30c6 d26a 6ea0 6ab4 2449 8f05</span>
+<span class="wire-hex">3b52 6948 d74c bc65 2e02 45e3 4fa8 6361</span>
+<span class="wire-hex">ed71 188f 7641 cd5c 386e 7c49 a553 0e4b</span>
+<span class="wire-hex">e2f9 129d f75b b4ca 1c58 d075 b251 ebd3</span>
+<span class="wire-hex">fa64 2b59 bd0a e8b4 40b6 b19a 29f0 d32b</span>
+<span class="wire-hex">317e 72a2 7158 384b 2057 8949 fb00 cf29</span>
+<span class="wire-hex">9c80 7534 5b57 110d .... .... .... ....</span></code></pre>
+            </div>
+        </div>
+
+        <div class="wire-arrow">
+            <svg viewBox="0 0 40 120" xmlns="http://www.w3.org/2000/svg">
+                <text x="20" y="30" fill="#5a2d6e" font-family="JetBrains Mono" font-size="8" text-anchor="middle">exit sees</text>
+                <text x="20" y="42" fill="#5a2d6e" font-family="JetBrains Mono" font-size="8" text-anchor="middle">ciphertext</text>
+                <line x1="20" y1="52" x2="20" y2="100" stroke="#5a2d6e" stroke-width="1.5"/>
+                <polygon points="14,94 20,106 26,94" fill="#5a2d6e"/>
+            </svg>
+        </div>
+
+        <div class="wire-panel">
+            <div class="terminal">
+                <div class="terminal-header">
+                    <span class="terminal-dot red"></span>
+                    <span class="terminal-dot yellow"></span>
+                    <span class="terminal-dot green"></span>
+                    <span class="terminal-title">exit relay &rarr; destination (cleartext TCP)</span>
+                </div>
+<pre><code><span class="wire-meta">86.54.28.49:48290 &rarr; 93.184.216.34:80</span>
+<span class="wire-meta">length 345  |  plaintext HTTP &mdash; exit decrypts onion layers</span>
+
+<span class="wire-plain">4745 5420 2f20 4854 5450 2f31 2e31 0d0a</span>  <span class="wire-meta">GET / HTTP/1.1..</span>
+<span class="wire-plain">486f 7374 3a20 6578 616d 706c 652e 636f</span>  <span class="wire-meta">Host: example.co</span>
+<span class="wire-plain">6d0d 0a55 7365 722d 4167 656e 743a 2063</span>  <span class="wire-meta">m..User-Agent: c</span>
+<span class="wire-plain">7572 6c2f 382e 352e 300d 0a41 6363 6570</span>  <span class="wire-meta">url/8.5.0..Accep</span>
+<span class="wire-plain">743a 202a 2f2a 0d0a 0d0a .... .... ....</span>  <span class="wire-meta">t: */*......</span></code></pre>
+            </div>
+        </div>
+    </div>
+
+
+
+    <h3 class="hardening-title">Adversary Capability Matrix</h3>
+
+    <p class="section-desc">
+        What can each adversary learn from their vantage point? No single position can link client identity to destination.
+    </p>
+
+    <div class="wire-single wire-single-wide">
+      <svg viewBox="0 0 820 530" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Adversary capability matrix">
+        <style>
+          .acm-hdr { fill: #c9a84c; font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 700; letter-spacing: 1px; }
+          .acm-row-label { fill: #ccc4b8; font-family: 'JetBrains Mono', monospace; font-size: 11.5px; }
+          .acm-yes { fill: #e85d5d; font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 700; }
+          .acm-no { fill: #706860; font-family: 'JetBrains Mono', monospace; font-size: 11.5px; }
+          .acm-self { fill: #706860; font-family: 'JetBrains Mono', monospace; font-size: 11.5px; font-style: italic; }
+          .acm-hard { fill: #4ec9b0; font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 700; }
+          .acm-note { fill: #706860; font-family: 'JetBrains Mono', monospace; font-size: 9.5px; }
+          .acm-grid { stroke: #2e2636; stroke-width: 1; }
+          .acm-grid-hdr { stroke: #5a2d6e; stroke-width: 1.5; }
+          .acm-box { fill: #0d0b0e; stroke: #2e2636; stroke-width: 1; rx: 4; }
+          .acm-hdr-box { fill: #0d0b0e; stroke: #5a2d6e; stroke-width: 1.5; rx: 4; }
+        </style>
+
+        <!-- Column positions: label=30, Guard=340, Middle=460, Exit=580, ISP=700 -->
+        <!-- Row height: 34px, starting y=60 -->
+
+        <!-- Background -->
+        <rect class="acm-box" x="10" y="10" width="800" height="510"/>
+
+        <!-- Header row background -->
+        <rect class="acm-hdr-box" x="10" y="10" width="800" height="38"/>
+
+        <!-- Header labels -->
+        <text class="acm-hdr" x="170" y="35" text-anchor="middle">Observable</text>
+        <text class="acm-hdr" x="370" y="35" text-anchor="middle">Guard</text>
+        <text class="acm-hdr" x="480" y="35" text-anchor="middle">Middle</text>
+        <text class="acm-hdr" x="590" y="35" text-anchor="middle">Exit</text>
+        <text class="acm-hdr" x="720" y="35" text-anchor="middle">ISP</text>
+
+        <!-- Column dividers -->
+        <line class="acm-grid" x1="300" y1="10" x2="300" y2="430"/>
+        <line class="acm-grid" x1="425" y1="10" x2="425" y2="430"/>
+        <line class="acm-grid" x1="535" y1="10" x2="535" y2="430"/>
+        <line class="acm-grid" x1="655" y1="10" x2="655" y2="430"/>
+
+        <!-- Header separator -->
+        <line class="acm-grid-hdr" x1="10" y1="48" x2="810" y2="48"/>
+
+        <!-- Row 1: Client real IP  y=70 -->
+        <text class="acm-row-label" x="30" y="70">Client real IP</text>
+        <text class="acm-yes" x="370" y="70" text-anchor="middle">YES</text>
+        <text class="acm-no" x="480" y="70" text-anchor="middle">no</text>
+        <text class="acm-no" x="590" y="70" text-anchor="middle">no</text>
+        <text class="acm-yes" x="720" y="70" text-anchor="middle">YES*</text>
+        <line class="acm-grid" x1="20" y1="80" x2="800" y2="80"/>
+
+        <!-- Row 2: Guard IP  y=104 -->
+        <text class="acm-row-label" x="30" y="104">Guard IP</text>
+        <text class="acm-self" x="370" y="104" text-anchor="middle">self</text>
+        <text class="acm-yes" x="480" y="104" text-anchor="middle">YES</text>
+        <text class="acm-no" x="590" y="104" text-anchor="middle">no</text>
+        <text class="acm-yes" x="720" y="104" text-anchor="middle">YES</text>
+        <line class="acm-grid" x1="20" y1="114" x2="800" y2="114"/>
+
+        <!-- Row 3: Middle IP  y=138 -->
+        <text class="acm-row-label" x="30" y="138">Middle IP</text>
+        <text class="acm-yes" x="370" y="138" text-anchor="middle">YES</text>
+        <text class="acm-self" x="480" y="138" text-anchor="middle">self</text>
+        <text class="acm-no" x="590" y="138" text-anchor="middle">no</text>
+        <text class="acm-no" x="720" y="138" text-anchor="middle">no</text>
+        <line class="acm-grid" x1="20" y1="148" x2="800" y2="148"/>
+
+        <!-- Row 4: Exit IP  y=172 -->
+        <text class="acm-row-label" x="30" y="172">Exit IP</text>
+        <text class="acm-no" x="370" y="172" text-anchor="middle">no</text>
+        <text class="acm-yes" x="480" y="172" text-anchor="middle">YES</text>
+        <text class="acm-self" x="590" y="172" text-anchor="middle">self</text>
+        <text class="acm-no" x="720" y="172" text-anchor="middle">no</text>
+        <line class="acm-grid" x1="20" y1="182" x2="800" y2="182"/>
+
+        <!-- Row 5: Dest website IP  y=206 -->
+        <text class="acm-row-label" x="30" y="206">Dest website IP</text>
+        <text class="acm-no" x="370" y="206" text-anchor="middle">no</text>
+        <text class="acm-no" x="480" y="206" text-anchor="middle">no</text>
+        <text class="acm-yes" x="590" y="206" text-anchor="middle">YES</text>
+        <text class="acm-no" x="720" y="206" text-anchor="middle">no</text>
+        <line class="acm-grid" x1="20" y1="216" x2="800" y2="216"/>
+
+        <!-- Row 6: HTTP content  y=240 -->
+        <text class="acm-row-label" x="30" y="240">HTTP content</text>
+        <text class="acm-no" x="370" y="240" text-anchor="middle">no</text>
+        <text class="acm-no" x="480" y="240" text-anchor="middle">no</text>
+        <text class="acm-yes" x="590" y="240" text-anchor="middle">HTTP**</text>
+        <text class="acm-no" x="720" y="240" text-anchor="middle">no</text>
+        <line class="acm-grid" x1="20" y1="250" x2="800" y2="250"/>
+
+        <!-- Row 7: HTTPS content  y=274 -->
+        <text class="acm-row-label" x="30" y="274">HTTPS content</text>
+        <text class="acm-no" x="370" y="274" text-anchor="middle">no</text>
+        <text class="acm-no" x="480" y="274" text-anchor="middle">no</text>
+        <text class="acm-no" x="590" y="274" text-anchor="middle">no</text>
+        <text class="acm-no" x="720" y="274" text-anchor="middle">no</text>
+        <line class="acm-grid" x1="20" y1="284" x2="800" y2="284"/>
+
+        <!-- Row 8: HS identity  y=308 -->
+        <text class="acm-row-label" x="30" y="308">HS identity</text>
+        <text class="acm-no" x="370" y="308" text-anchor="middle">no</text>
+        <text class="acm-no" x="480" y="308" text-anchor="middle">no</text>
+        <text class="acm-no" x="590" y="308" text-anchor="middle">no</text>
+        <text class="acm-no" x="720" y="308" text-anchor="middle">no</text>
+        <line class="acm-grid" x1="20" y1="318" x2="800" y2="318"/>
+
+        <!-- Row 9: HS content  y=342 -->
+        <text class="acm-row-label" x="30" y="342">HS content</text>
+        <text class="acm-no" x="370" y="342" text-anchor="middle">no</text>
+        <text class="acm-no" x="480" y="342" text-anchor="middle">no</text>
+        <text class="acm-no" x="590" y="342" text-anchor="middle">no</text>
+        <text class="acm-no" x="720" y="342" text-anchor="middle">no</text>
+        <line class="acm-grid" x1="20" y1="352" x2="800" y2="352"/>
+
+        <!-- Row 10: Active vs idle  y=376 -->
+        <text class="acm-row-label" x="30" y="376">Active vs idle</text>
+        <text class="acm-hard" x="370" y="376" text-anchor="middle">HARD</text>
+        <text class="acm-hard" x="480" y="376" text-anchor="middle">HARD</text>
+        <text class="acm-hard" x="590" y="376" text-anchor="middle">HARD</text>
+        <text class="acm-hard" x="720" y="376" text-anchor="middle">HARD</text>
+        <line class="acm-grid" x1="20" y1="386" x2="800" y2="386"/>
+
+        <!-- Row 11: Traffic pattern  y=410 -->
+        <text class="acm-row-label" x="30" y="410">Traffic pattern</text>
+        <text class="acm-hard" x="370" y="410" text-anchor="middle">HARD</text>
+        <text class="acm-hard" x="480" y="410" text-anchor="middle">HARD</text>
+        <text class="acm-hard" x="590" y="410" text-anchor="middle">HARD</text>
+        <text class="acm-hard" x="720" y="410" text-anchor="middle">HARD</text>
+
+        <!-- Bottom border of last row -->
+        <line class="acm-grid" x1="10" y1="430" x2="810" y2="430"/>
+
+        <!-- Footnotes -->
+        <text class="acm-note" x="30" y="452">* ISP sees client&#x2192;guard, knows guard IP from public consensus</text>
+        <text class="acm-note" x="30" y="468">** Exit can read unencrypted HTTP; HTTPS is end-to-end encrypted</text>
+        <text class="acm-note" x="30" y="484">HARD = constant-rate padding + WTF-PAD makes traffic correlation difficult</text>
+
+        <!-- Legend dots -->
+        <circle cx="20" cy="504" r="4" fill="#e85d5d"/>
+        <text class="acm-note" x="30" y="507">Visible</text>
+        <circle cx="100" cy="504" r="4" fill="#4ec9b0"/>
+        <text class="acm-note" x="110" y="507">Mitigated</text>
+        <circle cx="205" cy="504" r="4" fill="#706860"/>
+        <text class="acm-note" x="215" y="507">Not visible</text>
+      </svg>
+    </div>
+
+    <div class="wire-explanation">
+        <div class="wire-explain-item">
+            <h3>No readable content</h3>
+            <p>Each cell is wrapped in 3 layers of ChaCha20 stream cipher (one per hop) and then sealed in a ChaCha20-Poly1305 AEAD link frame. The onion layers use keyed ChaCha20 with per-hop nonces &mdash; each relay strips one layer. A running BLAKE2b digest authenticates cells at the correct hop. The link-layer AEAD prevents tampering in transit. An observer between any two relays sees only authenticated ciphertext.</p>
+        </div>
+        <div class="wire-explain-item">
+            <h3>No size fingerprinting</h3>
+            <p>Every cell is exactly <code>514 bytes</code> plaintext. On the wire: 2-byte length prefix + 514 bytes ciphertext + 16-byte Poly1305 MAC = <code>532 bytes</code>. A 10-byte ping and a 498-byte data transfer produce identical packet sizes. No variable-length records, ever.</p>
+        </div>
+        <div class="wire-explain-item">
+            <h3>Statistically indistinguishable from random</h3>
+            <p>The link layer uses ChaCha20-Poly1305 IETF AEAD (libsodium <code>crypto_aead_chacha20poly1305_ietf</code>) with a 64-bit counter nonce. The only structured bytes are the 2-byte length prefix, which is constant (always 530). No protocol headers, no version fields, no magic bytes. The ciphertext is IND-CPA secure &mdash; computationally indistinguishable from random.</p>
+        </div>
+    </div>
+</section>
+
+<!-- Quick Start -->
+<section id="quickstart">
+    <h2 class="section-title">Quick Start</h2>
+    <p class="section-subtitle">Build and run a network</p>
+
+    <!-- Quick Install -->
+    <div class="terminal">
+        <div class="terminal-header">
+            <span class="terminal-dot red"></span>
+            <span class="terminal-dot yellow"></span>
+            <span class="terminal-dot green"></span>
+            <span class="terminal-title">Quick install</span>
+        </div>
+<pre><code><span class="comment"># Install and run (Linux / macOS)</span>
+<span class="prompt">$</span> curl -sL https://raw.githubusercontent.com/0xdeadbeefnetwork/MOOR_PQ/main/setup.sh | sudo bash
+<span class="prompt">$</span> moor                    <span class="comment"># Browse anonymously (SOCKS5 on :9050)</span>
+</code></pre>
+    </div>
+
+    <!-- Build -->
+    <div class="terminal">
+        <div class="terminal-header">
+            <span class="terminal-dot red"></span>
+            <span class="terminal-dot yellow"></span>
+            <span class="terminal-dot green"></span>
+            <span class="terminal-title">Build from source</span>
+        </div>
+<pre><code><span class="comment"># Install dependencies (Ubuntu/Debian)</span>
+<span class="prompt">$</span> sudo apt install build-essential libsodium-dev zlib1g-dev pkg-config
+
+<span class="comment"># Build</span>
+<span class="prompt">$</span> ./configure
+<span class="prompt">$</span> make <span class="flag">-j$(nproc)</span>
+<span class="prompt">$</span> make check            <span class="comment"># run test suite</span>
+<span class="prompt">$</span> sudo make install
+</code></pre>
+    </div>
+
+    <!-- Relay configs -->
+    <div class="terminal">
+        <div class="terminal-header">
+            <span class="terminal-dot red"></span>
+            <span class="terminal-dot yellow"></span>
+            <span class="terminal-dot green"></span>
+            <span class="terminal-title">Run a relay (moorrc)</span>
+        </div>
+<pre><code><span class="comment"># Create moorrc config file:</span>
+<span class="comment"># All relays start as middle relays. The DA assigns flags:</span>
+<span class="comment">#   Running  &mdash; immediately (DA can reach you)</span>
+<span class="comment">#   Fast     &mdash; bandwidth above 12.5th percentile</span>
+<span class="comment">#   Stable   &mdash; uptime above median</span>
+<span class="comment">#   Guard    &mdash; Fast + Stable + bandwidth + 8+ days uptime</span>
+<span class="comment">#   HSDir    &mdash; Fast + Stable + 96+ hours uptime</span>
+<span class="comment"># On small networks (&lt;20 relays), Guard/Exit granted immediately.</span>
+
+<span class="comment"># --- Guard relay moorrc ---</span>
+Mode relay
+BindAddress 0.0.0.0
+ORPort 9001
+AdvertiseAddress YOUR_PUBLIC_IP
+Guard 1
+Nickname MyGuard
+DataDirectory /var/lib/moor
+ContactInfo you@example.com
+Verbose 1
+
+<span class="comment"># --- Middle relay moorrc ---</span>
+Mode relay
+BindAddress 0.0.0.0
+ORPort 9001
+AdvertiseAddress YOUR_PUBLIC_IP
+Nickname MyMiddle
+DataDirectory /var/lib/moor
+ContactInfo you@example.com
+Verbose 1
+
+<span class="comment"># --- Exit relay moorrc ---</span>
+Mode relay
+BindAddress 0.0.0.0
+ORPort 9001
+AdvertiseAddress YOUR_PUBLIC_IP
+ExitRelay 1
+Nickname MyExit
+DataDirectory /var/lib/moor
+ContactInfo you@example.com
+Verbose 1
+
+<span class="comment"># Run:</span>
+<span class="prompt">$</span> moor -f moorrc
+
+<span class="comment"># NAT: BindAddress = local (0.0.0.0), AdvertiseAddress = public IP</span>
+<span class="comment"># Port 9001/tcp must be open inbound through your firewall</span>
+<span class="comment"># All relays must run the SAME version (old binaries fail handshakes)</span>
+</code></pre>
+    </div>
+
+    <!-- Client -->
+    <div class="terminal">
+        <div class="terminal-header">
+            <span class="terminal-dot red"></span>
+            <span class="terminal-dot yellow"></span>
+            <span class="terminal-dot green"></span>
+            <span class="terminal-title">Browse through MOOR</span>
+        </div>
+<pre><code><span class="comment"># Client moorrc:</span>
+SocksPort 9050
+
+<span class="comment"># Run:</span>
+<span class="prompt">$</span> moor -f moorrc
+
+<span class="comment"># SOCKS5 proxy on 127.0.0.1:9050. Test with curl:</span>
+<span class="prompt">$</span> curl -x socks5h://127.0.0.1:9050 https://check.torproject.org/api/ip
+<span class="output">{"IsTor":true,"IP":"86.54.28.49"}</span>
+
+<span class="prompt">$</span> curl -x socks5h://127.0.0.1:9050 https://example.com
+<span class="output">&lt;!doctype html&gt;...</span>
+
+<span class="comment"># Hidden service:</span>
+<span class="prompt">$</span> curl -x socks5h://127.0.0.1:9050 http://&lt;address&gt;.moor/
+</code></pre>
+    </div>
+
+    <!-- Browser -->
+    <div class="terminal">
+        <div class="terminal-header">
+            <span class="terminal-dot red"></span>
+            <span class="terminal-dot yellow"></span>
+            <span class="terminal-dot green"></span>
+            <span class="terminal-title">Browser setup</span>
+        </div>
+<pre><code><span class="comment"># Firefox:</span>
+<span class="comment">#   Settings &rarr; Network Settings &rarr; Manual proxy</span>
+<span class="comment">#   SOCKS Host: 127.0.0.1    Port: 9050    SOCKS v5</span>
+<span class="comment">#   Check &ldquo;Proxy DNS when using SOCKS v5&rdquo;</span>
+
+<span class="comment"># Chromium / Brave:</span>
+<span class="prompt">$</span> chromium <span class="flag">--proxy-server</span>="socks5://127.0.0.1:9050"
+</code></pre>
+    </div>
+</section>
+
+<!-- Bridges -->
+<section id="bridges">
+    <h2 class="section-title">Bridges</h2>
+    <p class="section-subtitle">Censorship circumvention</p>
+
+    <p class="bridge-intro">
+        In censored environments where connections to known MOOR relays are blocked, bridge relays
+        provide an alternative entry point. Bridges are not listed in the public consensus, making them
+        harder for censors to discover and block. Combined with pluggable transports, bridge connections
+        are indistinguishable from normal HTTPS traffic.
+    </p>
+
+    <div class="bridge-grid">
+        <div class="bridge-card">
+            <h3>1. Run a Bridge Relay</h3>
+            <p>A bridge is a relay not listed in the public consensus. Create a <code>moorrc</code>:</p>
+<pre><code>Mode relay
+BindAddress 0.0.0.0
+ORPort 443
+IsBridge 1
+AdvertiseAddress YOUR_PUBLIC_IP
+DataDirectory /var/lib/moor-bridge
+Verbose 1</code></pre>
+            <p>Run with <code>moor -f moorrc</code>. Use port 443 to blend with HTTPS. On startup, the bridge logs its <strong>bridge line</strong>:</p>
+            <pre>bridge line: shade 203.0.113.5:443 a1b2c3d4e5f6...64_hex_chars</pre>
+            <p>Share this line with clients out-of-band.</p>
+        </div>
+
+        <div class="bridge-card">
+            <h3>2. Connect via Bridge</h3>
+            <p>Add the bridge line to your client <code>moorrc</code>:</p>
+<pre><code>SocksPort 9050
+UseBridges 1
+Bridge shade 203.0.113.5:443 a1b2c3d4e5f6...64_hex_chars</code></pre>
+            <p>The three parts of a bridge line:</p>
+            <ul class="bridge-parts-list">
+                <li><strong>Transport</strong> &mdash; <code>scramble</code>, <code>shade</code>, or <code>mirage</code></li>
+                <li><strong>Address</strong> &mdash; bridge IP and port (e.g. <code>203.0.113.5:443</code>)</li>
+                <li><strong>Fingerprint</strong> &mdash; 64-char hex Ed25519 identity public key</li>
+            </ul>
+            <p>The fingerprint authenticates the bridge &mdash; without it, a MITM could impersonate it.</p>
+        </div>
+
+        <div class="bridge-card">
+            <h3>Pluggable Transports</h3>
+            <p>Pluggable transports disguise MOOR traffic to defeat deep packet inspection:</p>
+            <p><code>shade</code> &mdash; Elligator2-style key obfuscation + AEAD framing. Full DPI resistance.</p>
+            <p><code>mirage</code> &mdash; fake TLS 1.3 handshake with real x25519 DH. Looks like normal HTTPS.</p>
+            <p><code>scramble</code> &mdash; random-byte stream with AEAD framing + probe resistance. Default.</p>
+        </div>
+
+        <div class="bridge-card">
+            <h3>BridgeDB Distribution</h3>
+            <p>BridgeDB distributes bridge lines to users via HTTPS. It rate-limits requests and partitions bridges across distribution strategies to resist enumeration.</p>
+        </div>
+    </div>
+
+</section>
+
+<!-- Configs -->
+<section id="configs">
+    <h2 class="section-title">Ready-Made Configs</h2>
+    <p class="section-subtitle">Download, edit your IP and nickname, run.</p>
+
+    <div class="bridge-grid">
+        <div class="bridge-card">
+            <h3>Middle Relay</h3>
+            <p>Safest. No abuse complaints. Just forwards encrypted data.</p>
+            <a href="configs/middle.conf" class="download-link" style="font-size:0.8rem;padding:0.5rem 1.2rem;margin-top:0.5rem;display:inline-block">Download middle.conf</a>
+        </div>
+        <div class="bridge-card">
+            <h3>Guard Relay</h3>
+            <p>Entry point for client circuits. Sees client IPs, not destinations.</p>
+            <a href="configs/guard.conf" class="download-link" style="font-size:0.8rem;padding:0.5rem 1.2rem;margin-top:0.5rem;display:inline-block">Download guard.conf</a>
+        </div>
+        <div class="bridge-card">
+            <h3>Exit Relay</h3>
+            <p>Most needed. Connects to the internet on behalf of users. Includes default exit policy.</p>
+            <a href="configs/exit.conf" class="download-link" style="font-size:0.8rem;padding:0.5rem 1.2rem;margin-top:0.5rem;display:inline-block">Download exit.conf</a>
+        </div>
+        <div class="bridge-card">
+            <h3>General Relay</h3>
+            <p>Let the network decide your role. You will never become an exit unless you ask.</p>
+            <a href="configs/relay.conf" class="download-link" style="font-size:0.8rem;padding:0.5rem 1.2rem;margin-top:0.5rem;display:inline-block">Download relay.conf</a>
+        </div>
+    </div>
+
+    <div class="bridge-grid" style="margin-top:1.25rem">
+        <div class="bridge-card">
+            <h3>Client</h3>
+            <p>Browse anonymously. SOCKS5 proxy on localhost:9050.</p>
+            <a href="configs/client.conf" class="download-link" style="font-size:0.8rem;padding:0.5rem 1.2rem;margin-top:0.5rem;display:inline-block">Download client.conf</a>
+        </div>
+        <div class="bridge-card">
+            <h3>Hidden Service</h3>
+            <p>Host a .moor service reachable only through the network.</p>
+            <a href="configs/hidden-service.conf" class="download-link" style="font-size:0.8rem;padding:0.5rem 1.2rem;margin-top:0.5rem;display:inline-block">Download hidden-service.conf</a>
+        </div>
+        <div class="bridge-card">
+            <h3>Exit Policies</h3>
+            <p>Default (blocks abuse ports) and Reduced (web-only, fewer complaints).</p>
+            <a href="configs/exit-policy-default.conf" class="download-link" style="font-size:0.8rem;padding:0.5rem 1.2rem;margin-top:0.5rem;display:inline-block">Default Policy</a>
+            <a href="configs/exit-policy-reduced.conf" class="download-link" style="font-size:0.8rem;padding:0.5rem 1.2rem;margin-top:0.5rem;display:inline-block;background:transparent;color:#a87dbd;border:1px solid #a87dbd">Reduced Policy</a>
+        </div>
+    </div>
+</section>
+
+<!-- Download -->
+<section id="download">
+    <h2 class="section-title">Download</h2>
+    <p class="section-subtitle">v0.8.0 &mdash; Post-quantum at every hop. No exceptions.</p>
+
+    <div class="download-box">
+        <div class="version">moor-0.8.0</div>
+        <div class="release-date">March 30, 2026</div>
+        <a href="moor-0.8.0.tar.gz" class="download-link">Download .tar.gz</a>
+        <p class="checksum">
+            SHA-256: <code id="checksum">1dd091a3dd11369a71305cd2a1ccf4b63b666dafa9505a35e6cac0d8fdc51de4</code>
+        </p>
+    </div>
+
+</section>
+
+<!-- Donate -->
+<section id="donate">
+    <h2 class="section-title">Donate</h2>
+    <p class="section-subtitle">Support the project</p>
+
+    <div class="donate-box">
+        <p>
+            MOOR is built by volunteers. No donation is too small.
+            No donation buys influence over the code.
+        </p>
+        <div class="donate-address">
+            <span class="label">Bitcoin (BTC)</span>
+            <code>bc1qpu9c6mjp0ynry6ene3mqg8y65dzm6yarw5vc0m</code>
+        </div>
+        <div class="donate-address">
+            <span class="label">Monero (XMR)</span>
+            <code>49PsQUM6kBtKDD6A8qFgf8cNMNysascRkHYyrfHQEZGLCuGX4VzVQf6StwopoxFWhpJD82w9YPMbA7mgabEKvutcHkb51LN</code>
+        </div>
+    </div>
+</section>
+
+<!-- License -->
+<section id="license">
+    <h2 class="section-title">License</h2>
+    <p class="section-subtitle">BSD 3-Clause License</p>
+
+    <div class="license-text">
+        <p>
+            <span class="highlight">Privacy is not a privilege granted by the powerful.</span>
+            It is a right exercised by the free. This software exists because
+            surveillance is the default state of the internet, and the only
+            antidote is code that runs, ships, and works.
+        </p>
+        <p>
+            <span class="highlight">Cypherpunks write code.</span>
+        </p>
+        <p>
+            Permission is hereby granted, free of charge, to any person, group,
+            collective, organization, or autonomous entity obtaining a copy of
+            this software and associated documentation, to use, copy, modify,
+            merge, publish, distribute, sublicense, and/or sell copies of the
+            Software, subject to inclusion of the copyright notice.
+        </p>
+        <p>
+            You are encouraged to: fork this project and make it better. Run a
+            relay &mdash; even one relay makes the network stronger. Break the code
+            and tell us how. Teach someone how onion routing works. Deploy this
+            in places where the internet is not free.
+        </p>
+        <p class="manifesto">
+            "Privacy is necessary for an open society in the electronic age."
+            <span class="attribution">&mdash; Eric Hughes, A Cypherpunk's Manifesto, 1993</span>
+        </p>
+    </div>
+</section>
+
+<!-- Footer -->
+<footer>
+    <p>MOOR v0.7.0 &mdash; Copyright &copy; 2026 MOOR Contributors &mdash; <a href="#license">The MOOR License</a></p>
+</footer>
+
+</body>
+</html>
