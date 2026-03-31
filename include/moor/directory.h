@@ -27,6 +27,9 @@ typedef struct {
     /* HS PoW DoS protection */
     uint8_t  pow_seed[32];          /* Random seed for PoW challenge */
     uint8_t  pow_difficulty;        /* Required leading zero bits (0 = disabled) */
+    /* PQ hybrid e2e: Kyber768 public key for post-handshake KEM */
+    uint8_t  kem_pk[1184];          /* MOOR_KEM_PK_LEN */
+    int      kem_available;         /* 1 if kem_pk is set */
 } moor_hs_descriptor_t;
 
 /* Opaque HS entry stored at DA (DA cannot decrypt) */

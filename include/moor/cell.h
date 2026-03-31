@@ -52,6 +52,8 @@ typedef enum {
     RELAY_EXTENDED_PQ           = 43,   /* PQ EXTENDED response */
     RELAY_KEM_OFFER             = 44,   /* Client sends Kyber PK */
     RELAY_KEM_ACCEPT            = 45,   /* Relay sends Kyber CT */
+    RELAY_E2E_KEM_CT            = 46,   /* PQ e2e: client sends KEM CT to HS */
+    RELAY_E2E_KEM_ACK           = 47,   /* PQ e2e: HS acks KEM rekey complete */
     RELAY_CONFLUX_LINK          = 50,   /* Link circuit to conflux set */
     RELAY_CONFLUX_LINKED        = 51,   /* Acknowledgment */
     RELAY_CONFLUX_SWITCH        = 52,   /* Switch active leg */

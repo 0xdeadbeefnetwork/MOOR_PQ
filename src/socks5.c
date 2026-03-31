@@ -1,4 +1,5 @@
 #include "moor/moor.h"
+#include "moor/kem.h"
 #include <sodium.h>
 #include <string.h>
 #include <stdlib.h>
@@ -43,6 +44,9 @@ typedef struct {
     moor_connection_t *rp_conn;
     int active;           /* 1 = waiting for RENDEZVOUS2 */
     time_t started;       /* for timeout detection */
+    /* PQ e2e: HS's KEM pk from descriptor (if available) */
+    uint8_t hs_kem_pk[1184];
+    int     hs_kem_available;
 } hs_pending_connect_t;
 
 static hs_pending_connect_t g_hs_pending[MAX_HS_PENDING];
@@ -423,7 +427,56 @@ static void hs_rp_read_cb(int fd, int events, void *arg) {
                     pending->rp_circ->e2e_send_nonce = 0;
                     pending->rp_circ->e2e_recv_nonce = 0;
                     pending->rp_circ->e2e_active = 1;
-                    LOG_INFO("HS: e2e encryption established");
+                    LOG_INFO("HS: e2e encryption established (X25519)");
+
+                    /* PQ upgrade: if HS published KEM pk, encapsulate and
+                     * send CT to upgrade e2e to hybrid X25519+Kyber768.
+                     * Save DH shared for hybrid KDF after HS ACKs. */
+                    if (pending->hs_kem_available) {
+                        memcpy(pending->rp_circ->e2e_dh_shared, shared, 32);
+                        uint8_t kem_ct[1088], kem_ss[32];
+                        moor_kem_encapsulate(kem_ct, kem_ss,
+                                             pending->hs_kem_pk);
+
+                        /* Send KEM CT as RELAY_E2E_KEM_CT cells (3 cells) */
+                        size_t ct_off = 0;
+                        while (ct_off < 1088) {
+                            size_t chunk = 1088 - ct_off;
+                            if (chunk > 498) chunk = 498; /* MOOR_RELAY_DATA */
+                            moor_cell_t kcell;
+                            moor_cell_relay(&kcell,
+                                pending->rp_circ->circuit_id,
+                                RELAY_E2E_KEM_CT, 0,
+                                kem_ct + ct_off, (uint16_t)chunk);
+                            moor_circuit_encrypt_forward(
+                                pending->rp_circ, &kcell);
+                            if (!pending->rp_circ->conn ||
+                                moor_connection_send_cell(
+                                    pending->rp_circ->conn, &kcell) != 0) {
+                                LOG_WARN("HS: failed to send e2e KEM CT");
+                                break;
+                            }
+                            ct_off += chunk;
+                        }
+
+                        /* Immediately rekey with hybrid secret */
+                        uint8_t combined[64];
+                        memcpy(combined, shared, 32);
+                        memcpy(combined + 32, kem_ss, 32);
+                        uint8_t hybrid[32];
+                        moor_crypto_hash(hybrid, combined, 64);
+                        moor_crypto_kdf(pending->rp_circ->e2e_send_key,
+                                        32, hybrid, 0, "moore2e!");
+                        moor_crypto_kdf(pending->rp_circ->e2e_recv_key,
+                                        32, hybrid, 1, "moore2e!");
+                        pending->rp_circ->e2e_send_nonce = 0;
+                        pending->rp_circ->e2e_recv_nonce = 0;
+                        moor_crypto_wipe(kem_ss, 32);
+                        moor_crypto_wipe(combined, 64);
+                        moor_crypto_wipe(hybrid, 32);
+                        LOG_INFO("HS: e2e upgraded to PQ hybrid "
+                                 "(X25519 + Kyber768)");
+                    }
                     moor_crypto_wipe(shared, 32);
                 }
             }
@@ -1403,12 +1456,16 @@ int moor_socks5_handle_request(moor_socks5_client_t *client,
 
             /* Start async HS connect: build circuits + send INTRODUCE1 */
             moor_circuit_t *rp_circ = NULL;
+            uint8_t hs_kem_pk_tmp[1184];
+            int hs_kem_avail = 0;
             if (moor_hs_client_connect_start(client->target_addr, &rp_circ,
                                               &g_client_consensus,
                                               g_socks5_config.da_address,
                                               g_socks5_config.da_port,
                                               g_socks5_config.identity_pk,
-                                              g_socks5_config.identity_sk) != 0) {
+                                              g_socks5_config.identity_sk,
+                                              hs_kem_pk_tmp,
+                                              &hs_kem_avail) != 0) {
                 uint8_t fail[] = { 0x05, 0x04, 0x00, 0x01, 0,0,0,0, 0,0 };
                 send(client->client_fd, (char *)fail, sizeof(fail), MSG_NOSIGNAL);
                 return -1;
@@ -1438,6 +1495,9 @@ int moor_socks5_handle_request(moor_socks5_client_t *client,
             g_hs_pending[slot].rp_circ = rp_circ;
             g_hs_pending[slot].rp_conn = rp_circ->conn;
             g_hs_pending[slot].started = time(NULL);
+            g_hs_pending[slot].hs_kem_available = hs_kem_avail;
+            if (hs_kem_avail)
+                memcpy(g_hs_pending[slot].hs_kem_pk, hs_kem_pk_tmp, 1184);
 
             /* Register RP connection for async RENDEZVOUS2 wait */
             if (!rp_circ->conn) {

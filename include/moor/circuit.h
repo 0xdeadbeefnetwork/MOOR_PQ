@@ -115,6 +115,11 @@ typedef struct moor_circuit {
     uint64_t e2e_recv_nonce;
     int      e2e_active;           /* 1 if e2e keys are set */
     uint8_t  e2e_eph_sk[32];      /* Temp: client eph_sk for DH completion */
+    /* PQ e2e: post-handshake Kyber768 KEM upgrade */
+    uint8_t  e2e_kem_ct[1088];    /* Accumulating KEM ciphertext */
+    uint16_t e2e_kem_ct_len;      /* Bytes received so far */
+    int      e2e_kem_pending;     /* 1 = waiting for KEM CT / ACK */
+    uint8_t  e2e_dh_shared[32];   /* Saved DH shared secret for hybrid KDF */
     /* DoS cell rate limiting (Prop 305) */
     uint64_t dos_cell_tokens;           /* token bucket for cell rate */
     uint64_t dos_cell_last_refill;      /* last refill timestamp (ms) */

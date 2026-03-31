@@ -50,6 +50,10 @@ typedef struct {
     const moor_consensus_t *cached_consensus;
     /* Descriptor revision counter (persisted) */
     uint64_t desc_revision;
+    /* PQ hybrid e2e: Kyber768 keypair for post-handshake KEM */
+    uint8_t  kem_pk[1184];          /* MOOR_KEM_PK_LEN */
+    uint8_t  kem_sk[2400];          /* MOOR_KEM_SK_LEN */
+    int      kem_generated;
 } moor_hs_config_t;
 
 /* Generate or load hidden service keys */
@@ -106,13 +110,17 @@ int moor_hs_client_connect(const char *moor_address,
 
 /* Client-side async: build circuits and send INTRODUCE1, return RP circuit.
  * Does NOT wait for RENDEZVOUS2 -- caller must watch rp_circuit->conn->fd
- * for incoming RENDEZVOUS2 cell. */
+ * for incoming RENDEZVOUS2 cell.
+ * If hs_kem_pk_out is non-NULL and the HS descriptor has a KEM pk,
+ * copies it there and sets *hs_kem_available_out = 1. */
 int moor_hs_client_connect_start(const char *moor_address,
                                   moor_circuit_t **rp_circuit_out,
                                   const moor_consensus_t *consensus,
                                   const char *da_address, uint16_t da_port,
                                   const uint8_t our_pk[32],
-                                  const uint8_t our_sk[64]);
+                                  const uint8_t our_sk[64],
+                                  uint8_t *hs_kem_pk_out,
+                                  int *hs_kem_available_out);
 
 /* Compute .moor address with checksum: base32(pk(32)+checksum(2)+version(1)) + ".moor" */
 int moor_hs_compute_address_v2(char *out, size_t out_len,

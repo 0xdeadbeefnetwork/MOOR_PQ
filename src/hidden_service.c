@@ -1,4 +1,5 @@
 #include "moor/moor.h"
+#include "moor/kem.h"
 #include <sodium.h>
 #include <string.h>
 #include <stdlib.h>
@@ -106,7 +107,10 @@ int moor_hs_keygen(moor_hs_config_t *config) {
                               config->identity_pk, config->identity_sk,
                               config->current_time_period);
 
-    LOG_INFO("generated HS keys");
+    /* Generate Kyber768 keypair for PQ hybrid e2e */
+    moor_kem_keygen(config->kem_pk, config->kem_sk);
+    config->kem_generated = 1;
+    LOG_INFO("generated HS keys (with PQ KEM)");
     return 0;
 }
 
@@ -511,6 +515,12 @@ int moor_hs_publish_descriptor(moor_hs_config_t *config) {
         desc.pow_difficulty = (uint8_t)config->pow_difficulty;
     }
 
+    /* PQ hybrid e2e: publish Kyber768 public key in descriptor */
+    if (config->kem_generated) {
+        memcpy(desc.kem_pk, config->kem_pk, 1184);
+        desc.kem_available = 1;
+    }
+
     /* Fix #182: Sign address_hash + service_pk + BLAKE2b(critical fields).
      * Old signature only covered (address_hash, service_pk), allowing an attacker
      * who can derive desc_key (from public identity_pk + time_period) to decrypt,
@@ -537,8 +547,9 @@ int moor_hs_publish_descriptor(moor_hs_config_t *config) {
     moor_crypto_sign(desc.signature, to_sign, 96, config->identity_sk);
     desc.published = (uint64_t)time(NULL);
 
-    /* Serialize the plaintext descriptor (before client-auth encryption) */
-    uint8_t plaintext[1024];
+    /* Serialize the plaintext descriptor (before client-auth encryption).
+     * Buffer must fit KEM pk (1184 bytes) + other fields. */
+    uint8_t plaintext[2560];
     int pt_len = moor_hs_descriptor_serialize(plaintext, sizeof(plaintext), &desc);
     if (pt_len < 0) {
         sodium_memzero(&desc, sizeof(desc));
@@ -943,7 +954,16 @@ int moor_hs_rendezvous(moor_hs_config_t *config,
     rp_circ->e2e_send_nonce = 0;
     rp_circ->e2e_recv_nonce = 0;
     rp_circ->e2e_active = 1;
-    LOG_INFO("HS: e2e keys derived for RP circuit");
+
+    /* Save DH shared for PQ hybrid rekey when client sends KEM CT */
+    if (config->kem_generated) {
+        memcpy(rp_circ->e2e_dh_shared, shared, 32);
+        rp_circ->e2e_kem_pending = 1;
+        rp_circ->e2e_kem_ct_len = 0;
+        LOG_INFO("HS: e2e keys derived, awaiting PQ KEM upgrade");
+    } else {
+        LOG_INFO("HS: e2e keys derived for RP circuit (classical only)");
+    }
     moor_crypto_wipe(shared, 32);
     moor_crypto_wipe(eph_sk, 32);
     return 0;
@@ -954,7 +974,10 @@ int moor_hs_client_connect_start(const char *moor_address,
                                   const moor_consensus_t *consensus,
                                   const char *da_address, uint16_t da_port,
                                   const uint8_t our_pk[32],
-                                  const uint8_t our_sk[64]) {
+                                  const uint8_t our_sk[64],
+                                  uint8_t *hs_kem_pk_out,
+                                  int *hs_kem_available_out) {
+    if (hs_kem_available_out) *hs_kem_available_out = 0;
     LOG_DEBUG("connecting to hidden service");
 
     /* Decode .moor address to extract full service identity_pk.
@@ -1225,6 +1248,12 @@ verify_descriptor:
     }
     rp_circ->cc_path_type = MOOR_CC_PATH_ONION; /* HS path (6 hops end-to-end) */
 
+    /* Output HS KEM pk for PQ e2e upgrade after RENDEZVOUS2 */
+    if (hs_kem_pk_out && hs_kem_available_out && hs_desc.kem_available) {
+        memcpy(hs_kem_pk_out, hs_desc.kem_pk, 1184);
+        *hs_kem_available_out = 1;
+    }
+
     /* Send RELAY_ESTABLISH_RENDEZVOUS with random cookie */
     uint8_t cookie[MOOR_RENDEZVOUS_COOKIE_LEN];
     moor_crypto_random(cookie, sizeof(cookie));
@@ -1431,7 +1460,7 @@ int moor_hs_client_connect(const char *moor_address,
     moor_circuit_t *rp_circ = NULL;
     if (moor_hs_client_connect_start(moor_address, &rp_circ,
                                       consensus, da_address, da_port,
-                                      our_pk, our_sk) != 0)
+                                      our_pk, our_sk, NULL, NULL) != 0)
         return -1;
 
     /* Wait for RENDEZVOUS2 on the RP circuit (up to 60 seconds) */

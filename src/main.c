@@ -1,4 +1,5 @@
 #include "moor/moor.h"
+#include "moor/kem.h"
 #include "moor/transport.h"
 #include "moor/transport_shade.h"
 #include "moor/transport_mirage.h"
@@ -1622,6 +1623,52 @@ static void hs_rp_read_cb(int fd, int events, void *arg) {
         case RELAY_SENDME:
             /* Acknowledge (no-op for now) */
             break;
+
+        case RELAY_E2E_KEM_CT: {
+            /* PQ hybrid e2e: accumulate Kyber768 ciphertext from client */
+            if (!circ->e2e_kem_pending) {
+                LOG_DEBUG("HS: RELAY_E2E_KEM_CT but not pending, ignoring");
+                break;
+            }
+            size_t space = 1088 - circ->e2e_kem_ct_len;
+            size_t chunk = relay.data_length;
+            if (chunk > space) chunk = space;
+            if (chunk > 0) {
+                memcpy(circ->e2e_kem_ct + circ->e2e_kem_ct_len,
+                       relay.data, chunk);
+                circ->e2e_kem_ct_len += (uint16_t)chunk;
+            }
+            if (circ->e2e_kem_ct_len >= 1088) {
+                /* Full KEM CT received -- decapsulate and rekey */
+                uint8_t kem_ss[32];
+                if (moor_kem_decapsulate(kem_ss, circ->e2e_kem_ct,
+                                          ctx->config->kem_sk) != 0) {
+                    LOG_ERROR("HS: e2e KEM decapsulation failed");
+                    circ->e2e_kem_pending = 0;
+                    break;
+                }
+                /* Hybrid KDF: BLAKE2b(dh_shared || kem_ss) */
+                uint8_t combined[64];
+                memcpy(combined, circ->e2e_dh_shared, 32);
+                memcpy(combined + 32, kem_ss, 32);
+                uint8_t hybrid[32];
+                moor_crypto_hash(hybrid, combined, 64);
+                /* HS: send=subkey 1, recv=subkey 0 (opposite of client) */
+                moor_crypto_kdf(circ->e2e_send_key, 32,
+                                hybrid, 1, "moore2e!");
+                moor_crypto_kdf(circ->e2e_recv_key, 32,
+                                hybrid, 0, "moore2e!");
+                circ->e2e_send_nonce = 0;
+                circ->e2e_recv_nonce = 0;
+                circ->e2e_kem_pending = 0;
+                moor_crypto_wipe(kem_ss, 32);
+                moor_crypto_wipe(combined, 64);
+                moor_crypto_wipe(hybrid, 32);
+                moor_crypto_wipe(circ->e2e_dh_shared, 32);
+                LOG_INFO("HS: e2e upgraded to PQ hybrid (X25519 + Kyber768)");
+            }
+            break;
+        }
 
         default:
             LOG_DEBUG("HS RP: unhandled relay cmd %d", relay.relay_command);

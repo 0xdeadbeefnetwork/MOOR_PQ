@@ -2638,7 +2638,8 @@ int moor_hs_descriptor_serialize(uint8_t *out, size_t out_len,
                                  const moor_hs_descriptor_t *desc) {
     size_t needed = 32 + 32 + 32 + 32 + 4 + desc->num_intro_points * 98 + 64 + 8
                    + 1 /* auth_type */
-                   + 32 + 1 /* pow_seed + pow_difficulty */;
+                   + 32 + 1 /* pow_seed + pow_difficulty */
+                   + 1 + (desc->kem_available ? 1184 : 0) /* PQ KEM pk */;
     if (desc->auth_type == 1 && desc->num_auth_entries > 0)
         needed += 1 + (size_t)desc->num_auth_entries * 80;
     if (out_len < needed) return -1;
@@ -2684,6 +2685,13 @@ int moor_hs_descriptor_serialize(uint8_t *out, size_t out_len,
     /* PoW section: pow_seed(32) + pow_difficulty(1) */
     memcpy(out + off, desc->pow_seed, 32); off += 32;
     out[off++] = desc->pow_difficulty;
+
+    /* PQ e2e KEM public key: flag(1) + [kem_pk(1184)] */
+    out[off++] = (uint8_t)desc->kem_available;
+    if (desc->kem_available) {
+        memcpy(out + off, desc->kem_pk, 1184);
+        off += 1184;
+    }
 
     return (int)off;
 }
@@ -2752,6 +2760,17 @@ int moor_hs_descriptor_deserialize(moor_hs_descriptor_t *desc,
     if (off + 33 <= data_len) {
         memcpy(desc->pow_seed, data + off, 32); off += 32;
         desc->pow_difficulty = data[off++];
+    }
+
+    /* PQ e2e KEM public key (optional): flag(1) + [kem_pk(1184)] */
+    if (off < data_len) {
+        desc->kem_available = data[off++];
+        if (desc->kem_available && off + 1184 <= data_len) {
+            memcpy(desc->kem_pk, data + off, 1184);
+            off += 1184;
+        } else if (desc->kem_available) {
+            desc->kem_available = 0; /* truncated */
+        }
     }
 
     return (int)off;
