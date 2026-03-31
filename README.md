@@ -82,7 +82,7 @@ See [docs/configuration.md](docs/configuration.md) for all options.
 
 | Layer | Algorithm | What it protects |
 |-------|-----------|-----------------|
-| Link handshake | Noise_IK (X25519 + ChaCha20-Poly1305 + BLAKE2b) + Kyber768 | Connection between you and the first relay |
+| Link handshake | Noise_IK (X25519 + ChaCha20 + BLAKE2b) + Kyber768 | Connection between you and the first relay |
 | Circuit key exchange | X25519 + Kyber768 hybrid | Each hop of the 3-hop path |
 | Onion encryption | ChaCha20 stream cipher (keys derived from PQ hybrid exchange) | Data in transit through the circuit |
 | Consensus signatures | Ed25519 + ML-DSA-65 (Dilithium3) | Integrity of the relay directory |
