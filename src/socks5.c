@@ -111,6 +111,8 @@ static int g_prebuilt_pool_count = 0;
 static int g_inflight_builds = 0;
 static int g_prebuilt_timer_id = -1;
 
+static prebuilt_entry_t *prebuilt_pop(void); /* forward decl */
+
 /* No locking needed -- everything is single-threaded now */
 int moor_socks5_update_consensus(const moor_consensus_t *fresh) {
     return moor_consensus_copy(&g_client_consensus, fresh);
@@ -139,21 +141,21 @@ static void assign_circuits_to_waiting_clients(void) {
 
         if (existing_entry) {
             client->circuit = existing_entry->circuit;
-        } else if (g_prebuilt_pool_count > 0 &&
-                   g_circuit_cache_count < MAX_CIRCUIT_CACHE) {
-            prebuilt_entry_t pb = g_prebuilt_pool[--g_prebuilt_pool_count];
+        } else if (g_circuit_cache_count < MAX_CIRCUIT_CACHE) {
+            prebuilt_entry_t *pb = prebuilt_pop();
+            if (!pb) continue;
             int idx = g_circuit_cache_count;
             circuit_cache_entry_t *ce = &g_circuit_cache[idx];
             memset(ce, 0, sizeof(*ce));
             snprintf(ce->domain, sizeof(ce->domain), "%s", domain);
             snprintf(ce->isolation_key, sizeof(ce->isolation_key),
                      "%s", client->isolation_key);
-            ce->circuit = pb.circuit;
-            ce->conn = pb.conn;
+            ce->circuit = pb->circuit;
+            ce->conn = pb->circuit->conn;
             g_circuit_cache_count++;
-            client->circuit = pb.circuit;
+            client->circuit = pb->circuit;
             LOG_INFO("assigned prebuilt circuit %u to domain %s",
-                     pb.circuit->circuit_id, domain);
+                     pb->circuit->circuit_id, domain);
         } else {
             continue;
         }
@@ -237,10 +239,25 @@ static void prebuilt_timer_cb(void *arg) {
     g_inflight_builds++;
 }
 
-/* Pop a prebuilt circuit from the pool for immediate use */
+/* Pop a prebuilt circuit from the pool for immediate use.
+ * Skips dead entries: if the guard connection died (nullified by
+ * moor_circuit_nullify_conn) or the circuit was freed, discard and
+ * try the next one.  Callers MUST use pb->circuit->conn (authoritative)
+ * instead of pb->conn (may be stale after connection death). */
 static prebuilt_entry_t *prebuilt_pop(void) {
-    if (g_prebuilt_pool_count <= 0) return NULL;
-    return &g_prebuilt_pool[--g_prebuilt_pool_count];
+    while (g_prebuilt_pool_count > 0) {
+        prebuilt_entry_t *e = &g_prebuilt_pool[--g_prebuilt_pool_count];
+        if (e->circuit && e->circuit->circuit_id != 0 &&
+            e->circuit->conn && e->circuit->conn->state == CONN_STATE_OPEN) {
+            e->conn = e->circuit->conn; /* refresh stale pointer */
+            return e;
+        }
+        /* Dead circuit -- destroy if not already freed */
+        if (e->circuit && e->circuit->circuit_id != 0)
+            moor_circuit_destroy(e->circuit);
+        LOG_DEBUG("prebuilt pool: discarded dead circuit");
+    }
+    return NULL;
 }
 
 /* Complete a pending HS connect after RENDEZVOUS2 received */
@@ -549,7 +566,7 @@ static circuit_cache_entry_t *get_circuit_for_domain(const char *domain,
         snprintf(entry->isolation_key, sizeof(entry->isolation_key),
                  "%s", iso_key);
         entry->circuit = pb->circuit;
-        entry->conn = pb->conn;
+        entry->conn = pb->circuit->conn;
         g_circuit_cache_count++;
         LOG_INFO("assigned prebuilt circuit %u for %s (instant)",
                  entry->circuit->circuit_id, domain);
@@ -1440,7 +1457,8 @@ int moor_socks5_handle_request(moor_socks5_client_t *client,
         const char *domain = extract_domain(client->target_addr);
         circuit_cache_entry_t *entry = get_circuit_for_domain(
             domain, client->isolation_key);
-        if (!entry) {
+        if (!entry || !entry->conn || entry->conn->fd < 0 ||
+            entry->conn->state != CONN_STATE_OPEN) {
             uint8_t fail[] = { 0x05, 0x04, 0x00, 0x01, 0,0,0,0, 0,0 };
             send(client->client_fd, (char *)fail, sizeof(fail), MSG_NOSIGNAL);
             return -1;
