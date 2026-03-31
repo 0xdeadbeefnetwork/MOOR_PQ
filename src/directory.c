@@ -4,6 +4,25 @@
 #include "exit_notice.h"
 #include <sodium.h>
 #include <string.h>
+
+/* Trusted DA public keys for consensus signature verification. */
+static uint8_t g_trusted_da_pks[16 * 32];
+static int g_num_trusted_da_pks = 0;
+
+void moor_set_trusted_da_keys(const moor_da_entry_t *da_list, int num_das) {
+    g_num_trusted_da_pks = 0;
+    for (int i = 0; i < num_das && i < 16; i++) {
+        int has_pk = 0;
+        for (int j = 0; j < 32; j++) {
+            if (da_list[i].identity_pk[j] != 0) { has_pk = 1; break; }
+        }
+        if (has_pk) {
+            memcpy(g_trusted_da_pks + g_num_trusted_da_pks * 32,
+                   da_list[i].identity_pk, 32);
+            g_num_trusted_da_pks++;
+        }
+    }
+}
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
@@ -1424,6 +1443,27 @@ static void da_serve_metrics_json(int fd, moor_da_config_t *config) {
  *   "HS_PROPAGATE\n" + length(4) + hs_data      → flooded HS descriptor from peer DA
  *   "GET /"                                      → HTTP metrics dashboard
  */
+/* Check if a client fd comes from a known DA peer (by IP) */
+static int da_is_peer(int client_fd, const moor_da_config_t *config) {
+    struct sockaddr_storage addr;
+    socklen_t addrlen = sizeof(addr);
+    if (getpeername(client_fd, (struct sockaddr *)&addr, &addrlen) != 0)
+        return 0;
+    char client_ip[64] = "";
+    if (addr.ss_family == AF_INET) {
+        struct sockaddr_in *s = (struct sockaddr_in *)&addr;
+        inet_ntop(AF_INET, &s->sin_addr, client_ip, sizeof(client_ip));
+    } else if (addr.ss_family == AF_INET6) {
+        struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)&addr;
+        inet_ntop(AF_INET6, &s6->sin6_addr, client_ip, sizeof(client_ip));
+    }
+    for (int i = 0; i < config->num_peers; i++) {
+        if (strcmp(config->peers[i].address, client_ip) == 0)
+            return 1;
+    }
+    return 0;
+}
+
 int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
     char cmd_buf[64];
     memset(cmd_buf, 0, sizeof(cmd_buf));
@@ -1960,6 +2000,12 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
         send(client_fd, "OK\n", 3, MSG_NOSIGNAL);
     }
     else if (strncmp(cmd_buf, "PROPAGATE\n", 10) == 0) {
+        /* Reject from non-peer: only trusted DAs may propagate */
+        if (!da_is_peer(client_fd, config)) {
+            LOG_WARN("PROPAGATE from non-peer, rejecting");
+            send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
+            return -1;
+        }
         /*
          * Flooded relay descriptor from a peer DA (no PoW data).
          * Validate signature only, add if new, do NOT re-propagate.
@@ -2002,6 +2048,12 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
         free(desc_buf);
     }
     else if (strncmp(cmd_buf, "HS_PROPAGATE\n", 13) == 0) {
+        /* Reject from non-peer: only trusted DAs may propagate */
+        if (!da_is_peer(client_fd, config)) {
+            LOG_WARN("HS_PROPAGATE from non-peer, rejecting");
+            send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
+            return -1;
+        }
         /*
          * Flooded HS descriptor from peer DA.
          * Store if new, do NOT re-propagate.
@@ -2480,30 +2532,49 @@ int moor_client_fetch_consensus(moor_consensus_t *cons,
                      (unsigned long long)(uint64_t)time(NULL));
             return -1;
         }
-        /* Verify DA signatures using the keys embedded in the consensus.
-         * Require at least 2 DA signatures that verify correctly.
-         * This prevents a MITM from serving a forged consensus. */
-        if (cons->num_da_sigs >= 2) {
-            uint8_t da_pks[32 * 16];
-            int n_da = 0;
-            for (uint32_t i = 0; i < cons->num_da_sigs && n_da < 16; i++) {
-                memcpy(da_pks + n_da * 32, cons->da_sigs[i].identity_pk, 32);
-                n_da++;
-            }
-            if (moor_consensus_verify(cons, da_pks, n_da) != 0) {
-                LOG_ERROR("consensus signature verification FAILED");
+        /* Verify DA signatures against pre-configured trusted DA keys.
+         * If trusted keys are available (set via moor_set_trusted_da_keys),
+         * require majority verification.  Without trusted keys, fall back
+         * to verifying the consensus's own signatures are internally
+         * consistent (weaker but better than nothing). */
+        if (g_num_trusted_da_pks >= 2) {
+            if (moor_consensus_verify(cons, g_trusted_da_pks,
+                                       g_num_trusted_da_pks) != 0) {
+                LOG_ERROR("consensus: signature verification FAILED "
+                          "(trusted DA keys)");
                 return -1;
             }
-        } else if (cons->num_da_sigs == 1) {
-            /* Single-DA network: verify the one signature */
+        } else if (g_num_trusted_da_pks == 1) {
             uint8_t body_hash[32];
             if (consensus_body_hash(body_hash, cons) == 0 &&
                 moor_crypto_sign_verify(cons->da_sigs[0].signature,
                                          body_hash, 32,
-                                         cons->da_sigs[0].identity_pk) != 0) {
-                LOG_ERROR("consensus single-DA signature verification FAILED");
+                                         g_trusted_da_pks) != 0) {
+                LOG_ERROR("consensus: single-DA signature FAILED");
                 return -1;
             }
+        } else {
+            /* No trusted keys configured -- verify internal consistency
+             * (all signatures in the consensus verify against their own
+             * claimed keys).  This is circular trust but catches corruption. */
+            if (cons->num_da_sigs >= 1) {
+                uint8_t body_hash[32];
+                if (consensus_body_hash(body_hash, cons) == 0) {
+                    int valid = 0;
+                    for (uint32_t i = 0; i < cons->num_da_sigs; i++) {
+                        if (moor_crypto_sign_verify(
+                                cons->da_sigs[i].signature, body_hash, 32,
+                                cons->da_sigs[i].identity_pk) == 0)
+                            valid++;
+                    }
+                    if (valid == 0) {
+                        LOG_ERROR("consensus: no valid signatures");
+                        return -1;
+                    }
+                }
+            }
+            LOG_WARN("consensus: no trusted DA keys configured, "
+                     "verification is weak");
         }
         LOG_INFO("fetched consensus: %u relays (%u DA sigs verified)",
                  cons->num_relays, cons->num_da_sigs);
@@ -2902,7 +2973,11 @@ int moor_consensus_is_fresh(const moor_consensus_t *cons) {
     /* Allow 5s clock skew between DA and relay (#184) */
     uint64_t skew = 5;
     uint64_t lower = (cons->valid_after > skew) ? cons->valid_after - skew : 0;
-    return (now >= lower && now < cons->valid_until) ? 1 : 0;
+    /* Use fresh_until (1 consensus interval, ~1h) instead of valid_until
+     * (3 intervals, ~3h) to tighten the replay window.  Fall back to
+     * valid_until if fresh_until is not set (old consensus format). */
+    uint64_t upper = cons->fresh_until > 0 ? cons->fresh_until : cons->valid_until;
+    return (now >= lower && now < upper) ? 1 : 0;
 }
 
 /* --- DA Signing Key Cert Operations (Phase 8) --- */

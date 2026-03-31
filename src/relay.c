@@ -132,6 +132,13 @@ typedef struct {
     moor_connection_t *next_conn;  /* allocated by worker, transferred to main */
 } extend_work_t;
 
+/* Wipe secret key material before returning heap to allocator */
+static void extend_work_free(extend_work_t *w) {
+    if (!w) return;
+    moor_crypto_wipe(w->relay_identity_sk, 64);
+    free(w);
+}
+
 #define EXTEND_QUEUE_SIZE 32
 #define EXTEND_MAX_THREADS 16  /* cap concurrent blocking EXTEND workers */
 static extend_work_t *g_extend_results[EXTEND_QUEUE_SIZE];
@@ -149,7 +156,7 @@ static void extend_push_result(extend_work_t *w) {
     } else {
         /* Queue full — drop (shouldn't happen with 32 slots) */
         if (w->next_conn) moor_connection_close(w->next_conn);
-        free(w);
+        extend_work_free(w);
         w = NULL;
     }
     pthread_mutex_unlock(&g_extend_mutex);
@@ -268,7 +275,7 @@ static void extend_complete_cb(int fd, int events, void *arg) {
         if (!circ || !circ->extend_pending) {
             /* Circuit gone — clean up next_conn */
             if (w->next_conn) moor_connection_close(w->next_conn);
-            free(w);
+            extend_work_free(w);
             continue;
         }
         circ->extend_pending = 0;
@@ -277,7 +284,7 @@ static void extend_complete_cb(int fd, int events, void *arg) {
         if (!circ->prev_conn || circ->prev_conn->state != CONN_STATE_OPEN) {
             LOG_WARN("EXTEND: prev_conn gone for circuit %u, aborting", circ->circuit_id);
             if (w->next_conn) moor_connection_close(w->next_conn);
-            free(w);
+            extend_work_free(w);
             continue;
         }
 
@@ -292,7 +299,7 @@ static void extend_complete_cb(int fd, int events, void *arg) {
                 LOG_WARN("EXTEND: failed to send DESTROY for circuit %u", circ->circuit_id);
             LOG_DEBUG("EXTEND: async worker failed for circuit %u (reason=%u)",
                       circ->circuit_id, w->destroy_reason);
-            free(w);
+            extend_work_free(w);
             continue;
         }
 
@@ -319,7 +326,7 @@ static void extend_complete_cb(int fd, int events, void *arg) {
 
         LOG_INFO("EXTEND: circuit %u extended to %s:%u (async CKE)",
                  circ->circuit_id, w->next_addr, w->next_port);
-        free(w);
+        extend_work_free(w);
     }
 }
 
@@ -1897,7 +1904,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                 if (g_extend_threads >= EXTEND_MAX_THREADS) {
                     LOG_WARN("EXTEND: thread limit (%d), rejecting", g_extend_threads);
                     circ->extend_pending = 0;
-                    free(w);
+                    extend_work_free(w);
                     return -1;
                 }
                 __sync_fetch_and_add(&g_extend_threads, 1);
@@ -1910,7 +1917,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                     pthread_attr_destroy(&attr);
                     __sync_fetch_and_sub(&g_extend_threads, 1);
                     circ->extend_pending = 0;
-                    free(w);
+                    extend_work_free(w);
                     return -1;
                 }
                 pthread_attr_destroy(&attr);
@@ -2062,7 +2069,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                 if (g_extend_threads >= EXTEND_MAX_THREADS) {
                     LOG_WARN("EXTEND2: thread limit (%d), rejecting", g_extend_threads);
                     circ->extend_pending = 0;
-                    free(w);
+                    extend_work_free(w);
                     return -1;
                 }
                 __sync_fetch_and_add(&g_extend_threads, 1);
@@ -2075,7 +2082,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                     pthread_attr_destroy(&attr);
                     __sync_fetch_and_sub(&g_extend_threads, 1);
                     circ->extend_pending = 0;
-                    free(w);
+                    extend_work_free(w);
                     return -1;
                 }
                 pthread_attr_destroy(&attr);

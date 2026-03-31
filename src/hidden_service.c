@@ -35,10 +35,11 @@ static FILE *secure_fopen(const char *path, const char *mode) {
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <poll.h>
-/* Unix: open with 0600 permissions for secret key files */
+/* Unix: open with 0600 permissions for secret key files.
+ * O_NOFOLLOW prevents symlink attacks in data directories. */
 static FILE *secure_fopen(const char *path, const char *mode) {
     (void)mode;
-    int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC | O_NOFOLLOW, 0600);
     if (fd < 0) return NULL;
     return fdopen(fd, "wb");
 }

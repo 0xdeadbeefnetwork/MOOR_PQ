@@ -39,7 +39,7 @@ static FILE *secure_fopen_crypto(const char *path, const char *mode) {
 #include <fcntl.h>
 static FILE *secure_fopen_crypto(const char *path, const char *mode) {
     (void)mode;
-    int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC | O_NOFOLLOW, 0600);
     if (fd < 0) return NULL;
     return fdopen(fd, "wb");
 }

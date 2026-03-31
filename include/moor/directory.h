@@ -154,9 +154,12 @@ int moor_da_store_hs(moor_da_config_t *config,
 const moor_hs_stored_entry_t *moor_da_lookup_hs(
     const moor_da_config_t *config, const uint8_t address_hash[32]);
 
+/* Set trusted DA public keys for consensus signature verification.
+ * Call once before fetching consensus. Keys come from config. */
+void moor_set_trusted_da_keys(const moor_da_entry_t *da_list, int num_das);
+
 /* Client-side: fetch consensus from DA.
- * If trusted_da_pks is non-NULL, verifies that a majority of the
- * trusted DAs signed the consensus. */
+ * Verifies signatures against trusted DA keys set above. */
 int moor_client_fetch_consensus(moor_consensus_t *cons,
                                 const char *da_address, uint16_t da_port);
 

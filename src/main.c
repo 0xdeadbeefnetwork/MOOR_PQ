@@ -156,6 +156,8 @@ static void apply_config_to_globals(const moor_config_t *cfg) {
     g_num_das = cfg->num_das;
     for (int i = 0; i < cfg->num_das && i < 9; i++)
         g_da_list[i] = cfg->da_list[i];
+    /* Set trusted DA keys for consensus signature verification */
+    moor_set_trusted_da_keys(g_da_list, g_num_das);
     snprintf(g_data_dir, sizeof(g_data_dir), "%s", cfg->data_dir);
     snprintf(g_da_peers, sizeof(g_da_peers), "%s", cfg->da_peers);
     g_bandwidth = cfg->bandwidth;
