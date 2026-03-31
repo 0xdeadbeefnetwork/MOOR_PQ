@@ -4,7 +4,7 @@
 
 MOOR is a single C binary that operates in one of seven modes: **client**, **relay**, **directory authority (DA)**, **hidden service (HS)**, **OnionBalance (OB)**, **BridgeDB**, or **bridge authority**. All modes share the same crypto, cell, connection, and event loop infrastructure. The binary is portable across Linux (with epoll) and Windows (with select/WSAPoll).
 
-Version: 0.7.0
+Version: 0.8.0
 
 ## Source layout
 
@@ -25,7 +25,7 @@ src/
                       CREATE/EXTEND (CKE: X25519 DH), CREATE_PQ/EXTEND_PQ (+ Kyber768 KEM),
                       path selection (bandwidth-weighted, GeoIP-diverse, guard pinning),
                       vanguards (L2/L3), congestion control (Vegas/Prop 324), CBT,
-                      path bias detection, OOM killer, async builder thread
+                      path bias detection, OOM killer, non-blocking async builder (event-driven state machine)
   relay.c             Relay cell processing, CREATE/EXTEND handlers, exit connections,
                       exit policy enforcement, SSRF protection (private addr rejection),
                       async EXTEND (worker thread), relay registration, DNS cache integration
@@ -113,7 +113,7 @@ This section walks through what happens when you open a web browser, point it at
 
 ### Step 0: Starting up
 
-When you launch `moor` with no arguments, it starts in client mode and listens for SOCKS5 connections on port 9050 (same as Tor). It also spawns a background builder thread that pre-builds circuits so they are ready when you need them.
+When you launch `moor` with no arguments, it starts in client mode and listens for SOCKS5 connections on port 9050 (same as Tor). It also spawns a timer-driven async builder that pre-builds circuits so they are ready when you need them.
 
 During startup, the client:
 
@@ -171,8 +171,9 @@ With the encrypted link to the guard established, the client builds a circuit th
 - **Exit**: A relay with the Exit flag whose exit policy allows the destination port.
 
 **Hop 1 (to guard):** The client sends a `CREATE_PQ` cell containing its X25519 ephemeral public key and the relay's identity key. The guard performs an X25519 DH, derives circuit keys via HKDF, and replies with `CREATED_PQ`. Then a Kyber768 KEM exchange follows (RELAY_KEM_OFFER + RELAY_KEM_ACCEPT), and the KEM shared secret is mixed into the circuit keys. The client now has forward/backward ChaCha20 stream cipher keys for hop 1.
+| CELL_KEM_CT    |   8 | KEM ciphertext fragment (PQ hybrid handshake) |
 
-**Hop 2 (to middle):** The client wraps an `EXTEND` command in a relay cell, encrypts it with hop 1's key, and sends it. The guard decrypts one layer, sees the EXTEND, and opens a new TCP connection to the middle relay (with its own Noise_IK + Kyber768 link handshake). The guard forwards the CREATE to the middle, receives CREATED, and sends RELAY_EXTENDED back to the client. The client now has circuit keys for hop 2. The guard cannot read hop 2's encrypted content.
+**Hop 2 (to middle):** The client wraps an `EXTEND` command in a relay cell, encrypts it with hop 1's key, and sends it. The guard decrypts one layer, sees the EXTEND, and opens a TCP connection to the middle relay (reuses existing connection if available) (with its own Noise_IK + Kyber768 link handshake). The guard forwards the CREATE to the middle, receives CREATED, and sends RELAY_EXTENDED back to the client. The client now has circuit keys for hop 2. The guard cannot read hop 2's encrypted content.
 
 **Hop 3 (to exit):** Same as hop 2, but the EXTEND goes through both the guard and middle to reach the exit relay. The client now holds three sets of symmetric keys, one per hop.
 
@@ -249,6 +250,7 @@ Relay payload (inside the 509-byte payload):
 | NETINFO | 5 | Network information exchange |
 | CREATE_PQ | 6 | Create circuit hop (X25519 + Kyber768 hybrid) |
 | CREATED_PQ | 7 | PQ circuit hop created |
+| CELL_KEM_CT    |   8 | KEM ciphertext fragment (PQ hybrid handshake) |
 | RELAY_EARLY | 9 | Relay cell allowed to carry EXTEND (max 8 per circuit) |
 
 **Digest verification:** Each relay cell carries a 4-byte truncated BLAKE2b digest computed over a running hash of all cells on that circuit. The receiver checks `BLAKE2b(running_state || payload_with_zeroed_digest)` against the digest field. If the `recognized` field is zero and the digest matches, the cell is for this hop. Otherwise it is forwarded to the next hop.

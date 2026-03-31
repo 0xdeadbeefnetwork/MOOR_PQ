@@ -1,6 +1,6 @@
 # MOOR
 
-Post-quantum anonymous overlay network. Version 0.7.0.
+Post-quantum anonymous overlay network. Version 0.8.0.
 
 ## What is this?
 

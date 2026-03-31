@@ -44,7 +44,7 @@ A quantum computer that breaks X25519 cannot decrypt any MOOR traffic without al
 - **Traffic analysis**: Padding machines exist but a global adversary can still correlate timing. This is a fundamental limitation shared with Tor.
 - **2-DA network**: Only 2 directory authorities. A compromised majority (both) could forge consensus. Production needs 5-9 DAs.
 - **Flag voting**: Each DA independently computes relay flags from statistical medians rather than majority voting across DAs.
-- **Side channels**: libsodium primitives are constant-time, but surrounding C code has not been audited for timing leaks.
+- **Side channels**: libsodium primitives are constant-time, but surrounding C code reviewed for memory safety (March 2026 audit) but not formally audited for timing leaks.
 - **Forward secrecy**: Circuit keys are not rotated during a circuit's lifetime. Circuits rotate every 10 minutes.
 
 ## Responsible disclosure

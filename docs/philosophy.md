@@ -30,7 +30,7 @@ MOOR is not a VPN. A VPN is a pipe to a single server operated by a company that
 
 MOOR is not a magic cloak of invisibility. It is a tool. Used correctly, it provides strong network-layer anonymity. Used carelessly, it provides a false sense of security that is worse than no anonymity at all.
 
-MOOR is not finished. The network is small. The code has not been audited. The protocol will evolve. What it is today is a foundation: the cryptographic primitives are right, the architecture is proven, and the post-quantum protection is real.
+MOOR is not finished. The network is small. The code has undergone internal security review but not a formal third-party audit. The protocol will evolve. What it is today is a foundation: the cryptographic primitives are right, the architecture is proven, and the post-quantum protection is real.
 
 ## On naming
 

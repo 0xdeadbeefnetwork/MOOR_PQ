@@ -48,7 +48,7 @@ done
 [ -z "$BINDIR" ] && BINDIR="$PREFIX/bin"
 [ -z "$SYSCONFDIR" ] && SYSCONFDIR="$PREFIX/etc"
 
-echo "Configuring MOOR v0.7.0..."
+echo "Configuring MOOR v0.8.0..."
 echo ""
 echo "  prefix:      $PREFIX"
 echo "  bindir:      $BINDIR"

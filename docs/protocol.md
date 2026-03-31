@@ -21,6 +21,7 @@ payload     (509 bytes)
 | DESTROY | 4 | Both | Tear down circuit |
 | CREATE_PQ | 6 | Client->Relay | PQ hybrid circuit handshake |
 | CREATED_PQ | 7 | Relay->Client | PQ hybrid handshake response |
+| CELL_KEM_CT    |   8 | KEM ciphertext fragment (PQ hybrid handshake) |
 
 ### Relay commands (inside RELAY cells)
 
@@ -42,7 +43,6 @@ data           (up to 498 bytes)
 | RELAY_SENDME | 5 | Flow control acknowledgment |
 | RELAY_EXTEND | 6 | Extend circuit to next hop (classical) |
 | RELAY_EXTENDED | 7 | Extension successful |
-| RELAY_BEGIN_DIR | 13 | Open directory stream |
 | RELAY_EXTEND_PQ | 42 | PQ hybrid extend |
 | RELAY_EXTENDED_PQ | 43 | PQ hybrid extend response |
 | RELAY_KEM_OFFER | 44 | Kyber768 ciphertext (chunked) |
@@ -110,7 +110,7 @@ Client -> Guard (RELAY_EXTEND_PQ, encrypted through circuit):
 Client -> Guard (RELAY_KEM_OFFER cells, chunked):
   kem_ct (1088 bytes, split across 3 relay cells)
 
-Guard connects to middle, sends CREATE_PQ + raw kem_ct
+Guard connects to middle, sends CREATE_PQ + CELL_KEM_CT cells
 Middle responds CREATED_PQ
 
 Guard -> Client (RELAY_EXTENDED_PQ):
