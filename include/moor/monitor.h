@@ -10,6 +10,28 @@
 #define MOOR_CTRL_MAX_CLIENTS    8
 #define MOOR_CTRL_COOKIE_LEN     32
 
+/* Tor-aligned bandwidth history (from bw_array_st.h).
+ * Tracks per-second byte counts in a rolling 10-second window,
+ * records the peak of each 1-hour period, keeps 24 period maxima.
+ * observed_bw = min(peak_read, peak_write) / NUM_SECS_ROLLING.
+ * Old peaks expire naturally — no EWMA ratcheting. */
+#define MOOR_BW_ROLLING_SECS    10       /* per-second obs window */
+#define MOOR_BW_PERIOD_SECS     3600     /* 1-hour periods */
+#define MOOR_BW_NUM_PERIODS     24       /* keep 24 hours of maxima */
+
+typedef struct {
+    uint64_t obs[MOOR_BW_ROLLING_SECS]; /* per-second byte counts (circular) */
+    int      cur_idx;                    /* current position in obs[] */
+    uint64_t total_obs;                  /* sum of obs[] except cur_idx */
+    uint64_t max_total;                  /* peak rolling sum this period */
+    uint64_t maxima[MOOR_BW_NUM_PERIODS]; /* peak per period (circular) */
+    int      next_max_idx;               /* next slot in maxima[] */
+    int      num_maxes_set;              /* how many maxima filled */
+    uint64_t total_in_period;            /* total bytes this period */
+    uint64_t period_end;                 /* when current period ends (unix) */
+    uint64_t cur_obs_time;               /* unix second of obs[cur_idx] */
+} moor_bw_hist_t;
+
 /* Async event types (bitmask) */
 #define MOOR_CTRL_EVENT_CIRC     (1u << 0)
 #define MOOR_CTRL_EVENT_STREAM   (1u << 1)
@@ -30,10 +52,12 @@ typedef struct {
     /* BW tracking for event notification */
     uint64_t bw_read_last;        /* bytes_recv at last BW event */
     uint64_t bw_written_last;     /* bytes_sent at last BW event */
-    /* Observed bandwidth (Tor-aligned): peak bytes/sec over 10s windows */
+    /* Observed bandwidth (Tor-aligned rolling-window peak tracker) */
     uint64_t observed_bw;         /* Current observed bandwidth (bytes/sec) */
-    uint64_t obs_bytes_prev;      /* bytes_sent+recv at last sample */
-    uint64_t obs_sample_time;     /* timestamp of last sample (ms) */
+    moor_bw_hist_t bw_read;       /* read (recv) bandwidth history */
+    moor_bw_hist_t bw_write;      /* write (sent) bandwidth history */
+    uint64_t hist_recv_prev;      /* bytes_recv snapshot for hist delta */
+    uint64_t hist_sent_prev;      /* bytes_sent snapshot for hist delta */
 } moor_stats_t;
 
 /* Persistent control port client */

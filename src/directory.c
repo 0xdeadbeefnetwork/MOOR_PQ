@@ -2354,15 +2354,15 @@ int moor_da_probe_relays(moor_da_config_t *config) {
             /* Bandwidth measurement: test relay throughput via BW_TEST.
              * Like Tor's bandwidth authority (sbws/torflow), the DA actively
              * measures each relay and stores the result as verified_bandwidth.
-             * 256 KB test (small enough to not disrupt, large enough to measure). */
+             * 256 KB test (small enough to not disrupt, large enough to
+             * measure).  moor_bw_auth_measure() already derates raw TCP by
+             * 0.7x to approximate circuit throughput.  We still cap at 2x
+             * self-reported as a sanity bound against gaming. */
             moor_bw_measurement_t bw = {0};
             bw.self_reported_bw = relay->bandwidth;
             if (moor_bw_auth_measure(&bw, relay->address, relay->or_port,
                                       256 * 1024) == 0 && bw.measured_bw > 0) {
-                /* Cap DA measurement: TCP echo overestimates real relay
-                 * throughput.  Use min(measured, self-reported * 1.5) to
-                 * prevent one fast link from dominating path selection. */
-                uint64_t cap = relay->bandwidth + (relay->bandwidth / 2);
+                uint64_t cap = relay->bandwidth * 2;
                 if (cap < 1000000) cap = 1000000; /* minimum 1 MB/s */
                 relay->verified_bandwidth = bw.measured_bw < cap ?
                     bw.measured_bw : cap;

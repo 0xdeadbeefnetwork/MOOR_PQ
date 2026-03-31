@@ -138,10 +138,16 @@ int moor_bw_auth_measure(moor_bw_measurement_t *result,
     uint64_t elapsed_ms = moor_time_ms() - start_ms;
     if (elapsed_ms == 0) elapsed_ms = 1;
 
-    /* One-direction throughput: test_size bytes over half the round-trip time.
-     * Previous formula counted both directions (test_size * 2), which
-     * double-counted bandwidth and inflated measurements. */
-    result->measured_bw = ((uint64_t)test_size * 1000) / elapsed_ms;
+    /* Pipelined one-direction throughput: relay echoes each chunk as it
+     * arrives, so sending and receiving overlap.  raw_bw is the effective
+     * throughput of the TCP echo.
+     *
+     * Derating: TCP echo measures raw socket throughput — no Noise-IK
+     * encryption, no cell framing, no circuit routing, no congestion
+     * control.  Real relay traffic is ~30% slower than raw TCP, matching
+     * Tor's SBWS measurements vs raw bandwidth.  Apply 0.7x factor. */
+    uint64_t raw_bw = ((uint64_t)test_size * 1000) / elapsed_ms;
+    result->measured_bw = (raw_bw * 7) / 10;
     result->measured = 1;
     result->effective_bw = moor_bw_auth_effective(result->self_reported_bw,
                                                    result->measured_bw);

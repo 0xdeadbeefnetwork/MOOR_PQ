@@ -23,6 +23,7 @@
 #include <sodium.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -513,36 +514,89 @@ void moor_monitor_notify_bw(void) {
     }
 }
 
+/* Tor-aligned bandwidth history: commit current period maximum and rotate.
+ * Called when cur_obs_time crosses a period boundary. */
+static void bw_hist_commit(moor_bw_hist_t *h) {
+    h->maxima[h->next_max_idx++] = h->max_total;
+    if (h->next_max_idx == MOOR_BW_NUM_PERIODS)
+        h->next_max_idx = 0;
+    if (h->num_maxes_set < MOOR_BW_NUM_PERIODS)
+        h->num_maxes_set++;
+    h->max_total = 0;
+    h->total_in_period = 0;
+    h->period_end += MOOR_BW_PERIOD_SECS;
+}
+
+/* Advance the per-second observation window by one tick. */
+static void bw_hist_advance(moor_bw_hist_t *h) {
+    /* Sum the full rolling window and check against period max */
+    uint64_t total = h->total_obs + h->obs[h->cur_idx];
+    if (total > h->max_total)
+        h->max_total = total;
+
+    int next = h->cur_idx + 1;
+    if (next == MOOR_BW_ROLLING_SECS) next = 0;
+
+    h->total_obs = total - h->obs[next];
+    h->obs[next] = 0;
+    h->cur_idx = next;
+    h->cur_obs_time++;
+
+    if (h->cur_obs_time >= h->period_end)
+        bw_hist_commit(h);
+}
+
+/* Record bytes into the bandwidth history at the given unix second. */
+static void bw_hist_add(moor_bw_hist_t *h, uint64_t when, uint64_t nbytes) {
+    if (h->cur_obs_time == 0) {
+        /* First call: initialize */
+        h->cur_obs_time = when;
+        h->period_end = when + MOOR_BW_PERIOD_SECS;
+    }
+    if (when < h->cur_obs_time) return; /* ignore stale */
+    while (when > h->cur_obs_time)
+        bw_hist_advance(h);
+    h->obs[h->cur_idx] += nbytes;
+    h->total_in_period += nbytes;
+}
+
+/* Find the largest peak across all stored period maxima.
+ * Also consider the current (in-progress) period if it has at least
+ * min_obs seconds of data. */
+static uint64_t bw_hist_largest_max(const moor_bw_hist_t *h, int min_obs) {
+    uint64_t mx = 0;
+    /* Include current period if we have enough observations */
+    uint64_t period_start = h->period_end - MOOR_BW_PERIOD_SECS;
+    if (h->cur_obs_time > period_start + (uint64_t)min_obs)
+        mx = h->max_total;
+    for (int i = 0; i < h->num_maxes_set && i < MOOR_BW_NUM_PERIODS; i++) {
+        if (h->maxima[i] > mx)
+            mx = h->maxima[i];
+    }
+    return mx;
+}
+
 void moor_monitor_sample_observed_bw(void) {
-    /* Tor-aligned observed bandwidth: track bytes relayed over 10-second
-     * windows.  The relay advertises min(configured_rate, observed_bw).
-     * This ensures relays can't claim more bandwidth than they actually relay. */
-    uint64_t now_ms = moor_time_ms();
-    uint64_t total_bytes = g_stats.bytes_sent + g_stats.bytes_recv;
+    /* Tor-aligned observed bandwidth (from bwhist.c / bw_array_st.h):
+     * Track bytes read/written per second in rolling 10-second windows.
+     * Record peak of each 1-hour period; keep 24 periods.
+     * Observed BW = min(peak_read, peak_write) / 10  (bytes/sec).
+     * Old peaks expire naturally — unlike the old EWMA which only ratcheted up,
+     * this decays as old period maxima rotate out. */
+    uint64_t now_s = (uint64_t)time(NULL);
 
-    if (g_stats.obs_sample_time == 0) {
-        /* First sample — initialize */
-        g_stats.obs_bytes_prev = total_bytes;
-        g_stats.obs_sample_time = now_ms;
-        return;
-    }
+    bw_hist_add(&g_stats.bw_read, now_s,
+                g_stats.bytes_recv - g_stats.hist_recv_prev);
+    bw_hist_add(&g_stats.bw_write, now_s,
+                g_stats.bytes_sent - g_stats.hist_sent_prev);
 
-    uint64_t elapsed_ms = now_ms - g_stats.obs_sample_time;
-    if (elapsed_ms < 1000) return; /* Don't sample too frequently */
+    g_stats.hist_recv_prev = g_stats.bytes_recv;
+    g_stats.hist_sent_prev = g_stats.bytes_sent;
 
-    uint64_t bytes_delta = total_bytes - g_stats.obs_bytes_prev;
-    uint64_t bw = (bytes_delta * 1000) / elapsed_ms; /* bytes/sec */
-
-    /* Track peak observed bandwidth (EWMA with alpha=0.3 for smoothing) */
-    if (g_stats.observed_bw == 0) {
-        g_stats.observed_bw = bw;
-    } else {
-        /* Use higher of: EWMA smoothed, or current sample (captures peaks) */
-        uint64_t smoothed = (g_stats.observed_bw * 7 + bw * 3) / 10;
-        if (bw > smoothed) smoothed = bw;
-        g_stats.observed_bw = smoothed;
-    }
-
-    g_stats.obs_bytes_prev = total_bytes;
-    g_stats.obs_sample_time = now_ms;
+    /* Compute observed bandwidth: min(read, write) peak / window_size.
+     * Require at least 30 seconds of observation before reporting. */
+    uint64_t r = bw_hist_largest_max(&g_stats.bw_read, 30);
+    uint64_t w = bw_hist_largest_max(&g_stats.bw_write, 30);
+    uint64_t peak = (r < w) ? r : w;
+    g_stats.observed_bw = peak / MOOR_BW_ROLLING_SECS;
 }

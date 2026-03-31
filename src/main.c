@@ -579,7 +579,9 @@ static void *relay_selftest_thread(void *arg) {
 
     /* Auto bandwidth test: measure our own throughput via BW_TEST
      * against our public OR port, then re-register with the result.
-     * Cap at 50 MB/s since self-tests via loopback overestimate. */
+     * moor_bw_auth_measure() already derates by 0.7x for circuit overhead.
+     * Additional 50 MB/s cap for loopback self-tests (they still
+     * overestimate since there's no real network path). */
     const char *addr = g_relay_cfg.advertise_addr[0] ?
                        g_relay_cfg.advertise_addr : g_relay_cfg.bind_addr;
     moor_bw_measurement_t bw = {0};
@@ -591,9 +593,10 @@ static void *relay_selftest_thread(void *arg) {
             capped = 50 * 1024 * 1024;  /* 50 MB/s cap for self-tests */
         g_relay_cfg.bandwidth = capped;
         g_bandwidth = capped;
-        LOG_INFO("auto-bandwidth: measured %llu bytes/sec (advertised %llu)",
+        LOG_INFO("auto-bandwidth: measured %llu bytes/sec (raw=%llu, advertised %llu)",
+                 (unsigned long long)capped,
                  (unsigned long long)bw.measured_bw,
-                 (unsigned long long)capped);
+                 (unsigned long long)bw.self_reported_bw);
         /* Re-register with updated bandwidth */
         if (!g_is_bridge)
             moor_relay_register(&g_relay_cfg);
