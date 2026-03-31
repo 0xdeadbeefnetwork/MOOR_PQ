@@ -2022,7 +2022,7 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
         data += (remaining >= 4) ? 4 : remaining;
         remaining -= (remaining >= 4) ? 4 : remaining;
 
-        if (len > 1024 || len < 32) {
+        if (len > 4096 || len < 32) { /* match HS_PUBLISH limit */
             send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
             return -1;
         }
@@ -2480,7 +2480,33 @@ int moor_client_fetch_consensus(moor_consensus_t *cons,
                      (unsigned long long)(uint64_t)time(NULL));
             return -1;
         }
-        LOG_INFO("fetched consensus: %u relays", cons->num_relays);
+        /* Verify DA signatures using the keys embedded in the consensus.
+         * Require at least 2 DA signatures that verify correctly.
+         * This prevents a MITM from serving a forged consensus. */
+        if (cons->num_da_sigs >= 2) {
+            uint8_t da_pks[32 * 16];
+            int n_da = 0;
+            for (uint32_t i = 0; i < cons->num_da_sigs && n_da < 16; i++) {
+                memcpy(da_pks + n_da * 32, cons->da_sigs[i].identity_pk, 32);
+                n_da++;
+            }
+            if (moor_consensus_verify(cons, da_pks, n_da) != 0) {
+                LOG_ERROR("consensus signature verification FAILED");
+                return -1;
+            }
+        } else if (cons->num_da_sigs == 1) {
+            /* Single-DA network: verify the one signature */
+            uint8_t body_hash[32];
+            if (consensus_body_hash(body_hash, cons) == 0 &&
+                moor_crypto_sign_verify(cons->da_sigs[0].signature,
+                                         body_hash, 32,
+                                         cons->da_sigs[0].identity_pk) != 0) {
+                LOG_ERROR("consensus single-DA signature verification FAILED");
+                return -1;
+            }
+        }
+        LOG_INFO("fetched consensus: %u relays (%u DA sigs verified)",
+                 cons->num_relays, cons->num_da_sigs);
         return 0;
     }
     return -1;

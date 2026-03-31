@@ -1670,8 +1670,9 @@ static void hs_rp_read_cb(int fd, int events, void *arg) {
                                 hybrid, 1, "moore2e!");
                 moor_crypto_kdf(circ->e2e_recv_key, 32,
                                 hybrid, 0, "moore2e!");
-                circ->e2e_send_nonce = 0;
-                circ->e2e_recv_nonce = 0;
+                /* Continue nonce counters -- do NOT reset to 0.
+                 * Resetting causes desync with client which rekeyed
+                 * before we received the KEM CT. */
                 circ->e2e_kem_pending = 0;
                 moor_crypto_wipe(kem_ss, 32);
                 moor_crypto_wipe(combined, 64);

@@ -820,31 +820,43 @@ int link_handshake_client_pq(moor_connection_t *conn,
         return -1;
     }
 
-    /* Send kyber_pk over the now-encrypted link.
-     * We reuse the cell mechanism but send raw here since
-     * the link is already encrypted. Send as raw bytes. */
-    size_t sent = 0;
-    while (sent < MOOR_KEM_PK_LEN) {
-        ssize_t n = conn_send(conn, kem_pk + sent, MOOR_KEM_PK_LEN - sent);
-        if (n <= 0) {
-            LOG_ERROR("PQ hybrid: send kyber_pk failed");
-            moor_crypto_wipe(kem_sk, MOOR_KEM_SK_LEN);
-            return -1;
+    /* Send kyber_pk through the AEAD-encrypted cell channel.
+     * Raw conn_send would be plaintext -- an active MITM could
+     * substitute the KEM pk, defeating the PQ protection. */
+    {
+        size_t pk_off = 0;
+        while (pk_off < MOOR_KEM_PK_LEN) {
+            moor_cell_t kcell;
+            memset(&kcell, 0, sizeof(kcell));
+            kcell.command = CELL_KEM_CT; /* reuse KEM cell type */
+            size_t chunk = MOOR_KEM_PK_LEN - pk_off;
+            if (chunk > MOOR_CELL_PAYLOAD) chunk = MOOR_CELL_PAYLOAD;
+            memcpy(kcell.payload, kem_pk + pk_off, chunk);
+            if (moor_connection_send_cell(conn, &kcell) != 0) {
+                LOG_ERROR("PQ hybrid: send kyber_pk cell failed");
+                moor_crypto_wipe(kem_sk, MOOR_KEM_SK_LEN);
+                return -1;
+            }
+            pk_off += chunk;
         }
-        sent += n;
     }
 
-    /* Step 3: Receive kyber_ct */
+    /* Step 3: Receive kyber_ct through the AEAD cell channel */
     uint8_t kem_ct[MOOR_KEM_CT_LEN];
     size_t total = 0;
     while (total < MOOR_KEM_CT_LEN) {
-        ssize_t n = conn_recv(conn, kem_ct + total, MOOR_KEM_CT_LEN - total);
-        if (n <= 0) {
-            LOG_ERROR("PQ hybrid: recv kyber_ct failed");
+        moor_cell_t kcell;
+        if (moor_connection_recv_cell(conn, &kcell) <= 0 ||
+            kcell.command != CELL_KEM_CT) {
+            LOG_ERROR("PQ hybrid: recv kyber_ct cell failed");
             moor_crypto_wipe(kem_sk, MOOR_KEM_SK_LEN);
             return -1;
         }
-        total += n;
+        size_t space = MOOR_KEM_CT_LEN - total;
+        size_t chunk = MOOR_CELL_PAYLOAD;
+        if (chunk > space) chunk = space;
+        memcpy(kem_ct + total, kcell.payload, chunk);
+        total += chunk;
     }
 
     /* Step 4: KEM decapsulate */
@@ -888,16 +900,21 @@ int link_handshake_server_pq(moor_connection_t *conn,
     if (link_handshake_server(conn, our_identity_pk, our_identity_sk) != 0)
         return -1;
 
-    /* Step 2: Receive kyber_pk from client */
+    /* Step 2: Receive kyber_pk from client via AEAD cell channel */
     uint8_t kem_pk[MOOR_KEM_PK_LEN];
     size_t total = 0;
     while (total < MOOR_KEM_PK_LEN) {
-        ssize_t n = conn_recv(conn, kem_pk + total, MOOR_KEM_PK_LEN - total);
-        if (n <= 0) {
-            LOG_ERROR("PQ hybrid server: recv kyber_pk failed");
+        moor_cell_t kcell;
+        if (moor_connection_recv_cell(conn, &kcell) <= 0 ||
+            kcell.command != CELL_KEM_CT) {
+            LOG_ERROR("PQ hybrid server: recv kyber_pk cell failed");
             return -1;
         }
-        total += n;
+        size_t space = MOOR_KEM_PK_LEN - total;
+        size_t chunk = MOOR_CELL_PAYLOAD;
+        if (chunk > space) chunk = space;
+        memcpy(kem_pk + total, kcell.payload, chunk);
+        total += chunk;
     }
 
     /* Step 3: KEM encapsulate */
@@ -908,16 +925,23 @@ int link_handshake_server_pq(moor_connection_t *conn,
         return -1;
     }
 
-    /* Send kyber_ct */
-    size_t sent = 0;
-    while (sent < MOOR_KEM_CT_LEN) {
-        ssize_t n = conn_send(conn, kem_ct + sent, MOOR_KEM_CT_LEN - sent);
-        if (n <= 0) {
-            LOG_ERROR("PQ hybrid server: send kyber_ct failed");
-            moor_crypto_wipe(kem_shared, MOOR_KEM_SS_LEN);
-            return -1;
+    /* Send kyber_ct via AEAD cell channel */
+    {
+        size_t ct_off = 0;
+        while (ct_off < MOOR_KEM_CT_LEN) {
+            moor_cell_t kcell;
+            memset(&kcell, 0, sizeof(kcell));
+            kcell.command = CELL_KEM_CT;
+            size_t chunk = MOOR_KEM_CT_LEN - ct_off;
+            if (chunk > MOOR_CELL_PAYLOAD) chunk = MOOR_CELL_PAYLOAD;
+            memcpy(kcell.payload, kem_ct + ct_off, chunk);
+            if (moor_connection_send_cell(conn, &kcell) != 0) {
+                LOG_ERROR("PQ hybrid server: send kyber_ct cell failed");
+                moor_crypto_wipe(kem_shared, MOOR_KEM_SS_LEN);
+                return -1;
+            }
+            ct_off += chunk;
         }
-        sent += n;
     }
 
     /* Step 4: Mix KEM shared secret into existing keys */

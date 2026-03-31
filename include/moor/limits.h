@@ -53,6 +53,7 @@
 #define MOOR_DA_REQUEST_TIMEOUT     10      /* DA request timeout (seconds) */
 #define MOOR_CONSENSUS_INTERVAL     3600    /* Consensus publish interval (seconds) */
 #define MOOR_CIRCUIT_ROTATE_SECS    600     /* Circuit rotation period (seconds) */
+#define MOOR_RELAY_CIRCUIT_MAX_AGE  86400  /* Relay-side max circuit lifetime (24h) */
 #define MOOR_GUARD_ROTATE_DAYS      120     /* Guard rotation (days) */
 #define MOOR_TIME_PERIOD_SECS       86400   /* Key blinding rotation (24h) */
 #define MOOR_VANGUARD_L2_ROTATE     86400   /* L2 vanguard rotation (24h) */

@@ -133,8 +133,10 @@ typedef struct {
 } extend_work_t;
 
 #define EXTEND_QUEUE_SIZE 32
+#define EXTEND_MAX_THREADS 16  /* cap concurrent blocking EXTEND workers */
 static extend_work_t *g_extend_results[EXTEND_QUEUE_SIZE];
 static int g_extend_head = 0, g_extend_tail = 0, g_extend_count = 0;
+static volatile int g_extend_threads = 0; /* active worker threads */
 static pthread_mutex_t g_extend_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int g_extend_pipe[2] = {-1, -1};
 
@@ -177,6 +179,11 @@ static void extend_complete_cb(int fd, int events, void *arg);
 /* Worker thread: blocking connect + CREATE + wait CREATED */
 static void *extend_worker_func(void *arg) {
     extend_work_t *w = (extend_work_t *)arg;
+    /* Ensure thread counter is decremented on every exit path */
+    #define EXTEND_WORKER_RETURN(val) do { \
+        __sync_fetch_and_sub(&g_extend_threads, 1); \
+        return (val); \
+    } while(0)
 
     moor_connection_t *conn = moor_connection_alloc();
     if (!conn) {
@@ -184,7 +191,7 @@ static void *extend_worker_func(void *arg) {
         w->destroy_reason = 4; /* DESTROY_REASON_RESOURCELIMIT */
         w->next_conn = NULL;
         extend_push_result(w);
-        return NULL;
+        EXTEND_WORKER_RETURN(NULL);
     }
     memcpy(conn->peer_identity, w->next_identity_pk, 32);
 
@@ -196,7 +203,7 @@ static void *extend_worker_func(void *arg) {
         w->destroy_reason = 3; /* DESTROY_REASON_CONNECTFAILED */
         w->next_conn = NULL;
         extend_push_result(w);
-        return NULL;
+        EXTEND_WORKER_RETURN(NULL);
     }
 
     /* Forward CKE CREATE */
@@ -209,7 +216,7 @@ static void *extend_worker_func(void *arg) {
         w->destroy_reason = 3;
         w->next_conn = NULL;
         extend_push_result(w);
-        return NULL;
+        EXTEND_WORKER_RETURN(NULL);
     }
 
     /* Blocking wait for CREATED */
@@ -219,7 +226,7 @@ static void *extend_worker_func(void *arg) {
     for (;;) {
         ret = moor_connection_recv_cell(conn, &resp);
         if (ret > 0) {
-            if (resp.circuit_id != w->next_circuit_id) continue; /* skip other circuits */
+            if (resp.circuit_id != w->next_circuit_id) continue;
             break;
         }
         if (ret < 0) break;
@@ -233,7 +240,7 @@ static void *extend_worker_func(void *arg) {
         w->destroy_reason = 3;
         w->next_conn = NULL;
         extend_push_result(w);
-        return NULL;
+        EXTEND_WORKER_RETURN(NULL);
     }
 
     /* Success */
@@ -242,7 +249,8 @@ static void *extend_worker_func(void *arg) {
     memcpy(w->created_payload, resp.payload, 64);
     w->next_conn = conn;
     extend_push_result(w);
-    return NULL;
+    EXTEND_WORKER_RETURN(NULL);
+    #undef EXTEND_WORKER_RETURN
 }
 
 /* Event loop callback: worker finished, complete the EXTEND on main thread */
@@ -1491,8 +1499,24 @@ static int relay_cke_derive(uint8_t key_seed[32], uint8_t auth_tag[32],
  *   6. Derive key_seed, auth_tag via CKE HKDF
  *   7. Send CREATED: [Y(32)][auth_tag(32)]
  */
+/* Rate limit: max circuits per connection per second */
+#define CREATE_RATE_LIMIT    10   /* max CREATE cells per connection per window */
+#define CREATE_RATE_WINDOW   5    /* seconds */
+
 int moor_relay_handle_create(moor_connection_t *conn,
                              const moor_cell_t *cell) {
+    /* Per-connection CREATE rate limit to prevent circuit pool exhaustion */
+    uint64_t now = (uint64_t)time(NULL);
+    if (now - conn->create_window_start >= CREATE_RATE_WINDOW) {
+        conn->create_window_start = now;
+        conn->create_window_count = 0;
+    }
+    if (++conn->create_window_count > CREATE_RATE_LIMIT) {
+        LOG_WARN("CREATE rate limit exceeded on fd=%d (%u in %us)",
+                 conn->fd, conn->create_window_count, CREATE_RATE_WINDOW);
+        return -1;
+    }
+
     /* Extract expected identity and client ephemeral pk */
     uint8_t expected_id[32], client_eph_pk[32];
     memcpy(expected_id, cell->payload, 32);
@@ -1870,12 +1894,21 @@ int moor_relay_handle_relay(moor_connection_t *conn,
 
                 circ->extend_pending = 1;
 
+                if (g_extend_threads >= EXTEND_MAX_THREADS) {
+                    LOG_WARN("EXTEND: thread limit (%d), rejecting", g_extend_threads);
+                    circ->extend_pending = 0;
+                    free(w);
+                    return -1;
+                }
+                __sync_fetch_and_add(&g_extend_threads, 1);
+
                 pthread_t tid;
                 pthread_attr_t attr;
                 pthread_attr_init(&attr);
                 pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
                 if (pthread_create(&tid, &attr, extend_worker_func, w) != 0) {
                     pthread_attr_destroy(&attr);
+                    __sync_fetch_and_sub(&g_extend_threads, 1);
                     circ->extend_pending = 0;
                     free(w);
                     return -1;
@@ -2026,12 +2059,21 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                 w->prev_conn = circ->prev_conn;
                 circ->extend_pending = 1;
 
+                if (g_extend_threads >= EXTEND_MAX_THREADS) {
+                    LOG_WARN("EXTEND2: thread limit (%d), rejecting", g_extend_threads);
+                    circ->extend_pending = 0;
+                    free(w);
+                    return -1;
+                }
+                __sync_fetch_and_add(&g_extend_threads, 1);
+
                 pthread_t tid;
                 pthread_attr_t attr;
                 pthread_attr_init(&attr);
                 pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
                 if (pthread_create(&tid, &attr, extend_worker_func, w) != 0) {
                     pthread_attr_destroy(&attr);
+                    __sync_fetch_and_sub(&g_extend_threads, 1);
                     circ->extend_pending = 0;
                     free(w);
                     return -1;

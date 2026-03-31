@@ -523,15 +523,19 @@ moor_circuit_t *moor_circuit_find(uint32_t circuit_id,
 }
 
 moor_circuit_t *moor_circuit_find_by_intro_pk(const moor_circuit_t *exclude) {
+    circ_pool_lock();
+    moor_circuit_t *found = NULL;
     for (int i = 0; i < MOOR_MAX_CIRCUITS; i++) {
         moor_circuit_t *c = &g_circuit_pool[i];
         if (c->circuit_id != 0 && c != exclude &&
             c->intro_service_pk[0] != 0 &&
             c->prev_conn && c->prev_conn->state == CONN_STATE_OPEN) {
-            return c;
+            found = c;
+            break;
         }
     }
-    return NULL;
+    circ_pool_unlock();
+    return found;
 }
 
 uint32_t moor_circuit_gen_id(void) {
@@ -1821,6 +1825,17 @@ void moor_circuit_check_timeouts(void) {
             continue;
         }
 
+        /* Relay-side max circuit lifetime: hard kill after 24h regardless
+         * of activity.  Prevents a malicious client from pinning circuit
+         * slots indefinitely with periodic keepalive traffic. */
+        if (!circ->is_client && age > MOOR_RELAY_CIRCUIT_MAX_AGE) {
+            LOG_INFO("relay circuit %u expired (age=%llu s, max=%d)",
+                     circ->circuit_id, (unsigned long long)age,
+                     MOOR_RELAY_CIRCUIT_MAX_AGE);
+            moor_circuit_destroy(circ);
+            continue;
+        }
+
         /* Circuit rotation: tear down old established circuits.
          * Skip circuits with active streams to avoid killing live connections. */
         if (circ->is_client && age > MOOR_CIRCUIT_ROTATE_SECS) {
@@ -1871,11 +1886,13 @@ void moor_circuit_check_timeouts(void) {
 
 int moor_circuit_active_count(void) {
     if (!g_circuit_pool_init) return 0;
+    circ_pool_lock();
     int count = 0;
     for (int i = 0; i < MOOR_MAX_CIRCUITS; i++) {
         if (g_circuit_pool[i].circuit_id != 0)
             count++;
     }
+    circ_pool_unlock();
     return count;
 }
 

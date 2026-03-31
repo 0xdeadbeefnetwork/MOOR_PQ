@@ -469,8 +469,10 @@ static void hs_rp_read_cb(int fd, int events, void *arg) {
                                         32, hybrid, 0, "moore2e!");
                         moor_crypto_kdf(pending->rp_circ->e2e_recv_key,
                                         32, hybrid, 1, "moore2e!");
-                        pending->rp_circ->e2e_send_nonce = 0;
-                        pending->rp_circ->e2e_recv_nonce = 0;
+                        /* Do NOT reset nonces -- continue counters.
+                         * Resetting causes desync: client rekeys before
+                         * HS receives KEM CT, cells with new key nonce=0
+                         * arrive while HS still expects old key. */
                         moor_crypto_wipe(kem_ss, 32);
                         moor_crypto_wipe(combined, 64);
                         moor_crypto_wipe(hybrid, 32);

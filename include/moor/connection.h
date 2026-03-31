@@ -58,6 +58,9 @@ struct moor_connection {
     size_t             write_off;  /* partial write offset into current cell */
     /* Connection multiplexing */
     int                circuit_refcount; /* circuits sharing this connection */
+    /* CREATE rate limiting (prevents circuit pool exhaustion DoS) */
+    uint64_t           create_window_start;
+    uint32_t           create_window_count;
     /* DoS cell rate limiting (Prop 305) */
     uint64_t           dos_cell_tokens;      /* token bucket */
     uint64_t           dos_cell_last_refill; /* last refill timestamp (ms) */
