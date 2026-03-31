@@ -1487,7 +1487,11 @@ static void hs_rp_read_cb(int fd, int events, void *arg) {
         }
 
         moor_circuit_t *circ = moor_circuit_find(cell.circuit_id, ctx->conn);
-        if (!circ) { circ = ctx->circ; }
+        if (!circ) circ = ctx->circ;
+        if (!circ || circ->circuit_id == 0) {
+            LOG_WARN("HS recv: no valid circuit for cell (id=%u)", cell.circuit_id);
+            continue;
+        }
 
         moor_circuit_decrypt_backward(circ, &cell);
 

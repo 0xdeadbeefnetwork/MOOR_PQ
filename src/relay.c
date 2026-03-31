@@ -457,6 +457,7 @@ static int dot_tls_send(int fd, uint8_t content_type,
                         const uint8_t *data, size_t data_len,
                         const uint8_t *key, const uint8_t *iv,
                         uint64_t *seq) {
+    if (data_len > 16384) return -1; /* TLS record size limit */
     uint8_t rec[5 + 16384 + 256];
     if (!key) {
         /* Plaintext record */
@@ -497,7 +498,8 @@ static int dot_tls_send(int fd, uint8_t content_type,
 /* Receive a TLS record. If key is NULL, receive plaintext.
  * Returns content type, writes payload to out, sets *out_len.
  * Returns -1 on error. */
-static int dot_tls_recv(int fd, uint8_t *out, size_t *out_len,
+static int dot_tls_recv(int fd, uint8_t *out, size_t out_size,
+                        size_t *out_len,
                         const uint8_t *key, const uint8_t *iv,
                         uint64_t *seq) {
     uint8_t hdr[5];
@@ -517,6 +519,7 @@ static int dot_tls_recv(int fd, uint8_t *out, size_t *out_len,
 
     if (!key) {
         /* Plaintext */
+        if (frag_len > out_size) return -1;
         memcpy(out, frag, frag_len);
         *out_len = frag_len;
         return hdr[0];
@@ -528,6 +531,7 @@ static int dot_tls_recv(int fd, uint8_t *out, size_t *out_len,
     for (int i = 0; i < 8; i++)
         nonce[4 + i] ^= (uint8_t)(*seq >> (56 - 8 * i));
 
+    if (frag_len > out_size + 16) return -1; /* plaintext can't fit */
     unsigned long long plen;
     if (crypto_aead_chacha20poly1305_ietf_decrypt(
             out, &plen, NULL, frag, frag_len, hdr, 5, nonce, key) != 0)
@@ -812,7 +816,7 @@ static int dot_query(const dot_provider_t *prov,
     /* === ServerHello === */
     uint8_t rec_buf[16384 + 256];
     size_t rec_len;
-    int rtype = dot_tls_recv(fd, rec_buf, &rec_len, NULL, NULL, NULL);
+    int rtype = dot_tls_recv(fd, rec_buf, sizeof(rec_buf), &rec_len, NULL, NULL, NULL);
     if (rtype != 0x16 || rec_len < 4) {
         LOG_DEBUG("DoT: ServerHello recv failed");
         goto cleanup;
@@ -878,7 +882,7 @@ static int dot_query(const dot_provider_t *prov,
 
     while (!got_finished) {
         size_t rlen;
-        int ct = dot_tls_recv(fd, rec_buf, &rlen, s_hs_key, s_hs_iv, &s_hs_seq);
+        int ct = dot_tls_recv(fd, rec_buf, sizeof(rec_buf), &rlen, s_hs_key, s_hs_iv, &s_hs_seq);
         if (ct == 0x14) continue; /* CCS -- ignore */
         if (ct != 0x16) {
             LOG_DEBUG("DoT: unexpected record during handshake");
@@ -1059,7 +1063,7 @@ static int dot_query(const dot_provider_t *prov,
         /* May need to skip NewSessionTicket messages (handshake type 4) */
         for (int attempts = 0; attempts < 5; attempts++) {
             size_t rlen;
-            int ct = dot_tls_recv(fd, rec_buf, &rlen,
+            int ct = dot_tls_recv(fd, rec_buf, sizeof(rec_buf), &rlen,
                                   s_app_key, s_app_iv, &s_app_seq);
             if (ct == 0x16) { continue; } /* skip post-handshake msgs (NewSessionTicket) */
             if (ct == 0x15 && rlen >= 2) {
@@ -2038,8 +2042,8 @@ int moor_relay_handle_relay(moor_connection_t *conn,
             }
 
             case RELAY_BEGIN: {
-                if (relay.data_length >= 280) return -1;
-                char addr_port[280];
+                if (relay.data_length >= 256) return -1; /* match target_addr[256] */
+                char addr_port[256];
                 memcpy(addr_port, relay.data, relay.data_length);
                 addr_port[relay.data_length] = '\0';
 
@@ -2109,8 +2113,11 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                 if (circ->circ_deliver_window <= 0 || stream->deliver_window <= 0) {
                     LOG_WARN("deliver window exhausted on circuit %u stream %u -- dropping cell",
                              circ->circuit_id, relay.stream_id);
-                    circ->circ_deliver_window--;
-                    stream->deliver_window--;
+                    /* Don't decrement past floor to prevent unbounded underflow */
+                    if (circ->circ_deliver_window > -MOOR_CIRCUIT_WINDOW)
+                        circ->circ_deliver_window--;
+                    if (stream->deliver_window > -MOOR_STREAM_WINDOW)
+                        stream->deliver_window--;
                     goto sendme_check;
                 }
 

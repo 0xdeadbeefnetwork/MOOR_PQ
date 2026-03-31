@@ -395,7 +395,10 @@ static void noise_init(uint8_t h[32], uint8_t ck[32]) {
 /* MixHash: h = HASH(h || data) */
 static void noise_mix_hash(uint8_t h[32], const uint8_t *data, size_t len) {
     uint8_t input[32 + 1200]; /* h + data (max: Kyber CT 1088 + AEAD 16) */
-    if (len > 1200) len = 1200; /* safety (#134) */
+    if (len > 1200) {
+        LOG_ERROR("noise_mix_hash: data too large (%zu > 1200)", len);
+        len = 1200; /* prevent overflow, but this is a bug if reached */
+    }
     memcpy(input, h, 32);
     memcpy(input + 32, data, len);
     moor_crypto_hash(h, input, 32 + len);

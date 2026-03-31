@@ -1407,6 +1407,7 @@ int moor_circuit_open_stream(moor_circuit_t *circ, uint16_t *stream_id,
                            (uint8_t *)begin_data, (uint16_t)(n + 1));
 
             moor_circuit_encrypt_forward(circ, &cell);
+            if (!circ->conn) return -1;
             moor_connection_send_cell(circ->conn, &cell);
 
             LOG_INFO("stream %u: BEGIN sent", circ->streams[i].stream_id);
@@ -1439,12 +1440,14 @@ uint32_t moor_circuit_resolve(moor_circuit_t *circ, const char *hostname) {
     moor_cell_relay(&cell, circ->circuit_id, RELAY_RESOLVE, 0,
                     (const uint8_t *)hostname, (uint16_t)hlen);
     if (moor_circuit_encrypt_forward(circ, &cell) != 0) return 0;
+    if (!circ->conn) return 0;
     if (moor_connection_send_cell(circ->conn, &cell) != 0) return 0;
 
     /* Wait for RELAY_RESOLVED (up to 10s) */
     moor_cell_t resp;
     uint64_t deadline = moor_time_ms() + 10000;
     for (;;) {
+        if (!circ->conn) return 0;
         int ret = moor_connection_recv_cell(circ->conn, &resp);
         if (ret > 0) {
             if (resp.command == CELL_PADDING) continue;
@@ -1500,7 +1503,7 @@ int moor_circuit_send_data(moor_circuit_t *circ, uint16_t stream_id,
                        stream_id, data, chunk);
         moor_circuit_encrypt_forward(circ, &cell);
 
-        if (moor_connection_send_cell(circ->conn, &cell) != 0)
+        if (!circ->conn || moor_connection_send_cell(circ->conn, &cell) != 0)
             return -1;
 
         /* Track inflight for CC, decrement legacy + stream windows */
@@ -2863,13 +2866,29 @@ int moor_guard_load(moor_guard_state_t *state, const char *data_dir) {
     }
     size_t off = 0;
     for (int i = 0; i < state->num_confirmed; i++) {
-        state->confirmed_indices[i] = ((int)idx_buf[off] << 24) | ((int)idx_buf[off+1] << 16) |
-                                      ((int)idx_buf[off+2] << 8) | idx_buf[off+3];
+        int idx = ((int)idx_buf[off] << 24) | ((int)idx_buf[off+1] << 16) |
+                  ((int)idx_buf[off+2] << 8) | idx_buf[off+3];
+        if (idx < 0 || idx >= state->num_sampled) {
+            LOG_WARN("guard: confirmed_indices[%d]=%d out of range (num_sampled=%d)",
+                     i, idx, state->num_sampled);
+            fclose(f);
+            memset(state, 0, sizeof(*state));
+            return -1;
+        }
+        state->confirmed_indices[i] = idx;
         off += 4;
     }
     for (int i = 0; i < state->num_primary; i++) {
-        state->primary_indices[i] = ((int)idx_buf[off] << 24) | ((int)idx_buf[off+1] << 16) |
-                                    ((int)idx_buf[off+2] << 8) | idx_buf[off+3];
+        int idx = ((int)idx_buf[off] << 24) | ((int)idx_buf[off+1] << 16) |
+                  ((int)idx_buf[off+2] << 8) | idx_buf[off+3];
+        if (idx < 0 || idx >= state->num_sampled) {
+            LOG_WARN("guard: primary_indices[%d]=%d out of range (num_sampled=%d)",
+                     i, idx, state->num_sampled);
+            fclose(f);
+            memset(state, 0, sizeof(*state));
+            return -1;
+        }
+        state->primary_indices[i] = idx;
         off += 4;
     }
 

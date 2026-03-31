@@ -1440,6 +1440,14 @@ int moor_socks5_handle_request(moor_socks5_client_t *client,
             g_hs_pending[slot].started = time(NULL);
 
             /* Register RP connection for async RENDEZVOUS2 wait */
+            if (!rp_circ->conn) {
+                LOG_ERROR("HS: RP circuit has no connection");
+                moor_circuit_destroy(rp_circ);
+                g_hs_pending[slot].active = 0;
+                uint8_t fail[] = { 0x05, 0x04, 0x00, 0x01, 0,0,0,0, 0,0 };
+                send(client->client_fd, (char *)fail, sizeof(fail), MSG_NOSIGNAL);
+                return -1;
+            }
             rp_circ->conn->on_other_cell = extend_dispatch_cell;
             moor_event_add(rp_circ->conn->fd, MOOR_EVENT_READ,
                            hs_rp_read_cb, rp_circ->conn);
