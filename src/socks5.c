@@ -1659,14 +1659,24 @@ void moor_socks5_invalidate_circuit(moor_circuit_t *circ) {
     }
 
     /* NULL out circuit cache entries pointing to this circuit,
-     * then remove fully-dead entries to prevent cache bloat. */
+     * then remove fully-dead entries to prevent cache bloat.
+     *
+     * IMPORTANT: with connection multiplexing, multiple cache entries
+     * may share the same guard connection.  Only close the connection
+     * when circuit_refcount drops to 0 (no other circuits use it).
+     * Closing a shared connection kills ALL circuits on it. */
     for (int i = 0; i < g_circuit_cache_count; i++) {
         circuit_cache_entry_t *e = &g_circuit_cache[i];
         if (e->circuit == circ) {
             e->circuit = NULL;
             if (e->conn) {
-                moor_event_remove(e->conn->fd);
-                moor_connection_close(e->conn);
+                /* Only close if this is the last circuit on the connection.
+                 * refcount not yet decremented (destroy runs after us),
+                 * so <= 1 means we're the only one left. */
+                if (e->conn->circuit_refcount <= 1) {
+                    moor_event_remove(e->conn->fd);
+                    moor_connection_close(e->conn);
+                }
                 e->conn = NULL;
             }
             if (e->conflux) {
@@ -1678,8 +1688,10 @@ void moor_socks5_invalidate_circuit(moor_circuit_t *circ) {
             if (e->extra_circuits[j] == circ) {
                 e->extra_circuits[j] = NULL;
                 if (e->extra_conns[j]) {
-                    moor_event_remove(e->extra_conns[j]->fd);
-                    moor_connection_close(e->extra_conns[j]);
+                    if (e->extra_conns[j]->circuit_refcount <= 1) {
+                        moor_event_remove(e->extra_conns[j]->fd);
+                        moor_connection_close(e->extra_conns[j]);
+                    }
                     e->extra_conns[j] = NULL;
                 }
             }
