@@ -138,8 +138,10 @@ int moor_bw_auth_measure(moor_bw_measurement_t *result,
     uint64_t elapsed_ms = moor_time_ms() - start_ms;
     if (elapsed_ms == 0) elapsed_ms = 1;
 
-    /* Total round-trip bytes / elapsed seconds (ms precision) */
-    result->measured_bw = ((uint64_t)test_size * 2 * 1000) / elapsed_ms;
+    /* One-direction throughput: test_size bytes over half the round-trip time.
+     * Previous formula counted both directions (test_size * 2), which
+     * double-counted bandwidth and inflated measurements. */
+    result->measured_bw = ((uint64_t)test_size * 1000) / elapsed_ms;
     result->measured = 1;
     result->effective_bw = moor_bw_auth_effective(result->self_reported_bw,
                                                    result->measured_bw);

@@ -584,7 +584,7 @@ static void *relay_selftest_thread(void *arg) {
                        g_relay_cfg.advertise_addr : g_relay_cfg.bind_addr;
     moor_bw_measurement_t bw = {0};
     bw.self_reported_bw = g_relay_cfg.bandwidth;
-    if (moor_bw_auth_measure(&bw, addr, g_relay_cfg.or_port, 512 * 1024) == 0 &&
+    if (moor_bw_auth_measure(&bw, addr, g_relay_cfg.or_port, 256 * 1024) == 0 &&
         bw.measured_bw > 0) {
         uint64_t capped = bw.measured_bw;
         if (capped > 50 * 1024 * 1024)
