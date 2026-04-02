@@ -1776,6 +1776,8 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
             /* Update snapshot again after votes (now has peer sigs) */
             moor_da_update_published_snapshot(config);
         } else {
+            LOG_WARN("DA: PUBLISH descriptor parse failed (len=%u, desc_len=%d)",
+                     len, desc_len);
             send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
         }
         free(desc_buf);
