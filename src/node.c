@@ -333,6 +333,12 @@ int moor_node_descriptor_deserialize(moor_node_descriptor_t *desc,
     memcpy(desc->onion_pk, data + off, 32); off += 32;
     memcpy(desc->address, data + off, 64); off += 64;
     desc->address[63] = '\0'; /* Ensure null-termination from untrusted wire data */
+    /* Sanitize: strip control chars < 0x20, space (0x20), and DEL (0x7F)
+     * to prevent consensus line injection (CWE-93) (#R1-C1). */
+    for (int c = 0; desc->address[c]; c++)
+        if ((unsigned char)desc->address[c] < 0x20 ||
+            desc->address[c] == 0x20 || desc->address[c] == 0x7F)
+            desc->address[c] = '_';
     desc->or_port = ((uint16_t)data[off] << 8) | data[off + 1]; off += 2;
     desc->dir_port = ((uint16_t)data[off] << 8) | data[off + 1]; off += 2;
     desc->flags = ((uint32_t)data[off] << 24) | ((uint32_t)data[off+1] << 16) |
@@ -383,8 +389,17 @@ int moor_node_descriptor_deserialize(moor_node_descriptor_t *desc,
                 off + DESC_V4_EXTRA <= data_len) {
                 memcpy(desc->nickname, data + off, 32); off += 32;
                 desc->nickname[31] = '\0';
+                /* Sanitize: strip control chars, space, and DEL (CWE-93, #R1-C1) */
+                for (int c = 0; desc->nickname[c]; c++)
+                    if ((unsigned char)desc->nickname[c] < 0x20 ||
+                        desc->nickname[c] == 0x20 || desc->nickname[c] == 0x7F)
+                        desc->nickname[c] = '_';
                 memcpy(desc->address6, data + off, 64); off += 64;
                 desc->address6[63] = '\0';
+                for (int c = 0; desc->address6[c]; c++)
+                    if ((unsigned char)desc->address6[c] < 0x20 ||
+                        desc->address6[c] == 0x20 || desc->address6[c] == 0x7F)
+                        desc->address6[c] = '_';
                 memcpy(desc->prev_onion_pk, data + off, 32); off += 32;
                 desc->onion_key_version = ((uint32_t)data[off] << 24) |
                                           ((uint32_t)data[off+1] << 16) |
@@ -398,6 +413,10 @@ int moor_node_descriptor_deserialize(moor_node_descriptor_t *desc,
                     off + DESC_V5_EXTRA <= data_len) {
                     memcpy(desc->contact_info, data + off, 128); off += 128;
                     desc->contact_info[127] = '\0';
+                    for (int c = 0; desc->contact_info[c]; c++)
+                        if ((unsigned char)desc->contact_info[c] < 0x20 ||
+                            desc->contact_info[c] == 0x20 || desc->contact_info[c] == 0x7F)
+                            desc->contact_info[c] = '_';
                 }
             }
         }
@@ -924,6 +943,22 @@ int moor_consensus_deserialize(moor_consensus_t *cons,
             snprintf(cons->relays[current_relay].contact_info,
                      sizeof(cons->relays[current_relay].contact_info),
                      "%s", line + 2);
+        }
+        /* Bandwidth weights: "bandwidth-weights Wgg=X Wgd=X Wee=X Wed=X Wmg=X Wme=X Wmm=X Wmd=X" */
+        else if (strncmp(line, "bandwidth-weights ", 18) == 0) {
+            int wgg = 0, wgd = 0, wee = 0, wed = 0, wmg = 0, wme = 0, wmm = 0, wmd = 0;
+            if (sscanf(line + 18,
+                       "Wgg=%d Wgd=%d Wee=%d Wed=%d Wmg=%d Wme=%d Wmm=%d Wmd=%d",
+                       &wgg, &wgd, &wee, &wed, &wmg, &wme, &wmm, &wmd) == 8) {
+                cons->bw_weights[BW_WGG] = (int32_t)wgg;
+                cons->bw_weights[BW_WGD] = (int32_t)wgd;
+                cons->bw_weights[BW_WEE] = (int32_t)wee;
+                cons->bw_weights[BW_WED] = (int32_t)wed;
+                cons->bw_weights[BW_WMG] = (int32_t)wmg;
+                cons->bw_weights[BW_WME] = (int32_t)wme;
+                cons->bw_weights[BW_WMM] = (int32_t)wmm;
+                cons->bw_weights[BW_WMD] = (int32_t)wmd;
+            }
         }
         /* Footer marker */
         else if (strncmp(line, "directory-footer", 16) == 0) {

@@ -18,6 +18,7 @@ static const int g_rl_limits[MOOR_RL_NUM_TYPES] = {
     MOOR_RL_INTRO_LIMIT,
     MOOR_RL_ESTAB_LIMIT,
     MOOR_RL_REND_LIMIT,
+    MOOR_RL_PUBLISH_LIMIT,
 };
 
 void moor_ratelimit_init(void) {

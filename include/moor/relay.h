@@ -40,6 +40,8 @@ typedef struct {
     /* Kyber768 KEM keypair for PQ circuit crypto */
     uint8_t  kem_pk[MOOR_KEM_PK_LEN];
     uint8_t  kem_sk[MOOR_KEM_SK_LEN];
+    /* Bridge mode: relay serves as unlisted bridge, never in consensus */
+    int      is_bridge;
     /* Operator contact info */
     char     contact_info[128];
 } moor_relay_config_t;
@@ -99,5 +101,9 @@ void moor_relay_invalidate_rp_cookies(const moor_circuit_t *circ);
 
 /* Remove all exit FD map entries pointing to this circuit (dangling pointer fix) */
 void moor_relay_cleanup_exit_fds(const moor_circuit_t *circ);
+
+/* Accessors for relay identity and consensus (used by dht.c responsibility check) */
+const uint8_t *moor_relay_get_identity_pk(void);
+const moor_consensus_t *moor_relay_get_consensus(void);
 
 #endif /* MOOR_RELAY_H */

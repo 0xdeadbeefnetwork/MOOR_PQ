@@ -58,7 +58,9 @@ static int is_private_address(const char *addr) {
         if ((in6.s6_addr[0] & 0xfe) == 0xfc) return 1;
         /* ::ffff:0:0/96 -- IPv4-mapped (check inner IPv4 against ALL ranges) */
         if (IN6_IS_ADDR_V4MAPPED(&in6)) {
-            uint32_t ip = ntohl(*(uint32_t *)&in6.s6_addr[12]);
+            uint32_t ip;
+            memcpy(&ip, &in6.s6_addr[12], 4);
+            ip = ntohl(ip);
             if ((ip >> 24) == 127) return 1;                  /* loopback */
             if ((ip >> 24) == 10) return 1;                   /* RFC 1918 */
             if ((ip >> 20) == (172 << 4 | 1)) return 1;      /* RFC 1918 */
@@ -69,6 +71,16 @@ static int is_private_address(const char *addr) {
             if ((ip >> 28) == 14) return 1;                   /* multicast */
             if ((ip >> 28) == 15) return 1;                   /* reserved */
         }
+        /* ::/96 -- IPv4-compatible (deprecated but still routable) */
+        if (IN6_IS_ADDR_V4COMPAT(&in6)) return 1;
+        /* 2002::/16 -- 6to4 (embeds IPv4, can reach private nets) */
+        if (in6.s6_addr[0] == 0x20 && in6.s6_addr[1] == 0x02) return 1;
+        /* 2001:0000::/32 -- Teredo (embeds IPv4, bypass risk) */
+        if (in6.s6_addr[0] == 0x20 && in6.s6_addr[1] == 0x01 &&
+            in6.s6_addr[2] == 0x00 && in6.s6_addr[3] == 0x00) return 1;
+        /* 64:ff9b::/96 -- NAT64 well-known prefix */
+        if (in6.s6_addr[0] == 0x00 && in6.s6_addr[1] == 0x64 &&
+            in6.s6_addr[2] == 0xff && in6.s6_addr[3] == 0x9b) return 1;
     }
     /* Also reject hostnames that are obviously internal */
     if (strcmp(addr, "localhost") == 0) return 1;
@@ -124,6 +136,7 @@ typedef struct {
     uint32_t prev_circuit_id;
     uint32_t next_circuit_id;
     moor_connection_t *prev_conn;  /* lookup key only — worker must NOT touch */
+    uint32_t prev_conn_generation; /* detect conn slot reuse (#CWE-362) */
     /* Output: filled by worker */
     int      result;               /* 0=success, -1=failure */
     uint8_t  destroy_reason;
@@ -146,6 +159,7 @@ static int g_extend_head = 0, g_extend_tail = 0, g_extend_count = 0;
 static volatile int g_extend_threads = 0; /* active worker threads */
 static pthread_mutex_t g_extend_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int g_extend_pipe[2] = {-1, -1};
+static int g_extend_pq_inflight = 0; /* concurrency cap for EXTEND_PQ (#R1-B3) */
 
 static void extend_push_result(extend_work_t *w) {
     pthread_mutex_lock(&g_extend_mutex);
@@ -270,7 +284,16 @@ static void extend_complete_cb(int fd, int events, void *arg) {
 
     extend_work_t *w;
     while ((w = extend_pop_result()) != NULL) {
-        /* Find the circuit — if prev_conn disconnected, circuit was freed */
+        /* Find the circuit — if prev_conn disconnected, circuit was freed.
+         * Also check connection generation to detect slot reuse (#CWE-362):
+         * if the conn was freed and reallocated, the generation won't match. */
+        if (w->prev_conn->generation != w->prev_conn_generation) {
+            LOG_WARN("EXTEND: prev_conn reused (gen %u != %u), discarding result",
+                     w->prev_conn->generation, w->prev_conn_generation);
+            if (w->next_conn) moor_connection_close(w->next_conn);
+            extend_work_free(w);
+            continue;
+        }
         moor_circuit_t *circ = moor_circuit_find(w->prev_circuit_id, w->prev_conn);
         if (!circ || !circ->extend_pending) {
             /* Circuit gone — clean up next_conn */
@@ -345,790 +368,513 @@ void moor_relay_extend_shutdown(void) {
     }
 }
 
-/* === DNS-over-TLS (DoT) with minimal TLS 1.3 — libsodium only ===
+/* === DNSCrypt v2 — authenticated encrypted DNS using libsodium ===
  *
- * Implements a minimal TLS 1.3 client using only libsodium primitives
- * (X25519, ChaCha20-Poly1305, SHA-256, HMAC-SHA256). Authenticates
- * servers via SPKI pinning instead of X.509 chain verification.
+ * Replaces DNS-over-TLS (DoT). DoT relies on X.509 certificate chains
+ * which we can't verify without a TLS library — SPKI pinning is brittle
+ * (pins rotate, intermediates change) and any MITM with a valid cert
+ * (corporate proxy, state actor with a compromised CA) defeats it.
  *
- * Providers tried in order: Cloudflare, Quad9, Google.
- * Each has both leaf and intermediate CA SPKI pins for rotation resilience.
+ * DNSCrypt v2 uses X25519 + XSalsa20-Poly1305 with a pinned server
+ * public key. Authentication is cryptographic and unconditional:
+ * if the server can't prove it holds the private key corresponding
+ * to the pinned public key, decryption fails. No CAs, no certificates,
+ * no MITM possible.
  *
- * Regenerate pins:
- *   openssl s_client -connect IP:853 -servername SNI 2>/dev/null | \
- *     openssl x509 -pubkey -noout | openssl pkey -pubin -outform der | \
- *     openssl dgst -sha256 -hex
+ * Protocol (simplified):
+ *   1. Client fetches server certificate (contains short-lived X25519 pk)
+ *   2. Client generates ephemeral X25519 keypair
+ *   3. shared_key = X25519(client_sk, server_cert_pk)
+ *   4. Client sends: client_magic(8) + client_pk(32) + client_nonce(12)
+ *                     + XSalsa20-Poly1305(dns_query, shared_key, full_nonce)
+ *   5. Server sends: server_magic(8) + server_nonce(24) + encrypted response
+ *
+ * Provider public keys from:
+ *   https://dnscrypt.info/stamps/
+ *   sdns:// stamps decode to provider_pk directly
  */
 
 typedef struct {
     const char *ip;
     uint16_t    port;
-    const char *sni;
-    uint8_t     leaf_pin[32];
-    uint8_t     ca_pin[32];
-} dot_provider_t;
+    const char *provider_name;
+    uint8_t     provider_pk[32]; /* long-term Ed25519 signing key (verifies certs) */
+} dnscrypt_provider_t;
 
-static const dot_provider_t g_dot_providers[] = {
-    { "1.1.1.1",  853, "cloudflare-dns.com",
-      { 0x96,0xd4,0x3a,0x69,0x7c,0xb7,0xb6,0xaa,0x4d,0x64,0xa2,0x5d,0x9d,0xeb,0xcc,0x0f,
-        0xba,0x11,0xf8,0x8b,0x08,0xe6,0xb3,0x56,0x6c,0xeb,0x2c,0x14,0x3a,0xe5,0xf8,0x4c },
-      { 0xcc,0x68,0x00,0xe0,0xe5,0x38,0x0e,0x32,0x5d,0xbe,0x94,0x58,0x52,0xa6,0xe2,0xe5,
-        0x58,0x76,0x83,0xd5,0xb9,0x39,0xcf,0xcf,0x80,0xa8,0xa1,0xcb,0xd9,0xa4,0x2e,0xc1 } },
-    { "9.9.9.9",  853, "dns.quad9.net",
-      { 0x8b,0x69,0x0e,0x6d,0xfc,0xf4,0xa8,0x82,0x82,0x18,0xd5,0xad,0xec,0xc8,0xc1,0x51,
-        0xe4,0xab,0x87,0x40,0xf2,0x8d,0xbd,0x3f,0xcd,0x62,0x0d,0x22,0x66,0x44,0x4b,0xe2 },
-      { 0xa8,0x14,0x63,0x66,0x63,0xa6,0x91,0x23,0x49,0x2f,0x4a,0x7b,0xd3,0x37,0xa4,0xee,
-        0x87,0x52,0x23,0x3a,0xac,0xfe,0x6b,0x91,0xe0,0x99,0x3d,0xc5,0x8c,0x82,0x3f,0xe1 } },
-    { "8.8.8.8",  853, "dns.google",
-      { 0x50,0x02,0x0f,0xf2,0x1b,0xf0,0x4e,0x95,0x59,0xa4,0x9e,0x40,0x9c,0x97,0x06,0xc2,
-        0x67,0x31,0x3c,0x37,0x03,0x55,0xd2,0x3f,0xc3,0xca,0x9a,0x70,0x14,0xe6,0x46,0xe6 },
-      { 0x60,0xfb,0x47,0x69,0xfb,0x4b,0xc3,0xaf,0xf4,0xbe,0x77,0x36,0x06,0x73,0x4a,0x18,
-        0x5e,0x78,0xc6,0x20,0x80,0xdb,0xc5,0x85,0x71,0xc7,0x23,0x90,0x0e,0x32,0xa4,0x23 } },
+/* DNSCrypt v2 providers with pinned public keys.
+ * Keys decoded from sdns:// stamps at:
+ *   https://github.com/DNSCrypt/dnscrypt-resolvers/blob/master/v3/public-resolvers.md
+ * These are long-term provider keys, NOT short-lived certificate keys. */
+static const dnscrypt_provider_t g_dnscrypt_providers[] = {
+    /* AdGuard Default (94.140.14.14:5443) */
+    { "94.140.14.14", 5443, "2.dnscrypt.default.ns1.adguard.com",
+      { 0xd1,0x2b,0x47,0xf2,0x52,0xdc,0xf2,0xc2,0xbb,0xf8,0x99,0x10,0x86,0xea,0xf7,0x9c,
+        0xe4,0x49,0x5d,0x8b,0x16,0xc8,0xa0,0xc4,0x32,0x2e,0x52,0xca,0x3f,0x39,0x08,0x73 } },
+    /* OpenDNS (208.67.220.220:443) */
+    { "208.67.220.220", 443, "2.dnscrypt-cert.opendns.com",
+      { 0xb7,0x35,0x11,0x40,0x20,0x6f,0x22,0x5d,0x3e,0x2b,0xd8,0x22,0xd7,0xfd,0x69,0x1e,
+        0xa1,0xc3,0x3c,0xc8,0xd6,0x66,0x8d,0x0c,0xbe,0x04,0xbf,0xab,0xca,0x43,0xfb,0x79 } },
+    /* CleanBrowsing Security (185.228.168.10:8443) */
+    { "185.228.168.10", 8443, "cleanbrowsing.org",
+      { 0xbc,0xac,0x32,0xfa,0xd5,0x43,0x69,0x17,0x1f,0x08,0x32,0xd6,0x07,0x50,0x27,0xc3,
+        0x20,0x8c,0xee,0xf0,0xe8,0xe9,0x9f,0x94,0x18,0xdc,0x77,0x60,0x65,0xd4,0x8f,0x29 } },
 };
-#define DOT_NUM_PROVIDERS 3
+#define DNSCRYPT_NUM_PROVIDERS 3
 
-/* ---- HMAC-SHA256 / HKDF (TLS 1.3 key schedule) ---- */
+/* DNS record types */
+#define DNS_TYPE_A   1
+#define DNS_TYPE_TXT 16
 
-static void dot_hmac_sha256(uint8_t out[32],
-                            const uint8_t *key, size_t key_len,
-                            const uint8_t *data, size_t data_len) {
-    crypto_auth_hmacsha256_state st;
-    crypto_auth_hmacsha256_init(&st, key, key_len);
-    crypto_auth_hmacsha256_update(&st, data, data_len);
-    crypto_auth_hmacsha256_final(&st, out);
-    sodium_memzero(&st, sizeof(st));
-}
+/* Forward declaration: build DNS query with specified record type */
+static int build_dns_query_type(uint8_t *buf, size_t buf_len,
+                                const char *hostname, uint16_t qtype);
 
-static void dot_hkdf_extract(uint8_t out[32],
-                             const uint8_t *salt, size_t salt_len,
-                             const uint8_t *ikm, size_t ikm_len) {
-    dot_hmac_sha256(out, salt, salt_len, ikm, ikm_len);
-}
+/*
+ * DNSCrypt v2 certificate layout (from TXT record):
+ *   "DNSC" magic       (4 bytes)
+ *   es_version          (2 bytes, big-endian) -- 0x0002 = XSalsa20-Poly1305
+ *   protocol_minor      (2 bytes, big-endian)
+ *   signature           (64 bytes) -- Ed25519 over cert body [72..end]
+ *   resolver_pk          (32 bytes) -- X25519 public key for encrypted queries
+ *   client_magic         (8 bytes)  -- magic to prepend to encrypted queries
+ *   serial               (4 bytes, big-endian)
+ *   ts_start             (4 bytes, big-endian) -- cert validity start
+ *   ts_end               (4 bytes, big-endian) -- cert validity end
+ *   extensions           (variable, may be empty)
+ *
+ * Minimum cert size: 4 + 2 + 2 + 64 + 32 + 8 + 4 + 4 + 4 = 124 bytes
+ */
+#define DNSCRYPT_CERT_MAGIC      "DNSC"
+#define DNSCRYPT_CERT_MAGIC_LEN  4
+#define DNSCRYPT_CERT_MIN_LEN    124
+#define DNSCRYPT_ES_V1_XSALSA   0x0001  /* XSalsa20-Poly1305 (original) */
+#define DNSCRYPT_ES_V2_XSALSA   0x0002  /* XSalsa20-Poly1305 (v2) */
 
-/* HKDF-Expand-Label for TLS 1.3:
- *   struct { uint16 length; opaque label<7..255>; opaque context<0..255>; } HkdfLabel;
- *   HKDF-Expand(secret, HkdfLabel, out_len) */
-static void dot_hkdf_expand_label(uint8_t *out, size_t out_len,
-                                  const uint8_t secret[32],
-                                  const char *label, size_t label_len,
-                                  const uint8_t *ctx, size_t ctx_len) {
-    /* Build HkdfLabel */
-    uint8_t info[512];
-    size_t pos = 0;
-    info[pos++] = (uint8_t)(out_len >> 8);
-    info[pos++] = (uint8_t)(out_len);
-    info[pos++] = (uint8_t)(6 + label_len); /* "tls13 " + label */
-    memcpy(info + pos, "tls13 ", 6); pos += 6;
-    memcpy(info + pos, label, label_len); pos += label_len;
-    info[pos++] = (uint8_t)ctx_len;
-    if (ctx_len > 0) { memcpy(info + pos, ctx, ctx_len); pos += ctx_len; }
+/* Parsed DNSCrypt v2 certificate */
+typedef struct {
+    uint8_t  resolver_pk[32]; /* X25519 public key for crypto_box */
+    uint8_t  client_magic[8]; /* Magic bytes to use in query header */
+    uint32_t serial;
+    uint32_t ts_start;
+    uint32_t ts_end;
+} dnscrypt_cert_t;
 
-    /* HKDF-Expand: T(1) = HMAC(secret, info || 0x01)
-     * For out_len <= 32, one iteration suffices */
-    uint8_t tmp[512 + 1];
-    memcpy(tmp, info, pos);
-    tmp[pos] = 0x01;
-    uint8_t block[32];
-    dot_hmac_sha256(block, secret, 32, tmp, pos + 1);
-    memcpy(out, block, out_len < 32 ? out_len : 32);
-
-    /* If out_len > 32 (only for IV=12, so not needed, but be safe) */
-    sodium_memzero(block, sizeof(block));
-    sodium_memzero(tmp, sizeof(tmp));
-}
-
-static void dot_derive_secret(uint8_t out[32], const uint8_t secret[32],
-                              const char *label, size_t label_len,
-                              const uint8_t *hash, size_t hash_len) {
-    dot_hkdf_expand_label(out, 32, secret, label, label_len, hash, hash_len);
-}
-
-/* ---- Reliable I/O helpers ---- */
-
-static int dot_send_all(int fd, const uint8_t *buf, size_t len) {
-    size_t sent = 0;
-    while (sent < len) {
-        ssize_t n = send(fd, (const char *)buf + sent, len - sent, MSG_NOSIGNAL);
-        if (n <= 0) return -1;
-        sent += (size_t)n;
-    }
-    return 0;
-}
-
-static int dot_recv_all(int fd, uint8_t *buf, size_t len) {
-    size_t got = 0;
-    while (got < len) {
-        ssize_t n = recv(fd, (char *)buf + got, len - got, 0);
-        if (n <= 0) return -1;
-        got += (size_t)n;
-    }
-    return 0;
-}
-
-/* ---- TLS 1.3 record layer ---- */
-
-/* Send a TLS record.  If key is NULL, send plaintext. */
-static int dot_tls_send(int fd, uint8_t content_type,
-                        const uint8_t *data, size_t data_len,
-                        const uint8_t *key, const uint8_t *iv,
-                        uint64_t *seq) {
-    if (data_len > 16384) return -1; /* TLS record size limit */
-    uint8_t rec[5 + 16384 + 256];
-    if (!key) {
-        /* Plaintext record */
-        rec[0] = content_type;
-        rec[1] = 0x03; rec[2] = (content_type == 0x16) ? 0x01 : 0x03; /* 0x0301 for CH, 0x0303 for CCS */
-        rec[3] = (uint8_t)(data_len >> 8);
-        rec[4] = (uint8_t)(data_len);
-        memcpy(rec + 5, data, data_len);
-        return dot_send_all(fd, rec, 5 + data_len);
-    }
-    /* Encrypted record: plaintext || inner_content_type, then AEAD */
-    size_t inner_len = data_len + 1; /* +1 for inner content type */
-    size_t cipher_len = inner_len + 16; /* +16 for AEAD tag */
-    rec[0] = 0x17; /* application_data */
-    rec[1] = 0x03; rec[2] = 0x03; /* TLS 1.2 */
-    rec[3] = (uint8_t)(cipher_len >> 8);
-    rec[4] = (uint8_t)(cipher_len);
-
-    /* Build nonce: IV XOR seq (big-endian, 12 bytes) */
-    uint8_t nonce[12];
-    memcpy(nonce, iv, 12);
-    for (int i = 0; i < 8; i++)
-        nonce[4 + i] ^= (uint8_t)(*seq >> (56 - 8 * i));
-
-    /* Plaintext = data || content_type */
-    uint8_t pt[16384 + 1];
-    memcpy(pt, data, data_len);
-    pt[data_len] = content_type;
-
-    unsigned long long clen;
-    crypto_aead_chacha20poly1305_ietf_encrypt(
-        rec + 5, &clen, pt, inner_len, rec, 5, NULL, nonce, key);
-    (*seq)++;
-    sodium_memzero(pt, inner_len);
-    return dot_send_all(fd, rec, 5 + (size_t)clen);
-}
-
-/* Receive a TLS record. If key is NULL, receive plaintext.
- * Returns content type, writes payload to out, sets *out_len.
- * Returns -1 on error. */
-static int dot_tls_recv(int fd, uint8_t *out, size_t out_size,
-                        size_t *out_len,
-                        const uint8_t *key, const uint8_t *iv,
-                        uint64_t *seq) {
-    uint8_t hdr[5];
-    if (dot_recv_all(fd, hdr, 5) != 0) return -1;
-
-    uint16_t frag_len = ((uint16_t)hdr[3] << 8) | hdr[4];
-    if (frag_len > 16384 + 256) return -1;
-
-    uint8_t frag[16384 + 256];
-    if (dot_recv_all(fd, frag, frag_len) != 0) return -1;
-
-    /* ChangeCipherSpec (0x14): silently ignore */
-    if (hdr[0] == 0x14) {
-        *out_len = 0;
-        return 0x14;
-    }
-
-    if (!key) {
-        /* Plaintext */
-        if (frag_len > out_size) return -1;
-        memcpy(out, frag, frag_len);
-        *out_len = frag_len;
-        return hdr[0];
-    }
-
-    /* Decrypt */
-    uint8_t nonce[12];
-    memcpy(nonce, iv, 12);
-    for (int i = 0; i < 8; i++)
-        nonce[4 + i] ^= (uint8_t)(*seq >> (56 - 8 * i));
-
-    if (frag_len > out_size + 16) return -1; /* plaintext can't fit */
-    unsigned long long plen;
-    if (crypto_aead_chacha20poly1305_ietf_decrypt(
-            out, &plen, NULL, frag, frag_len, hdr, 5, nonce, key) != 0)
-        return -1;
-    (*seq)++;
-
-    if (plen == 0) return -1;
-    /* Last byte of plaintext is the inner content type */
-    uint8_t inner_type = out[plen - 1];
-    *out_len = (size_t)(plen - 1);
-    return inner_type;
-}
-
-/* ---- TLS 1.3 ClientHello builder ---- */
-
-static int dot_build_client_hello(uint8_t *buf, size_t buf_len,
-                                  const uint8_t eph_pk[32],
-                                  const char *sni,
-                                  uint8_t client_random[32]) {
-    if (buf_len < 512) return -1;
-    randombytes_buf(client_random, 32);
-
-    uint8_t session_id[32];
-    randombytes_buf(session_id, 32);
-
-    /* We build the handshake message body first, then prepend the header */
-    uint8_t body[512];
-    size_t p = 0;
-
-    /* ProtocolVersion (legacy) */
-    body[p++] = 0x03; body[p++] = 0x03;
-    /* Random */
-    memcpy(body + p, client_random, 32); p += 32;
-    /* SessionID */
-    body[p++] = 32;
-    memcpy(body + p, session_id, 32); p += 32;
-    /* CipherSuites: length=2, TLS_CHACHA20_POLY1305_SHA256 (0x1303) */
-    body[p++] = 0x00; body[p++] = 0x02;
-    body[p++] = 0x13; body[p++] = 0x03;
-    /* Compression: length=1, null */
-    body[p++] = 0x01; body[p++] = 0x00;
-
-    /* Extensions */
-    size_t ext_start = p;
-    p += 2; /* placeholder for extensions length */
-
-    /* supported_versions (0x002b): offer TLS 1.3 only */
-    body[p++] = 0x00; body[p++] = 0x2b;
-    body[p++] = 0x00; body[p++] = 0x03; /* ext len */
-    body[p++] = 0x02; /* list len */
-    body[p++] = 0x03; body[p++] = 0x04; /* TLS 1.3 */
-
-    /* supported_groups (0x000a): x25519 only */
-    body[p++] = 0x00; body[p++] = 0x0a;
-    body[p++] = 0x00; body[p++] = 0x04;
-    body[p++] = 0x00; body[p++] = 0x02;
-    body[p++] = 0x00; body[p++] = 0x1d; /* x25519 */
-
-    /* signature_algorithms (0x000d) */
-    body[p++] = 0x00; body[p++] = 0x0d;
-    body[p++] = 0x00; body[p++] = 0x0a; /* ext len */
-    body[p++] = 0x00; body[p++] = 0x08; /* list len */
-    body[p++] = 0x04; body[p++] = 0x03; /* ecdsa_secp256r1_sha256 */
-    body[p++] = 0x05; body[p++] = 0x03; /* ecdsa_secp384r1_sha384 */
-    body[p++] = 0x08; body[p++] = 0x04; /* rsa_pss_rsae_sha256 */
-    body[p++] = 0x08; body[p++] = 0x06; /* rsa_pss_rsae_sha512 */
-
-    /* key_share (0x0033): x25519 */
-    body[p++] = 0x00; body[p++] = 0x33;
-    body[p++] = 0x00; body[p++] = 0x26; /* ext len = 38 */
-    body[p++] = 0x00; body[p++] = 0x24; /* client shares len = 36 */
-    body[p++] = 0x00; body[p++] = 0x1d; /* group: x25519 */
-    body[p++] = 0x00; body[p++] = 0x20; /* key len = 32 */
-    memcpy(body + p, eph_pk, 32); p += 32;
-
-    /* server_name (0x0000) SNI */
-    size_t sni_len = strlen(sni);
-    body[p++] = 0x00; body[p++] = 0x00;
-    uint16_t sni_ext_len = (uint16_t)(sni_len + 5);
-    body[p++] = (uint8_t)(sni_ext_len >> 8); body[p++] = (uint8_t)sni_ext_len;
-    uint16_t sni_list_len = (uint16_t)(sni_len + 3);
-    body[p++] = (uint8_t)(sni_list_len >> 8); body[p++] = (uint8_t)sni_list_len;
-    body[p++] = 0x00; /* host_name type */
-    body[p++] = (uint8_t)(sni_len >> 8); body[p++] = (uint8_t)sni_len;
-    memcpy(body + p, sni, sni_len); p += sni_len;
-
-    /* Fill in extensions length */
-    uint16_t ext_len = (uint16_t)(p - ext_start - 2);
-    body[ext_start]     = (uint8_t)(ext_len >> 8);
-    body[ext_start + 1] = (uint8_t)(ext_len);
-
-    /* Handshake header: type=ClientHello(1), length(3) */
-    if (4 + p > buf_len) return -1;
-    buf[0] = 0x01; /* ClientHello */
-    buf[1] = (uint8_t)(p >> 16);
-    buf[2] = (uint8_t)(p >> 8);
-    buf[3] = (uint8_t)(p);
-    memcpy(buf + 4, body, p);
-
-    sodium_memzero(session_id, 32);
-    return (int)(4 + p);
-}
-
-/* ---- TLS 1.3 ServerHello parser ---- */
-
-static int dot_parse_server_hello(const uint8_t *msg, size_t msg_len,
-                                  uint8_t server_pk[32]) {
-    /* msg starts at handshake body (after type+length header) */
-    if (msg_len < 2 + 32 + 1) return -1;
-    size_t p = 0;
-    p += 2; /* version */
-    p += 32; /* server random */
-    uint8_t sid_len = msg[p++];
-    if (p + sid_len > msg_len) return -1;
-    p += sid_len;
-    if (p + 3 > msg_len) return -1;
-    uint16_t cipher = ((uint16_t)msg[p] << 8) | msg[p + 1];
-    if (cipher != 0x1303) return -1; /* must be chacha20poly1305 */
-    p += 2;
-    p += 1; /* compression */
-
-    /* Extensions */
-    if (p + 2 > msg_len) return -1;
-    uint16_t ext_total = ((uint16_t)msg[p] << 8) | msg[p + 1];
-    p += 2;
-    size_t ext_end = p + ext_total;
-    if (ext_end > msg_len) return -1;
-
-    int got_key = 0, got_version = 0;
-    while (p + 4 <= ext_end) {
-        uint16_t etype = ((uint16_t)msg[p] << 8) | msg[p + 1];
-        uint16_t elen  = ((uint16_t)msg[p + 2] << 8) | msg[p + 3];
-        p += 4;
-        if (p + elen > ext_end) return -1;
-
-        if (etype == 0x0033 && elen >= 36) { /* key_share */
-            /* group(2) + key_len(2) + key(32) */
-            uint16_t group = ((uint16_t)msg[p] << 8) | msg[p + 1];
-            if (group != 0x001d) return -1; /* x25519 */
-            memcpy(server_pk, msg + p + 4, 32);
-            got_key = 1;
-        } else if (etype == 0x002b && elen >= 2) { /* supported_versions */
-            uint16_t ver = ((uint16_t)msg[p] << 8) | msg[p + 1];
-            if (ver != 0x0304) return -1; /* must be TLS 1.3 */
-            got_version = 1;
-        }
-        p += elen;
-    }
-    return (got_key && got_version) ? 0 : -1;
-}
-
-/* ---- ASN.1 DER helpers for SPKI extraction ---- */
-
-/* Read DER tag and length at pos. Returns header size, sets *content_len.
- * Returns 0 on error. */
-static size_t dot_asn1_read_tl(const uint8_t *buf, size_t buf_len,
-                               size_t pos, size_t *content_len) {
-    if (pos >= buf_len) return 0;
-    pos++; /* skip tag byte */
-    if (pos >= buf_len) return 0;
-
-    uint8_t b = buf[pos];
-    if (b < 0x80) {
-        *content_len = b;
-        return 2; /* 1 tag + 1 length */
-    }
-    size_t num_bytes = b & 0x7F;
-    if (num_bytes == 0 || num_bytes > 3 || pos + num_bytes >= buf_len) return 0;
-    size_t len = 0;
-    for (size_t i = 0; i < num_bytes; i++)
-        len = (len << 8) | buf[pos + 1 + i];
-    *content_len = len;
-    return 2 + num_bytes;
-}
-
-/* Skip one TLV at pos. Returns new position, or 0 on error. */
-static size_t dot_asn1_skip(const uint8_t *buf, size_t buf_len, size_t pos) {
-    size_t content_len;
-    size_t hdr = dot_asn1_read_tl(buf, buf_len, pos, &content_len);
-    if (hdr == 0) return 0;
-    size_t end = pos + hdr + content_len;
-    return (end <= buf_len) ? end : 0;
-}
-
-/* Extract SPKI from DER X.509 certificate and verify pin.
- * Returns 0 if pin matches, -1 otherwise. */
-static int dot_verify_spki_pin(const uint8_t *cert, size_t cert_len,
-                               const uint8_t leaf_pin[32],
-                               const uint8_t ca_pin[32]) {
-    size_t content_len, hdr_len;
-    /* Outer SEQUENCE (Certificate) */
-    hdr_len = dot_asn1_read_tl(cert, cert_len, 0, &content_len);
-    if (hdr_len == 0) return -1;
-    size_t tbs_start = hdr_len;
-
-    /* TBSCertificate SEQUENCE */
-    hdr_len = dot_asn1_read_tl(cert, cert_len, tbs_start, &content_len);
-    if (hdr_len == 0) return -1;
-    size_t pos = tbs_start + hdr_len; /* inside TBS */
-
-    /* Field 1: version [0] EXPLICIT (optional) */
-    if (pos < cert_len && cert[pos] == 0xA0) {
-        pos = dot_asn1_skip(cert, cert_len, pos);
-        if (pos == 0) return -1;
-    }
-    /* Field 2: serialNumber INTEGER */
-    pos = dot_asn1_skip(cert, cert_len, pos);
-    if (pos == 0) return -1;
-    /* Field 3: signature AlgorithmIdentifier */
-    pos = dot_asn1_skip(cert, cert_len, pos);
-    if (pos == 0) return -1;
-    /* Field 4: issuer Name */
-    pos = dot_asn1_skip(cert, cert_len, pos);
-    if (pos == 0) return -1;
-    /* Field 5: validity SEQUENCE */
-    pos = dot_asn1_skip(cert, cert_len, pos);
-    if (pos == 0) return -1;
-    /* Field 6: subject Name */
-    pos = dot_asn1_skip(cert, cert_len, pos);
-    if (pos == 0) return -1;
-
-    /* Field 7: subjectPublicKeyInfo SEQUENCE -- hash this entire TLV */
-    hdr_len = dot_asn1_read_tl(cert, cert_len, pos, &content_len);
-    if (hdr_len == 0) return -1;
-    size_t spki_total = hdr_len + content_len;
-    if (pos + spki_total > cert_len) return -1;
-
-    uint8_t pin[32];
-    crypto_hash_sha256(pin, cert + pos, spki_total);
-
-    (void)0; /* SPKI pin check — no logging (opsec) */
-
-    if (sodium_memcmp(pin, leaf_pin, 32) == 0) return 0;
-    if (sodium_memcmp(pin, ca_pin, 32) == 0) return 0;
-    return -1;
-}
-
-/* ---- TLS 1.3 handshake + DoT query ---- */
-
-static int dot_query(const dot_provider_t *prov,
-                     const uint8_t *dns_query, size_t dns_query_len,
-                     uint8_t *dns_response, size_t *dns_response_len) {
+/*
+ * Fetch and validate DNSCrypt v2 certificate from the server.
+ *
+ * Sends a plain DNS TXT query for the provider_name to the server's IP:port
+ * via UDP.  The TXT response contains the binary certificate with the
+ * server's short-lived X25519 public key and client_magic.
+ *
+ * Returns 0 on success, -1 on failure.
+ */
+static int fetch_dnscrypt_cert(const dnscrypt_provider_t *prov,
+                               dnscrypt_cert_t *cert_out)
+{
     int fd = -1, ret = -1;
-    uint8_t eph_sk[32], eph_pk[32], server_pk[32];
-    uint8_t client_random[32];
-    uint8_t shared_secret[32];
-    uint8_t early_secret[32], derived1[32], handshake_secret[32];
-    uint8_t c_hs_traffic[32], s_hs_traffic[32];
-    uint8_t s_hs_key[32], s_hs_iv[12], c_hs_key[32], c_hs_iv[12];
-    uint8_t s_app_key[32], s_app_iv[12], c_app_key[32], c_app_iv[12];
-    uint64_t s_hs_seq = 0, c_hs_seq = 0, s_app_seq = 0, c_app_seq = 0;
-    crypto_hash_sha256_state transcript;
 
-    /* Generate ephemeral X25519 keypair */
-    randombytes_buf(eph_sk, 32);
-    crypto_scalarmult_curve25519_base(eph_pk, eph_sk);
+    /* Build a DNS TXT query for the provider name */
+    uint8_t txt_query[512];
+    int qlen = build_dns_query_type(txt_query, sizeof(txt_query),
+                                    prov->provider_name, DNS_TYPE_TXT);
+    if (qlen < 0) {
+        LOG_DEBUG("DNSCrypt cert: failed to build TXT query for %s",
+                  prov->provider_name);
+        return -1;
+    }
 
-    /* TCP connect (dual-stack) */
-    fd = moor_tcp_connect_simple(prov->ip, prov->port);
-    if (fd < 0) goto cleanup;
+    /* Open UDP socket and send to the DNSCrypt server's IP:port */
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        LOG_DEBUG("DNSCrypt cert: socket() failed");
+        return -1;
+    }
 
     struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-    /* === ClientHello === */
-    uint8_t ch_msg[512];
-    int ch_len = dot_build_client_hello(ch_msg, sizeof(ch_msg),
-                                        eph_pk, prov->sni, client_random);
-    if (ch_len < 0) goto cleanup;
-
-    /* Send as plaintext handshake record */
-    if (dot_tls_send(fd, 0x16, ch_msg, (size_t)ch_len, NULL, NULL, NULL) != 0) {
-        LOG_DEBUG("DoT: send ClientHello failed");
+    struct sockaddr_in dest;
+    memset(&dest, 0, sizeof(dest));
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons(prov->port);
+    if (inet_pton(AF_INET, prov->ip, &dest.sin_addr) != 1) {
+        LOG_DEBUG("DNSCrypt cert: invalid provider IP %s", prov->ip);
         goto cleanup;
     }
 
-    /* Start transcript hash */
-    crypto_hash_sha256_init(&transcript);
-    crypto_hash_sha256_update(&transcript, ch_msg, (size_t)ch_len);
-
-    /* === ServerHello === */
-    uint8_t rec_buf[16384 + 256];
-    size_t rec_len;
-    int rtype = dot_tls_recv(fd, rec_buf, sizeof(rec_buf), &rec_len, NULL, NULL, NULL);
-    if (rtype != 0x16 || rec_len < 4) {
-        LOG_DEBUG("DoT: ServerHello recv failed");
+    if (sendto(fd, (const char *)txt_query, (size_t)qlen, 0,
+               (struct sockaddr *)&dest, sizeof(dest)) != qlen) {
+        LOG_DEBUG("DNSCrypt cert: sendto %s:%u failed", prov->ip, prov->port);
         goto cleanup;
     }
 
-    /* Parse handshake header */
-    if (rec_buf[0] != 0x02) goto cleanup; /* ServerHello type */
-    uint32_t sh_body_len = ((uint32_t)rec_buf[1] << 16) |
-                           ((uint32_t)rec_buf[2] << 8) | rec_buf[3];
-    if (4 + sh_body_len > rec_len) goto cleanup;
-
-    if (dot_parse_server_hello(rec_buf + 4, sh_body_len, server_pk) != 0) {
-        LOG_DEBUG("DoT: parse ServerHello failed");
+    /* Receive DNS response */
+    uint8_t resp[4096];
+    ssize_t rlen = recvfrom(fd, (char *)resp, sizeof(resp), 0, NULL, NULL);
+    if (rlen < 12) {
+        LOG_DEBUG("DNSCrypt cert: recvfrom failed or too short (%zd)", rlen);
         goto cleanup;
     }
 
-    /* Add ServerHello to transcript */
-    crypto_hash_sha256_update(&transcript, rec_buf, 4 + sh_body_len);
-
-    /* === Derive handshake keys === */
-    if (crypto_scalarmult_curve25519(shared_secret, eph_sk, server_pk) != 0)
+    /* Parse DNS response to find TXT record(s) containing the cert.
+     * DNS header: 12 bytes, then question section, then answer section. */
+    uint16_t ancount = ((uint16_t)resp[6] << 8) | resp[7];
+    if (ancount == 0) {
+        LOG_DEBUG("DNSCrypt cert: no answer records in TXT response");
         goto cleanup;
+    }
 
-    /* empty_hash = SHA-256("") */
-    uint8_t empty_hash[32];
-    crypto_hash_sha256(empty_hash, NULL, 0);
+    /* Skip question section */
+    size_t off = 12;
+    while (off < (size_t)rlen && resp[off] != 0) {
+        if ((resp[off] & 0xC0) == 0xC0) { off += 2; goto past_qname; }
+        off += 1 + resp[off];
+    }
+    if (off < (size_t)rlen && resp[off] == 0) off++; /* root label */
+past_qname:
+    off += 4; /* QTYPE + QCLASS */
 
-    uint8_t zeros[32] = {0};
+    /* Iterate answer records looking for TXT with a valid cert */
+    uint32_t best_serial = 0;
+    int found = 0;
 
-    /* early_secret = HKDF-Extract(zeros, zeros) -- no PSK */
-    dot_hkdf_extract(early_secret, zeros, 32, zeros, 32);
-    /* derived1 = Derive-Secret(early_secret, "derived", empty_hash) */
-    dot_derive_secret(derived1, early_secret, "derived", 7, empty_hash, 32);
-    /* handshake_secret = HKDF-Extract(derived1, shared_secret) */
-    dot_hkdf_extract(handshake_secret, derived1, 32, shared_secret, 32);
-
-    /* Transcript hash up to CH+SH */
-    crypto_hash_sha256_state transcript_snap;
-    uint8_t hash_ch_sh[32];
-    memcpy(&transcript_snap, &transcript, sizeof(transcript));
-    crypto_hash_sha256_final(&transcript_snap, hash_ch_sh);
-
-    /* Traffic secrets */
-    dot_derive_secret(c_hs_traffic, handshake_secret,
-                      "c hs traffic", 12, hash_ch_sh, 32);
-    dot_derive_secret(s_hs_traffic, handshake_secret,
-                      "s hs traffic", 12, hash_ch_sh, 32);
-
-    /* Derive keys and IVs */
-    dot_hkdf_expand_label(s_hs_key, 32, s_hs_traffic, "key", 3, NULL, 0);
-    dot_hkdf_expand_label(s_hs_iv, 12, s_hs_traffic, "iv", 2, NULL, 0);
-    dot_hkdf_expand_label(c_hs_key, 32, c_hs_traffic, "key", 3, NULL, 0);
-    dot_hkdf_expand_label(c_hs_iv, 12, c_hs_traffic, "iv", 2, NULL, 0);
-
-    /* === Read encrypted handshake messages ===
-     * Server sends: EncryptedExtensions, Certificate, CertificateVerify, Finished
-     * May be split across multiple records, or combined. Also CCS may appear. */
-    uint8_t hs_buf[16384]; /* reassembly buffer for handshake messages */
-    size_t hs_buf_len = 0;
-    int got_ee = 0, got_cert = 0, got_cv = 0, got_finished = 0;
-    int pin_ok = 0;
-    uint8_t hash_before_finished[32]; /* transcript hash before Finished */
-
-    while (!got_finished) {
-        size_t rlen;
-        int ct = dot_tls_recv(fd, rec_buf, sizeof(rec_buf), &rlen, s_hs_key, s_hs_iv, &s_hs_seq);
-        if (ct == 0x14) continue; /* CCS -- ignore */
-        if (ct != 0x16) {
-            LOG_DEBUG("DoT: unexpected record during handshake");
-            goto cleanup;
-        }
-
-        /* Append to reassembly buffer */
-        if (hs_buf_len + rlen > sizeof(hs_buf)) goto cleanup;
-        memcpy(hs_buf + hs_buf_len, rec_buf, rlen);
-        hs_buf_len += rlen;
-
-        /* Process complete handshake messages from buffer */
-        size_t pos = 0;
-        while (pos + 4 <= hs_buf_len) {
-            uint8_t hs_type = hs_buf[pos];
-            uint32_t hs_len = ((uint32_t)hs_buf[pos + 1] << 16) |
-                              ((uint32_t)hs_buf[pos + 2] << 8) | hs_buf[pos + 3];
-            if (pos + 4 + hs_len > hs_buf_len) break; /* incomplete */
-
-            size_t msg_total = 4 + hs_len;
-
-            if (hs_type == 8) { /* EncryptedExtensions */
-                crypto_hash_sha256_update(&transcript, hs_buf + pos, msg_total);
-                got_ee = 1;
-            } else if (hs_type == 11) { /* Certificate */
-                crypto_hash_sha256_update(&transcript, hs_buf + pos, msg_total);
-                /* Parse: skip context(1), cert_list_len(3) */
-                if (hs_len < 4) goto cleanup;
-                size_t cp = pos + 4;
-                uint8_t ctx_len = hs_buf[cp++];
-                cp += ctx_len;
-                if (cp + 3 > pos + msg_total) goto cleanup;
-                /* uint32_t clist_len = (hs_buf[cp]<<16)|(hs_buf[cp+1]<<8)|hs_buf[cp+2]; */
-                cp += 3;
-                /* First cert entry: cert_data_len(3) + cert_data */
-                if (cp + 3 > pos + msg_total) goto cleanup;
-                uint32_t cert_len = ((uint32_t)hs_buf[cp] << 16) |
-                                    ((uint32_t)hs_buf[cp + 1] << 8) | hs_buf[cp + 2];
-                cp += 3;
-                if (cp + cert_len > pos + msg_total) goto cleanup;
-
-                pin_ok = (dot_verify_spki_pin(hs_buf + cp, cert_len,
-                                              prov->leaf_pin, prov->ca_pin) == 0);
-                got_cert = 1;
-            } else if (hs_type == 15) { /* CertificateVerify */
-                /* We don't verify RSA/ECDSA sig (no RSA in libsodium).
-                 * SPKI pin + Finished HMAC is sufficient for our threat model. */
-                crypto_hash_sha256_update(&transcript, hs_buf + pos, msg_total);
-                got_cv = 1;
-            } else if (hs_type == 20) { /* Finished */
-                /* Snapshot transcript BEFORE Finished for verification */
-                memcpy(&transcript_snap, &transcript, sizeof(transcript));
-                crypto_hash_sha256_final(&transcript_snap, hash_before_finished);
-
-                /* Verify Finished: HMAC(finished_key, transcript_hash) */
-                uint8_t finished_key[32];
-                dot_hkdf_expand_label(finished_key, 32, s_hs_traffic,
-                                      "finished", 8, NULL, 0);
-                uint8_t expected[32];
-                dot_hmac_sha256(expected, finished_key, 32,
-                                hash_before_finished, 32);
-                sodium_memzero(finished_key, 32);
-
-                if (hs_len != 32 || sodium_memcmp(hs_buf + pos + 4, expected, 32) != 0) {
-                    LOG_DEBUG("DoT: Finished verify failed");
-                    sodium_memzero(expected, 32);
-                    goto cleanup;
-                }
-                sodium_memzero(expected, 32);
-
-                /* Add Finished to transcript */
-                crypto_hash_sha256_update(&transcript, hs_buf + pos, msg_total);
-                got_finished = 1;
-            } else {
-                /* Unknown handshake message: add to transcript, skip */
-                crypto_hash_sha256_update(&transcript, hs_buf + pos, msg_total);
+    for (uint16_t a = 0; a < ancount && off + 12 <= (size_t)rlen; a++) {
+        /* Skip name (may be compressed) (#R1-B2: skip root-label check
+         * after compression pointer break to avoid double-advancing) */
+        if (off < (size_t)rlen && (resp[off] & 0xC0) == 0xC0) {
+            off += 2;
+        } else {
+            int hit_compression = 0;
+            while (off < (size_t)rlen && resp[off] != 0) {
+                if ((resp[off] & 0xC0) == 0xC0) { off += 2; hit_compression = 1; break; }
+                off += 1 + resp[off];
             }
-
-            pos += msg_total;
+            if (!hit_compression && off < (size_t)rlen && resp[off] == 0) off++; /* root label */
         }
-        /* Shift remaining data in buffer */
-        if (pos > 0 && pos < hs_buf_len) {
-            memmove(hs_buf, hs_buf + pos, hs_buf_len - pos);
-            hs_buf_len -= pos;
-        } else if (pos == hs_buf_len) {
-            hs_buf_len = 0;
+
+        if (off + 10 > (size_t)rlen) break;
+
+        uint16_t rtype = ((uint16_t)resp[off] << 8) | resp[off + 1];
+        /* skip RCLASS(2) + TTL(4) */
+        uint16_t rdlen = ((uint16_t)resp[off + 8] << 8) | resp[off + 9];
+        off += 10;
+
+        if (off + rdlen > (size_t)rlen) break;
+
+        if (rtype != DNS_TYPE_TXT) {
+            off += rdlen;
+            continue;
+        }
+
+        /* TXT RDATA: one or more <length-byte><string> chunks.
+         * DNSCrypt certs may span multiple chunks; reassemble them. */
+        uint8_t cert_buf[1024];
+        size_t cert_len = 0;
+        size_t txt_off = off;
+        size_t txt_end = off + rdlen;
+
+        while (txt_off < txt_end) {
+            uint8_t chunk_len = resp[txt_off++];
+            if (txt_off + chunk_len > txt_end) break;
+            if (cert_len + chunk_len > sizeof(cert_buf)) break;
+            memcpy(cert_buf + cert_len, resp + txt_off, chunk_len);
+            cert_len += chunk_len;
+            txt_off += chunk_len;
+        }
+
+        off += rdlen;
+
+        /* Validate cert structure */
+        if (cert_len < DNSCRYPT_CERT_MIN_LEN) {
+            LOG_DEBUG("DNSCrypt cert: TXT record too short (%zu)", cert_len);
+            continue;
+        }
+
+        /* Check "DNSC" magic */
+        if (memcmp(cert_buf, DNSCRYPT_CERT_MAGIC, DNSCRYPT_CERT_MAGIC_LEN) != 0) {
+            LOG_DEBUG("DNSCrypt cert: bad magic");
+            continue;
+        }
+
+        /* Check es_version == 0x0002 (XSalsa20-Poly1305) */
+        uint16_t es_version = ((uint16_t)cert_buf[4] << 8) | cert_buf[5];
+        if (es_version != DNSCRYPT_ES_V1_XSALSA &&
+            es_version != DNSCRYPT_ES_V2_XSALSA) {
+            LOG_DEBUG("DNSCrypt cert: unsupported es_version 0x%04x", es_version);
+            continue;
+        }
+
+        /* Verify Ed25519 signature over cert body [72..cert_len]
+         * Signature is at cert_buf[8..72) (64 bytes)
+         * Signed data is cert_buf[72..cert_len] */
+        if (crypto_sign_verify_detached(cert_buf + 8,       /* signature */
+                                        cert_buf + 72,      /* message */
+                                        cert_len - 72,      /* message len */
+                                        prov->provider_pk   /* Ed25519 pk */
+                                        ) != 0) {
+            LOG_DEBUG("DNSCrypt cert: Ed25519 signature verification failed");
+            continue;
+        }
+
+        /* Extract fields from the signed portion */
+        /* resolver_pk at [72..104], client_magic at [104..112],
+         * serial at [112..116], ts_start at [116..120], ts_end at [120..124] */
+        uint32_t serial   = ((uint32_t)cert_buf[112] << 24) |
+                            ((uint32_t)cert_buf[113] << 16) |
+                            ((uint32_t)cert_buf[114] << 8)  |
+                            (uint32_t)cert_buf[115];
+        uint32_t ts_start = ((uint32_t)cert_buf[116] << 24) |
+                            ((uint32_t)cert_buf[117] << 16) |
+                            ((uint32_t)cert_buf[118] << 8)  |
+                            (uint32_t)cert_buf[119];
+        uint32_t ts_end   = ((uint32_t)cert_buf[120] << 24) |
+                            ((uint32_t)cert_buf[121] << 16) |
+                            ((uint32_t)cert_buf[122] << 8)  |
+                            (uint32_t)cert_buf[123];
+
+        /* Check time validity */
+        uint32_t now = (uint32_t)time(NULL);
+        if (now < ts_start || now > ts_end) {
+            LOG_DEBUG("DNSCrypt cert: expired or not yet valid "
+                      "(now=%u start=%u end=%u)", now, ts_start, ts_end);
+            continue;
+        }
+
+        /* Prefer the certificate with the highest serial number */
+        if (!found || serial > best_serial) {
+            memcpy(cert_out->resolver_pk, cert_buf + 72, 32);
+            memcpy(cert_out->client_magic, cert_buf + 104, 8);
+            cert_out->serial   = serial;
+            cert_out->ts_start = ts_start;
+            cert_out->ts_end   = ts_end;
+            best_serial = serial;
+            found = 1;
         }
     }
 
-    if (!got_ee || !got_cert || !got_cv || !pin_ok) {
-        LOG_DEBUG("DoT: handshake incomplete");
-        goto cleanup;
-    }
-
-    /* === Send Client Finished + Derive App Keys === */
-    /* TLS 1.3: app traffic secrets use transcript through server Finished only,
-     * so we snapshot the hash BEFORE adding client Finished */
-    uint8_t hash_sf[32]; /* transcript hash through server Finished */
-    memcpy(&transcript_snap, &transcript, sizeof(transcript));
-    crypto_hash_sha256_final(&transcript_snap, hash_sf);
-
-    {
-        uint8_t hash_for_cfin[32];
-        memcpy(hash_for_cfin, hash_sf, 32); /* same transcript state */
-
-        uint8_t cfin_key[32];
-        dot_hkdf_expand_label(cfin_key, 32, c_hs_traffic, "finished", 8, NULL, 0);
-        uint8_t cfin_data[32];
-        dot_hmac_sha256(cfin_data, cfin_key, 32, hash_for_cfin, 32);
-        sodium_memzero(cfin_key, 32);
-
-        /* Handshake message: Finished(20) + length(3) + verify_data(32) */
-        uint8_t cfin_msg[36];
-        cfin_msg[0] = 0x14; /* Finished */
-        cfin_msg[1] = 0x00; cfin_msg[2] = 0x00; cfin_msg[3] = 0x20;
-        memcpy(cfin_msg + 4, cfin_data, 32);
-        sodium_memzero(cfin_data, 32);
-
-        /* Send CCS for middlebox compat (before encrypted Finished) */
-        uint8_t ccs = 0x01;
-        if (dot_tls_send(fd, 0x14, &ccs, 1, NULL, NULL, NULL) != 0) {
-            LOG_DEBUG("DoT: send CCS failed");
-            goto cleanup;
-        }
-
-        if (dot_tls_send(fd, 0x16, cfin_msg, 36, c_hs_key, c_hs_iv, &c_hs_seq) != 0) {
-            LOG_DEBUG("DoT: send client Finished failed");
-            goto cleanup;
-        }
-
-        /* Update transcript with client Finished (for resumption, not app keys) */
-        crypto_hash_sha256_update(&transcript, cfin_msg, 36);
-    }
-
-    /* handshake complete — derive app keys (no logging) */
-
-    /* === Derive application keys === */
-    {
-        uint8_t derived2[32], master_secret[32];
-        dot_derive_secret(derived2, handshake_secret, "derived", 7, empty_hash, 32);
-        dot_hkdf_extract(master_secret, derived2, 32, zeros, 32);
-
-        uint8_t c_app_traffic[32], s_app_traffic[32];
-        dot_derive_secret(c_app_traffic, master_secret,
-                          "c ap traffic", 12, hash_sf, 32);
-        dot_derive_secret(s_app_traffic, master_secret,
-                          "s ap traffic", 12, hash_sf, 32);
-
-        dot_hkdf_expand_label(s_app_key, 32, s_app_traffic, "key", 3, NULL, 0);
-        dot_hkdf_expand_label(s_app_iv, 12, s_app_traffic, "iv", 2, NULL, 0);
-        dot_hkdf_expand_label(c_app_key, 32, c_app_traffic, "key", 3, NULL, 0);
-        dot_hkdf_expand_label(c_app_iv, 12, c_app_traffic, "iv", 2, NULL, 0);
-
-        sodium_memzero(derived2, 32);
-        sodium_memzero(master_secret, 32);
-        sodium_memzero(c_app_traffic, 32);
-        sodium_memzero(s_app_traffic, 32);
-    }
-
-    /* === Send DNS query over TLS === */
-    {
-        /* DNS-over-TLS uses the same 2-byte length prefix as DNS-over-TCP */
-        uint8_t dns_msg[2 + 512];
-        dns_msg[0] = (uint8_t)(dns_query_len >> 8);
-        dns_msg[1] = (uint8_t)(dns_query_len);
-        memcpy(dns_msg + 2, dns_query, dns_query_len);
-
-        if (dot_tls_send(fd, 0x17, dns_msg, 2 + dns_query_len,
-                         c_app_key, c_app_iv, &c_app_seq) != 0) {
-            LOG_DEBUG("DoT: send DNS query failed");
-            goto cleanup;
-        }
-        /* DNS query sent — no logging (opsec) */
-    }
-
-    /* === Read DNS response over TLS === */
-    {
-        /* May need to skip NewSessionTicket messages (handshake type 4) */
-        for (int attempts = 0; attempts < 5; attempts++) {
-            size_t rlen;
-            int ct = dot_tls_recv(fd, rec_buf, sizeof(rec_buf), &rlen,
-                                  s_app_key, s_app_iv, &s_app_seq);
-            if (ct == 0x16) { continue; } /* skip post-handshake msgs (NewSessionTicket) */
-            if (ct == 0x15 && rlen >= 2) {
-                LOG_DEBUG("DoT: TLS alert received");
-                goto cleanup;
-            }
-            if (ct != 0x17) {
-                LOG_DEBUG("DoT: unexpected app record");
-                goto cleanup;
-            }
-
-            /* Parse 2-byte DNS length prefix */
-            if (rlen < 2) goto cleanup;
-            uint16_t dns_len = ((uint16_t)rec_buf[0] << 8) | rec_buf[1];
-            if ((size_t)dns_len + 2 > rlen || dns_len > *dns_response_len) goto cleanup;
-
-            memcpy(dns_response, rec_buf + 2, dns_len);
-            *dns_response_len = dns_len;
-            ret = 0;
-            break;
-        }
+    if (found) {
+        LOG_DEBUG("DNSCrypt cert: valid cert from %s (serial %u)",
+                  prov->provider_name, best_serial);
+        ret = 0;
+    } else {
+        LOG_DEBUG("DNSCrypt cert: no valid cert found from %s",
+                  prov->provider_name);
     }
 
 cleanup:
     if (fd >= 0) close(fd);
-    sodium_memzero(eph_sk, 32);
-    sodium_memzero(shared_secret, 32);
-    sodium_memzero(early_secret, 32);
-    sodium_memzero(derived1, 32);
-    sodium_memzero(handshake_secret, 32);
-    sodium_memzero(c_hs_traffic, 32);
-    sodium_memzero(s_hs_traffic, 32);
-    sodium_memzero(s_hs_key, 32);
-    sodium_memzero(c_hs_key, 32);
-    sodium_memzero(s_app_key, 32);
-    sodium_memzero(c_app_key, 32);
-    sodium_memzero(s_app_iv, 12);
-    sodium_memzero(c_app_iv, 12);
-    sodium_memzero(s_hs_iv, 12);
-    sodium_memzero(c_hs_iv, 12);
-    sodium_memzero(hs_buf, sizeof(hs_buf));
+    return ret;
+}
+
+/*
+ * DNSCrypt v2 query: send encrypted DNS query to a DNSCrypt server.
+ *
+ * Protocol (correct v2 flow):
+ *   1. Fetch server certificate via unencrypted DNS TXT query to provider_name
+ *      - The cert is signed by the provider's Ed25519 long-term key
+ *      - It contains the server's short-lived X25519 public key (resolver_pk)
+ *        and the client_magic bytes for query headers
+ *   2. Generate ephemeral X25519 keypair
+ *   3. Derive shared key: HSalsa20(X25519(client_sk, resolver_pk))
+ *   4. Build query packet:
+ *      - client_magic(8) + client_pk(32) + client_nonce(12)
+ *      - XSalsa20-Poly1305 encrypted DNS query (padded to 256+ bytes)
+ *   5. Send via TCP with 2-byte length prefix
+ *   6. Receive response, decrypt with same shared key + server nonce
+ *
+ * The provider_pk (Ed25519) is used ONLY to verify the certificate signature.
+ * The resolver_pk (X25519) from the cert is used for the encrypted query.
+ */
+static int dnscrypt_query(const dnscrypt_provider_t *prov,
+                          const uint8_t *dns_query, size_t dns_query_len,
+                          uint8_t *dns_response, size_t *dns_response_len)
+{
+    int fd = -1, ret = -1;
+    uint8_t client_pk[crypto_box_PUBLICKEYBYTES];
+    uint8_t client_sk[crypto_box_SECRETKEYBYTES];
+    uint8_t shared_key[crypto_box_BEFORENMBYTES];
+    uint8_t padded_query[512];
+    uint8_t full_nonce[crypto_box_NONCEBYTES]; /* 24 bytes */
+    uint8_t decrypted[4096];
+
+    memset(padded_query, 0, sizeof(padded_query));
+    memset(full_nonce, 0, sizeof(full_nonce));
+    memset(decrypted, 0, sizeof(decrypted));
+
+    /* Step 1: Fetch the DNSCrypt v2 certificate from the server.
+     * This gives us the resolver's X25519 public key and client_magic,
+     * verified against the provider's long-term Ed25519 signing key. */
+    dnscrypt_cert_t cert;
+    if (fetch_dnscrypt_cert(prov, &cert) != 0) {
+        LOG_WARN("DNSCrypt: failed to fetch cert from %s:%u (%s), "
+                 "cannot send encrypted query",
+                 prov->ip, prov->port, prov->provider_name);
+        return -1;
+    }
+
+    /* Step 2: Generate ephemeral X25519 keypair */
+    crypto_box_keypair(client_pk, client_sk);
+
+    /* Step 3: Compute shared key using the RESOLVER's X25519 pk from the cert
+     * (NOT the provider's Ed25519 signing key!) */
+    if (crypto_box_beforenm(shared_key, cert.resolver_pk, client_sk) != 0) {
+        LOG_DEBUG("DNSCrypt: crypto_box_beforenm failed");
+        goto cleanup;
+    }
+
+    /* Generate 12-byte random client nonce */
+    uint8_t client_nonce[12];
+    randombytes_buf(client_nonce, sizeof(client_nonce));
+
+    /* Build full 24-byte nonce for XSalsa20: client_nonce(12) + zeros(12) */
+    memcpy(full_nonce, client_nonce, 12);
+    /* remaining 12 bytes already zeroed */
+
+    /* Pad DNS query to at least 256 bytes (DNSCrypt minimum) */
+    size_t padded_len = dns_query_len < 256 ? 256 : dns_query_len;
+    if (padded_len > sizeof(padded_query)) {
+        LOG_DEBUG("DNSCrypt: query too large");
+        goto cleanup;
+    }
+    memcpy(padded_query, dns_query, dns_query_len);
+    if (padded_len > dns_query_len)
+        memset(padded_query + dns_query_len, 0, padded_len - dns_query_len);
+
+    /* Encrypt: XSalsa20-Poly1305 */
+    uint8_t ciphertext[512 + crypto_box_MACBYTES];
+    if (crypto_box_easy_afternm(ciphertext, padded_query, padded_len,
+                                full_nonce, shared_key) != 0) {
+        LOG_DEBUG("DNSCrypt: encryption failed");
+        goto cleanup;
+    }
+    size_t ciphertext_len = padded_len + crypto_box_MACBYTES;
+
+    /* Step 4: Build DNSCrypt query packet:
+     * client_magic(8) + client_pk(32) + client_nonce(12) + ciphertext
+     * client_magic comes from the certificate, NOT a hardcoded constant. */
+    size_t packet_len = 8 + 32 + 12 + ciphertext_len;
+    uint8_t packet[8 + 32 + 12 + 512 + crypto_box_MACBYTES];
+    if (packet_len > sizeof(packet)) {
+        LOG_DEBUG("DNSCrypt: packet too large");
+        goto cleanup;
+    }
+
+    size_t off = 0;
+    memcpy(packet + off, cert.client_magic, 8); off += 8;
+    memcpy(packet + off, client_pk, 32);        off += 32;
+    memcpy(packet + off, client_nonce, 12);     off += 12;
+    memcpy(packet + off, ciphertext, ciphertext_len);
+    /* off not advanced — last field, total_len already computed */
+
+    /* Step 5: TCP connect */
+    fd = moor_tcp_connect_simple(prov->ip, prov->port);
+    if (fd < 0) {
+        LOG_DEBUG("DNSCrypt: TCP connect to %s:%u failed", prov->ip, prov->port);
+        goto cleanup;
+    }
+
+    moor_setsockopt_timeo(fd, SO_SNDTIMEO, 5);
+    moor_setsockopt_timeo(fd, SO_RCVTIMEO, 5);
+
+    /* Send via TCP with 2-byte big-endian length prefix */
+    uint8_t len_prefix[2];
+    len_prefix[0] = (uint8_t)(packet_len >> 8);
+    len_prefix[1] = (uint8_t)(packet_len);
+
+    if (send(fd, (const char *)len_prefix, 2, MSG_NOSIGNAL) != 2 ||
+        send(fd, (const char *)packet, (int)packet_len, MSG_NOSIGNAL) != (ssize_t)packet_len) {
+        LOG_DEBUG("DNSCrypt: send failed");
+        goto cleanup;
+    }
+
+    /* Step 6: Receive response with 2-byte length prefix */
+    uint8_t resp_len_buf[2];
+    if (recv(fd, (char *)resp_len_buf, 2, MSG_WAITALL) != 2) {
+        LOG_DEBUG("DNSCrypt: recv length failed");
+        goto cleanup;
+    }
+    uint16_t resp_total = ((uint16_t)resp_len_buf[0] << 8) | resp_len_buf[1];
+    if (resp_total < 8 + 24 + crypto_box_MACBYTES || resp_total > 4096) {
+        LOG_DEBUG("DNSCrypt: invalid response length %u", resp_total);
+        goto cleanup;
+    }
+
+    uint8_t resp_buf[4096];
+    size_t resp_got = 0;
+    while (resp_got < resp_total) {
+        ssize_t n = recv(fd, (char *)resp_buf + resp_got,
+                         (int)(resp_total - resp_got), 0);
+        if (n <= 0) {
+            LOG_DEBUG("DNSCrypt: recv response failed");
+            goto cleanup;
+        }
+        resp_got += (size_t)n;
+    }
+
+    /* Parse response: server_magic(8) + server_nonce(24) + encrypted_response
+     * The server nonce's first 12 bytes should match our client_nonce. */
+    if (resp_total < 8 + 24 + crypto_box_MACBYTES) goto cleanup;
+
+    const uint8_t *server_nonce = resp_buf + 8; /* 24 bytes */
+    const uint8_t *encrypted_resp = resp_buf + 8 + 24;
+    size_t encrypted_resp_len = resp_total - 8 - 24;
+
+    /* Verify that server nonce starts with our client nonce */
+    if (sodium_memcmp(server_nonce, client_nonce, 12) != 0) {
+        LOG_DEBUG("DNSCrypt: server nonce mismatch");
+        goto cleanup;
+    }
+
+    /* Decrypt response using server's full 24-byte nonce */
+    if (encrypted_resp_len < crypto_box_MACBYTES ||
+        encrypted_resp_len - crypto_box_MACBYTES > sizeof(decrypted)) {
+        LOG_DEBUG("DNSCrypt: response too large to decrypt");
+        goto cleanup;
+    }
+
+    if (crypto_box_open_easy_afternm(decrypted, encrypted_resp,
+                                     encrypted_resp_len,
+                                     server_nonce, shared_key) != 0) {
+        LOG_DEBUG("DNSCrypt: decryption failed (auth error)");
+        goto cleanup;
+    }
+
+    size_t decrypted_len = encrypted_resp_len - crypto_box_MACBYTES;
+
+    /* Strip DNSCrypt padding: find last non-zero byte after DNS header.
+     * DNSCrypt pads with 0x80 followed by zeros (ISO/IEC 7816-4). */
+    while (decrypted_len > 0 && decrypted[decrypted_len - 1] == 0x00)
+        decrypted_len--;
+    if (decrypted_len > 0 && decrypted[decrypted_len - 1] == 0x80)
+        decrypted_len--;
+
+    if (decrypted_len == 0 || decrypted_len > *dns_response_len) {
+        LOG_DEBUG("DNSCrypt: decrypted response empty or too large");
+        goto cleanup;
+    }
+
+    memcpy(dns_response, decrypted, decrypted_len);
+    *dns_response_len = decrypted_len;
+    ret = 0;
+
+cleanup:
+    if (fd >= 0) close(fd);
+    sodium_memzero(client_sk, sizeof(client_sk));
+    sodium_memzero(shared_key, sizeof(shared_key));
+    sodium_memzero(full_nonce, sizeof(full_nonce));
+    sodium_memzero(padded_query, sizeof(padded_query));
+    sodium_memzero(decrypted, sizeof(decrypted));
+    sodium_memzero(&cert, sizeof(cert));
     return ret;
 }
 
 /* ---- DNS wire format ---- */
 
-/* Build a DNS wireformat query for an A record.
+/* Build a DNS wireformat query for a given record type.
  * Returns query length, or -1 on error. */
-static int build_dns_query(uint8_t *buf, size_t buf_len,
-                           const char *hostname) {
+static int build_dns_query_type(uint8_t *buf, size_t buf_len,
+                                const char *hostname, uint16_t qtype) {
     if (!hostname || strlen(hostname) > 253 || buf_len < 512) return -1;
 
     /* Header: ID=random, flags=0x0100 (RD), QDCOUNT=1 */
@@ -1157,11 +903,18 @@ static int build_dns_query(uint8_t *buf, size_t buf_len,
         label = strtok_r(NULL, ".", &saveptr);
     }
     buf[off++] = 0; /* root label */
-    /* QTYPE=A (1), QCLASS=IN (1) */
-    buf[off++] = 0x00; buf[off++] = 0x01;
+    /* QTYPE (variable), QCLASS=IN (1) */
+    buf[off++] = (uint8_t)(qtype >> 8);
+    buf[off++] = (uint8_t)(qtype);
     buf[off++] = 0x00; buf[off++] = 0x01;
 
     return (int)off;
+}
+
+/* Backwards-compatible wrapper: build DNS A record query */
+static int build_dns_query(uint8_t *buf, size_t buf_len,
+                           const char *hostname) {
+    return build_dns_query_type(buf, buf_len, hostname, DNS_TYPE_A);
 }
 
 /* Parse A record from DNS response. Returns 0 on success. */
@@ -1203,29 +956,33 @@ static int parse_dns_a_record(const uint8_t *resp, size_t rlen,
     return -1;
 }
 
-/* Resolve hostname via DNS-over-TLS to trusted resolvers.
- * Tries Cloudflare, Quad9, Google in order with SPKI pinning.
- * Falls back to system resolver if all DoT providers fail.
+/* Resolve hostname via DNSCrypt v2 to trusted resolvers.
+ * Tries providers in order with pinned X25519 public keys.
  * Returns 0 on success, -1 on failure. */
 static int resolve_dns_encrypted(const char *hostname, char *ip_out, size_t ip_len) {
     uint8_t query[512];
     int qlen = build_dns_query(query, sizeof(query), hostname);
     if (qlen < 0) return -1;
 
-    for (int i = 0; i < DOT_NUM_PROVIDERS; i++) {
+    for (int i = 0; i < DNSCRYPT_NUM_PROVIDERS; i++) {
         uint8_t response[1024];
         size_t rlen = sizeof(response);
-        if (dot_query(&g_dot_providers[i], query, (size_t)qlen,
-                      response, &rlen) == 0) {
+        if (dnscrypt_query(&g_dnscrypt_providers[i], query, (size_t)qlen,
+                           response, &rlen) == 0) {
             if (parse_dns_a_record(response, rlen, ip_out, ip_len) == 0) {
-                LOG_DEBUG("DoT resolved via provider %d", i);
+                LOG_DEBUG("DNSCrypt resolved via provider %d", i);
                 return 0;
             }
         }
-        LOG_DEBUG("DoT provider %d failed, trying next", i);
+        LOG_DEBUG("DNSCrypt provider %d failed, trying next", i);
     }
 
-    LOG_WARN("all DoT providers failed for query");
+    /* Fix CWE-295: NEVER fall back to cleartext system resolver.
+     * A cleartext fallback allows an attacker to force DNSCrypt failures
+     * (block ports, MitM the cert fetch) and then observe plaintext DNS
+     * queries from the exit relay, deanonymizing user traffic.
+     * All DNS resolution MUST go through encrypted channels or fail. */
+    LOG_WARN("all DNSCrypt providers failed, refusing cleartext fallback");
     return -1;
 }
 
@@ -1252,10 +1009,23 @@ void moor_relay_set_consensus(const moor_consensus_t *cons) {
     g_relay_has_consensus = 1;
 }
 
-/* Map exit target FDs back to their circuit+stream for data return */
+const uint8_t *moor_relay_get_identity_pk(void) {
+    return g_relay_config.identity_pk;
+}
+
+const moor_consensus_t *moor_relay_get_consensus(void) {
+    return g_relay_has_consensus ? &g_relay_consensus : NULL;
+}
+
+/* Map exit target FDs back to their circuit+stream for data return.
+ * Stores circuit_id + conn for safe re-lookup via moor_circuit_find()
+ * to prevent UAF if the circuit is freed between event registration
+ * and callback invocation (#CWE-416). */
 typedef struct {
     int fd;
     moor_circuit_t *circ;
+    uint32_t circuit_id;         /* for safe re-lookup after potential free */
+    moor_connection_t *conn;     /* connection the circuit was on */
     uint16_t stream_id;
 } exit_fd_map_t;
 
@@ -1267,6 +1037,8 @@ static int exit_fd_add(int fd, moor_circuit_t *circ, uint16_t stream_id) {
     if (g_exit_fd_count >= MAX_EXIT_FDS) return -1;
     g_exit_fds[g_exit_fd_count].fd = fd;
     g_exit_fds[g_exit_fd_count].circ = circ;
+    g_exit_fds[g_exit_fd_count].circuit_id = circ->circuit_id;
+    g_exit_fds[g_exit_fd_count].conn = circ->prev_conn;
     g_exit_fds[g_exit_fd_count].stream_id = stream_id;
     g_exit_fd_count++;
     return 0;
@@ -1349,8 +1121,19 @@ static void exit_target_read_cb(int fd, int events, void *arg) {
         return;
     }
 
-    moor_circuit_t *circ = map->circ;
     uint16_t stream_id = map->stream_id;
+
+    /* Validate circuit is still live via safe hash lookup (#CWE-416).
+     * The raw circ pointer in the map may be stale if the circuit was
+     * freed between event registration and this callback firing. */
+    moor_circuit_t *circ = moor_circuit_find(map->circuit_id, map->conn);
+    if (!circ) {
+        LOG_WARN("exit: circuit gone for fd=%d stream %u, cleaning up", fd, stream_id);
+        moor_event_remove(fd);
+        close(fd);
+        exit_fd_remove(fd);
+        return;
+    }
 
     /* Flow control: check package windows before reading (Tor-style) */
     moor_stream_t *stream = moor_circuit_find_stream(circ, stream_id);
@@ -1510,6 +1293,47 @@ static int relay_cke_derive(uint8_t key_seed[32], uint8_t auth_tag[32],
 #define CREATE_RATE_LIMIT    10   /* max CREATE cells per connection per window */
 #define CREATE_RATE_WINDOW   5    /* seconds */
 
+/* R10-ADV3: Per-IP circuit count cap to prevent Sybil circuit exhaustion.
+ * Track active circuits per source IP (up to 256 unique IPs). */
+#define MAX_CIRCUITS_PER_IP  32
+#define IP_CIRC_TABLE_SIZE   256
+
+static struct {
+    uint32_t ip;        /* IPv4 in network byte order */
+    int      count;     /* active circuits from this IP */
+} g_ip_circ_table[IP_CIRC_TABLE_SIZE];
+static int g_ip_circ_table_init = 0;
+
+static int ip_circ_count_check(int fd) {
+    if (!g_ip_circ_table_init) {
+        memset(g_ip_circ_table, 0, sizeof(g_ip_circ_table));
+        g_ip_circ_table_init = 1;
+    }
+    struct sockaddr_in sa;
+    socklen_t sa_len = sizeof(sa);
+    if (getpeername(fd, (struct sockaddr *)&sa, &sa_len) != 0)
+        return 0; /* can't determine, allow */
+    if (sa.sin_family != AF_INET) return 0; /* IPv6: skip for now */
+    uint32_t ip = sa.sin_addr.s_addr;
+    /* Find existing entry or empty slot */
+    int empty_slot = -1;
+    for (int i = 0; i < IP_CIRC_TABLE_SIZE; i++) {
+        if (g_ip_circ_table[i].ip == ip && g_ip_circ_table[i].count > 0) {
+            if (g_ip_circ_table[i].count >= MAX_CIRCUITS_PER_IP)
+                return -1; /* over limit */
+            g_ip_circ_table[i].count++;
+            return 0;
+        }
+        if (empty_slot < 0 && g_ip_circ_table[i].count == 0)
+            empty_slot = i;
+    }
+    if (empty_slot >= 0) {
+        g_ip_circ_table[empty_slot].ip = ip;
+        g_ip_circ_table[empty_slot].count = 1;
+    }
+    return 0;
+}
+
 int moor_relay_handle_create(moor_connection_t *conn,
                              const moor_cell_t *cell) {
     /* Per-connection CREATE rate limit to prevent circuit pool exhaustion */
@@ -1521,6 +1345,13 @@ int moor_relay_handle_create(moor_connection_t *conn,
     if (++conn->create_window_count > CREATE_RATE_LIMIT) {
         LOG_WARN("CREATE rate limit exceeded on fd=%d (%u in %us)",
                  conn->fd, conn->create_window_count, CREATE_RATE_WINDOW);
+        return -1;
+    }
+
+    /* R10-ADV3: Per-IP circuit count cap */
+    if (ip_circ_count_check(conn->fd) != 0) {
+        LOG_WARN("CREATE: per-IP circuit limit (%d) exceeded on fd=%d",
+                 MAX_CIRCUITS_PER_IP, conn->fd);
         return -1;
     }
 
@@ -1624,6 +1455,18 @@ int moor_relay_handle_create(moor_connection_t *conn,
 /* Handle CREATE_PQ: CKE handshake + mark circuit PQ-capable */
 int moor_relay_handle_create_pq(moor_connection_t *conn,
                                 const moor_cell_t *cell) {
+    /* Per-connection CREATE_PQ rate limit (mirrors CREATE rate limit) */
+    uint64_t now = (uint64_t)time(NULL);
+    if (now - conn->create_window_start >= CREATE_RATE_WINDOW) {
+        conn->create_window_start = now;
+        conn->create_window_count = 0;
+    }
+    if (++conn->create_window_count > CREATE_RATE_LIMIT) {
+        LOG_WARN("CREATE_PQ rate limit exceeded on fd=%d (%u in %us)",
+                 conn->fd, conn->create_window_count, CREATE_RATE_WINDOW);
+        return -1;
+    }
+
     /* CKE format: [expected_identity(32)][client_eph_pk(32)] */
     uint8_t expected_id[32], client_eph_pk[32];
     memcpy(expected_id, cell->payload, 32);
@@ -1705,9 +1548,8 @@ int moor_relay_handle_create_pq(moor_connection_t *conn,
     circ->pq_kem_pending = 1;
     LOG_INFO("CREATE_PQ: DH done, awaiting KEM CT cells for circuit %u",
              cell->circuit_id);
-    goto done;
 
-done:
+    /* Cleanup and register circuit */
     moor_crypto_wipe(eph_sk, 32);
     moor_crypto_wipe(our_curve_sk, 32);
     moor_crypto_wipe(dh1, 32);
@@ -1898,6 +1740,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                 w->prev_circuit_id = circ->prev_circuit_id;
                 w->next_circuit_id = next_circ_id;
                 w->prev_conn = circ->prev_conn;
+                w->prev_conn_generation = circ->prev_conn->generation;
 
                 circ->extend_pending = 1;
 
@@ -2064,6 +1907,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                 w->prev_circuit_id = circ->prev_circuit_id;
                 w->next_circuit_id = next_circ_id;
                 w->prev_conn = circ->prev_conn;
+                w->prev_conn_generation = circ->prev_conn->generation;
                 circ->extend_pending = 1;
 
                 if (g_extend_threads >= EXTEND_MAX_THREADS) {
@@ -2254,6 +2098,13 @@ int moor_relay_handle_relay(moor_connection_t *conn,
             sendme_check:
                 if (circ->circ_deliver_window <=
                     MOOR_CIRCUIT_WINDOW - MOOR_SENDME_INCREMENT) {
+                    /* Cap deliver window to prevent unbounded growth */
+                    if (circ->circ_deliver_window + MOOR_SENDME_INCREMENT >
+                        MOOR_CIRCUIT_WINDOW) {
+                        LOG_WARN("SENDME: deliver window would exceed cap on %u",
+                                 circ->circuit_id);
+                        return -1;
+                    }
                     /* SENDME auth (Prop 289): include forward digest */
                     uint8_t sendme_body[8];
                     memcpy(sendme_body, circ->relay_forward_digest, 8);
@@ -2315,7 +2166,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                 char resolved_ip[64] = {0};
                 int resolved = 0;
                 if (moor_dns_cache_lookup(&g_dns_cache, hostname,
-                        resolved_ip, sizeof(resolved_ip)) == 0) {
+                        resolved_ip, sizeof(resolved_ip)) != 0) {
                     resolved = 1;
                 } else if (resolve_dns_encrypted(hostname,
                         resolved_ip, sizeof(resolved_ip)) == 0) {
@@ -2686,10 +2537,25 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                     LOG_INFO("fragment reassembled: cmd=%d len=%zu",
                              inner_cmd, reassembled_len);
                     if (inner_cmd == RELAY_EXTEND_PQ) {
+                        /* Concurrency cap for blocking EXTEND_PQ (#R1-B3) */
+                        if (g_extend_pq_inflight >= 4) {
+                            LOG_WARN("EXTEND_PQ (frag): concurrency cap reached (%d), sending DESTROY",
+                                     g_extend_pq_inflight);
+                            moor_cell_t destroy;
+                            memset(&destroy, 0, sizeof(destroy));
+                            destroy.circuit_id = circ->prev_circuit_id;
+                            destroy.command = CELL_DESTROY;
+                            destroy.payload[0] = DESTROY_REASON_RESOURCELIMIT;
+                            if (moor_connection_send_cell(circ->prev_conn, &destroy) != 0)
+                                LOG_DEBUG("send_cell failed (line %d)", __LINE__);
+                            return -1;
+                        }
+                        g_extend_pq_inflight++;
                         /* PQ EXTEND: reassembled payload contains
                          * addr(64) + port(2) + identity_pk(32) + eph_pk(32) + kyber_pk(1184) */
                         if (reassembled_len < 130) {
                             LOG_ERROR("EXTEND_PQ payload too short");
+                            g_extend_pq_inflight--;
                             return -1;
                         }
                         char next_addr[64];
@@ -2705,6 +2571,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                         /* Reject EXTEND_PQ to private/reserved addresses (SSRF) */
                         if (is_private_address(next_addr)) {
                             LOG_WARN("EXTEND_PQ: rejecting private address");
+                            g_extend_pq_inflight--;
                             return -1;
                         }
 
@@ -2719,7 +2586,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                             LOG_DEBUG("EXTEND_PQ: reusing connection to next hop");
                         } else {
                             next_conn = moor_connection_alloc();
-                            if (!next_conn) return -1;
+                            if (!next_conn) { g_extend_pq_inflight--; return -1; }
                             memcpy(next_conn->peer_identity, next_identity_pk, 32);
                             if (moor_connection_connect(next_conn, next_addr,
                                                         next_port,
@@ -2727,6 +2594,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                                                         g_relay_config.identity_sk,
                                                         NULL, NULL) != 0) {
                                 moor_connection_free(next_conn);
+                                g_extend_pq_inflight--;
                                 return -1;
                             }
                         }
@@ -2739,12 +2607,16 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                                          next_identity_pk, client_eph_pk_ext);
                         create_cell.command = CELL_CREATE_PQ;
                         if (moor_connection_send_cell(next_conn,
-                                                      &create_cell) != 0)
+                                                      &create_cell) != 0) {
+                            if (conn_reused_pq) next_conn->circuit_refcount--;
+                            g_extend_pq_inflight--;
                             return -1;
+                        }
 
+                        LOG_WARN("EXTEND_PQ (frag): blocking connect+handshake on event loop — DoS risk");
                         moor_cell_t created_resp = {0};
                         int ret;
-                        uint64_t ext_pq_deadline = (uint64_t)time(NULL) + 10;
+                        uint64_t ext_pq_deadline = (uint64_t)time(NULL) + 2;
                         for (;;) {
                             ret = moor_connection_recv_cell(next_conn,
                                                             &created_resp);
@@ -2757,11 +2629,11 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                             }
                             if (ret < 0) break;
                             if ((uint64_t)time(NULL) >= ext_pq_deadline) {
-                                LOG_ERROR("EXTEND_PQ: timeout (10s)");
+                                LOG_ERROR("EXTEND_PQ: timeout (2s)");
                                 ret = -1;
                                 break;
                             }
-                            if (wait_for_readable(next_conn->fd, 3000) <= 0) {
+                            if (wait_for_readable(next_conn->fd, 1000) <= 0) {
                                 LOG_ERROR("EXTEND_PQ: timeout waiting for CREATED_PQ");
                                 ret = -1;
                                 break;
@@ -2770,12 +2642,15 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                         if (ret < 0 ||
                             created_resp.command != CELL_CREATED_PQ) {
                             LOG_ERROR("EXTEND_PQ: next hop CREATE_PQ failed");
+                            if (conn_reused_pq) next_conn->circuit_refcount--;
                             if (!conn_reused_pq) moor_connection_close(next_conn);
                             circ->next_conn = NULL;
                             circ->next_circuit_id = 0;
+                            g_extend_pq_inflight--;
                             return -1;
                         }
 
+                        g_extend_pq_inflight--;
                         if (!conn_reused_pq)
                             moor_event_add(next_conn->fd, MOOR_EVENT_READ,
                                            relay_conn_read_cb, next_conn);
@@ -2837,9 +2712,24 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                     return -1;
                 }
                 circ->relay_early_count++;
+                /* Concurrency cap for blocking EXTEND_PQ (#R1-B3) */
+                if (g_extend_pq_inflight >= 4) {
+                    LOG_WARN("EXTEND_PQ: concurrency cap reached (%d), sending DESTROY",
+                             g_extend_pq_inflight);
+                    moor_cell_t destroy;
+                    memset(&destroy, 0, sizeof(destroy));
+                    destroy.circuit_id = circ->prev_circuit_id;
+                    destroy.command = CELL_DESTROY;
+                    destroy.payload[0] = DESTROY_REASON_RESOURCELIMIT;
+                    if (moor_connection_send_cell(circ->prev_conn, &destroy) != 0)
+                        LOG_DEBUG("send_cell failed (line %d)", __LINE__);
+                    return -1;
+                }
+                g_extend_pq_inflight++;
                 /* Non-fragmented PQ EXTEND (small enough to fit) */
                 if (relay.data_length < 130) {
                     LOG_ERROR("EXTEND_PQ payload too short");
+                    g_extend_pq_inflight--;
                     return -1;
                 }
                 char next_addr[64];
@@ -2856,12 +2746,14 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                 if (sodium_memcmp(next_identity_pk_pq,
                                   g_relay_config.identity_pk, 32) == 0) {
                     LOG_WARN("EXTEND_PQ: rejecting loop to self");
+                    g_extend_pq_inflight--;
                     return -1;
                 }
 
                 /* Reject EXTEND_PQ to private/reserved addresses (SSRF) */
                 if (is_private_address(next_addr)) {
                     LOG_WARN("EXTEND_PQ: rejecting private address");
+                    g_extend_pq_inflight--;
                     return -1;
                 }
 
@@ -2876,13 +2768,14 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                     LOG_DEBUG("EXTEND_PQ: reusing connection to next hop");
                 } else {
                     next_conn = moor_connection_alloc();
-                    if (!next_conn) return -1;
+                    if (!next_conn) { g_extend_pq_inflight--; return -1; }
                     memcpy(next_conn->peer_identity, next_identity_pk_pq, 32);
                     if (moor_connection_connect(next_conn, next_addr, next_port,
                                                 g_relay_config.identity_pk,
                                                 g_relay_config.identity_sk,
                                                 NULL, NULL) != 0) {
                         moor_connection_free(next_conn);
+                        g_extend_pq_inflight--;
                         /* Send DESTROY back so client doesn't hang */
                         moor_cell_t destroy;
                         memset(&destroy, 0, sizeof(destroy));
@@ -2902,13 +2795,19 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                 moor_cell_create(&create_cell, circ->next_circuit_id,
                                  next_identity_pk_pq, client_eph_pk_ext);
                 create_cell.command = CELL_CREATE_PQ;
-                if (moor_connection_send_cell(next_conn, &create_cell) != 0)
+                if (moor_connection_send_cell(next_conn, &create_cell) != 0) {
+                    if (conn_reused_pq2) next_conn->circuit_refcount--;
+                    g_extend_pq_inflight--;
                     return -1;
+                }
 
-                /* Wait for CREATED_PQ from next hop */
+                /* Wait for CREATED_PQ from next hop.
+                 * TODO: move to async worker thread like RELAY_EXTEND to avoid
+                 * blocking the event loop.  2s cap limits DoS window for now. */
+                LOG_WARN("EXTEND_PQ: blocking connect+handshake on event loop — DoS risk");
                 moor_cell_t created_resp = {0};
                 int ret;
-                uint64_t ext_pq2_deadline = (uint64_t)time(NULL) + 10;
+                uint64_t ext_pq2_deadline = (uint64_t)time(NULL) + 2;
                 for (;;) {
                     ret = moor_connection_recv_cell(next_conn, &created_resp);
                     if (ret > 0) {
@@ -2920,11 +2819,11 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                     }
                     if (ret < 0) break;
                     if ((uint64_t)time(NULL) >= ext_pq2_deadline) {
-                        LOG_ERROR("EXTEND_PQ: timeout (10s)");
+                        LOG_ERROR("EXTEND_PQ: timeout (2s)");
                         ret = -1;
                         break;
                     }
-                    if (wait_for_readable(next_conn->fd, 3000) <= 0) {
+                    if (wait_for_readable(next_conn->fd, 1000) <= 0) {
                         LOG_ERROR("EXTEND_PQ: timeout waiting for CREATED_PQ");
                         ret = -1;
                         break;
@@ -2933,9 +2832,11 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                 if (ret < 0 || created_resp.command != CELL_CREATED_PQ) {
                     LOG_ERROR("EXTEND_PQ: next hop CREATE_PQ failed (ret=%d cmd=%d)",
                               ret, created_resp.command);
+                    if (conn_reused_pq2) next_conn->circuit_refcount--;
                     if (!conn_reused_pq2) moor_connection_close(next_conn);
                     circ->next_conn = NULL;
                     circ->next_circuit_id = 0;
+                    g_extend_pq_inflight--;
                     /* Send DESTROY back so client doesn't hang */
                     moor_cell_t destroy;
                     memset(&destroy, 0, sizeof(destroy));
@@ -2952,9 +2853,11 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                 if (circ->pq_kem_ct_len < MOOR_KEM_CT_LEN) {
                     LOG_ERROR("EXTEND_PQ: incomplete KEM CT (%zu/%d bytes)",
                               circ->pq_kem_ct_len, MOOR_KEM_CT_LEN);
+                    if (conn_reused_pq2) next_conn->circuit_refcount--;
                     if (!conn_reused_pq2) moor_connection_close(next_conn);
                     circ->next_conn = NULL;
                     circ->next_circuit_id = 0;
+                    g_extend_pq_inflight--;
                     /* Send DESTROY back so client doesn't hang */
                     moor_cell_t destroy;
                     memset(&destroy, 0, sizeof(destroy));
@@ -2966,6 +2869,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                     return -1;
                 }
 
+                g_extend_pq_inflight--;
                 circ->next_conn = next_conn;
                 if (!conn_reused_pq2)
                     moor_event_add(next_conn->fd, MOOR_EVENT_READ,
@@ -3048,16 +2952,43 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                 /* Handled by client side */
                 return 0;
 
-            case RELAY_DHT_STORE:
+            case RELAY_DHT_STORE: {
+                /* Validate we are a responsible replica for this address_hash
+                 * before accepting the store. Prevents DHT pollution attacks
+                 * where a malicious client stores descriptors on non-responsible
+                 * relays to poison lookups. */
+                if (relay.data_length >= 32 &&
+                    g_relay_consensus.num_relays > 0) {
+                    uint64_t tp = (uint64_t)time(NULL) / MOOR_TIME_PERIOD_SECS;
+                    int responsible =
+                        moor_dht_is_responsible(g_relay_config.identity_pk,
+                                                relay.data, &g_relay_consensus,
+                                                g_relay_consensus.srv_current, tp) ||
+                        moor_dht_is_responsible(g_relay_config.identity_pk,
+                                                relay.data, &g_relay_consensus,
+                                                g_relay_consensus.srv_previous, tp) ||
+                        moor_dht_is_responsible(g_relay_config.identity_pk,
+                                                relay.data, &g_relay_consensus,
+                                                g_relay_consensus.srv_current,
+                                                tp > 0 ? tp - 1 : 0);
+                    if (!responsible) {
+                        LOG_WARN("DHT STORE: rejected -- not a responsible replica");
+                        return -1;
+                    }
+                }
                 return moor_dht_handle_store(circ, relay.data, relay.data_length);
+            }
             case RELAY_DHT_FETCH:
                 return moor_dht_handle_fetch(circ, relay.data, relay.data_length);
             case RELAY_DHT_PIR_QUERY:
                 return moor_dht_handle_pir_query(circ, relay.data, relay.data_length);
+            case RELAY_DHT_DPF_QUERY:
+                return moor_dht_handle_dpf_query(circ, relay.data, relay.data_length);
             case RELAY_DHT_STORED:
             case RELAY_DHT_FOUND:
             case RELAY_DHT_NOT_FOUND:
             case RELAY_DHT_PIR_RESPONSE:
+            case RELAY_DHT_DPF_RESPONSE:
                 return 0; /* client-side responses, handled by caller */
 
             default:
@@ -3254,6 +3185,7 @@ static void exit_send_relay_end(moor_circuit_t *circ, uint16_t stream_id) {
 
 /* Helper: send RELAY_CONNECTED for a stream */
 static void exit_send_relay_connected(moor_circuit_t *circ, uint16_t stream_id) {
+    if (!circ->prev_conn) return;
     moor_cell_t cell;
     moor_cell_relay(&cell, circ->prev_circuit_id, RELAY_CONNECTED,
                    stream_id, NULL, 0);
@@ -3274,8 +3206,18 @@ static void exit_connect_complete_cb(int fd, int events, void *arg) {
         return;
     }
 
-    moor_circuit_t *circ = map->circ;
     uint16_t stream_id = map->stream_id;
+
+    /* Validate circuit is still live via safe hash lookup (#CWE-416) */
+    moor_circuit_t *circ = moor_circuit_find(map->circuit_id, map->conn);
+    if (!circ) {
+        LOG_WARN("exit: circuit gone during async connect for fd=%d stream %u",
+                 fd, stream_id);
+        moor_event_remove(fd);
+        close(fd);
+        exit_fd_remove(fd);
+        return;
+    }
 
     /* Check if connect() succeeded via SO_ERROR */
     int err = 0;
@@ -3482,7 +3424,7 @@ dns_done:
 }
 
 int moor_relay_exit_read(moor_circuit_t *circ, moor_stream_t *stream) {
-    if (!stream || stream->target_fd < 0) return -1;
+    if (!stream || stream->target_fd < 0 || !circ->prev_conn) return -1;
 
     /* XOFF: client told us to stop reading — pause until XON */
     if (stream->xoff_recv) {
@@ -3520,6 +3462,8 @@ int moor_relay_exit_read(moor_circuit_t *circ, moor_stream_t *stream) {
 
 int moor_relay_process_cell(moor_connection_t *conn,
                             const moor_cell_t *cell) {
+    if (!conn || !cell) return -1;
+
     /* Rate limit circuit creation */
     if (cell->command == CELL_CREATE || cell->command == CELL_CREATE_PQ) {
         struct sockaddr_storage sa;
@@ -3976,7 +3920,8 @@ int moor_relay_self_test(const moor_relay_config_t *config) {
 
 void moor_relay_periodic(void) {
     moor_relay_check_key_rotation(&g_relay_config);
-    moor_relay_register(&g_relay_config);
+    if (!g_relay_config.is_bridge)
+        moor_relay_register(&g_relay_config);
     moor_dht_store_expire(&g_dht_store);
 
     /* Refresh consensus for EXTEND address resolution (#183) */
@@ -3986,4 +3931,5 @@ void moor_relay_periodic(void) {
         moor_relay_set_consensus(&fresh);
         LOG_DEBUG("relay: refreshed consensus (%u relays)", fresh.num_relays);
     }
+    moor_consensus_cleanup(&fresh);
 }

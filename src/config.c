@@ -111,10 +111,10 @@ void moor_config_defaults(moor_config_t *cfg) {
     cfg->da_list[0].port = MOOR_DEFAULT_DIR_PORT;
     {
         static const uint8_t da1_pk[32] = {
-            0xb8,0x46,0x6b,0xed,0xec,0x70,0xaa,0x6e,
-            0x40,0xd8,0xce,0xe6,0x4c,0xca,0xcf,0xa1,
-            0xbc,0x3c,0x9a,0xf6,0x44,0x1d,0xa1,0x8b,
-            0xdc,0x70,0x73,0x45,0xc1,0x0b,0x4f,0x10
+            0x78,0x16,0xdf,0xa4,0xe7,0xf1,0xaa,0x63,
+            0x7b,0x36,0xa3,0xfb,0x04,0x72,0x98,0x3d,
+            0x32,0x67,0x66,0xdd,0xc9,0x8a,0xbe,0x21,
+            0x93,0x20,0xb3,0xea,0x90,0xdf,0x28,0xb4
         };
         memcpy(cfg->da_list[0].identity_pk, da1_pk, 32);
     }
@@ -123,10 +123,10 @@ void moor_config_defaults(moor_config_t *cfg) {
     cfg->da_list[1].port = MOOR_DEFAULT_DIR_PORT;
     {
         static const uint8_t da2_pk[32] = {
-            0x15,0x21,0xd6,0xbb,0xa6,0x1c,0xde,0xe8,
-            0xcb,0x6a,0x4b,0x99,0x42,0x4c,0x8e,0x5c,
-            0x43,0xd9,0x6e,0xaa,0x8b,0x29,0xd6,0x1d,
-            0x26,0x9f,0x4e,0x51,0x5f,0xe4,0xd0,0x02
+            0x52,0x98,0xf0,0x42,0xe5,0x14,0x4b,0x74,
+            0x1a,0xac,0xcb,0xce,0xeb,0xab,0xc0,0xd4,
+            0xcc,0x8f,0xeb,0xf1,0xf9,0xba,0xe8,0xe3,
+            0x12,0x67,0x88,0xef,0x28,0x3d,0x8c,0x06
         };
         memcpy(cfg->da_list[1].identity_pk, da2_pk, 32);
     }
@@ -141,6 +141,7 @@ void moor_config_defaults(moor_config_t *cfg) {
     cfg->exit_policy.num_rules = 0;
     cfg->num_hidden_services = 0;
     cfg->pir = 1;
+    cfg->pir_dpf = 1;  /* DPF-PIR preferred over XOR-bitmask PIR */
 }
 
 /* Parse an IPv4 address string to host-byte-order uint32_t */
@@ -342,6 +343,7 @@ int moor_config_set(moor_config_t *cfg, const char *key, const char *value) {
             strncpy(buf, value, sizeof(buf) - 1);
             buf[sizeof(buf) - 1] = '\0';
             cfg->num_das = 0;
+            memset(cfg->da_list, 0, sizeof(cfg->da_list));
             char *saveptr = NULL;
             char *token = strtok_r(buf, ",", &saveptr);
             while (token && cfg->num_das < 9) {
@@ -654,6 +656,15 @@ int moor_config_set(moor_config_t *cfg, const char *key, const char *value) {
     else if (strcmp(key, "PIR") == 0) {
         cfg->pir = atoi(value);
     }
+    else if (strcmp(key, "MirageSNI") == 0) {
+        /* Comma-separated list of SNI domains for mirage transport.
+         * Example: MirageSNI cdn.example.com,static.example.org */
+        extern void moor_mirage_set_sni_pool(const char *csv);
+        moor_mirage_set_sni_pool(value);
+    }
+    else if (strcmp(key, "PIR_DPF") == 0 || strcmp(key, "PIRDPF") == 0) {
+        cfg->pir_dpf = atoi(value);
+    }
     else if (strcmp(key, "EntryNode") == 0 || strcmp(key, "EntryNodes") == 0) {
         snprintf(cfg->entry_node, sizeof(cfg->entry_node), "%s", value);
     }
@@ -716,8 +727,19 @@ int moor_config_load(moor_config_t *cfg, const char *path) {
     int lineno = 0;
     while (fgets(line, sizeof(line), f)) {
         lineno++;
-        /* Strip trailing newline */
+        /* Check for line overflow: if fgets filled the buffer without
+         * a newline, the line was truncated.  Consume the rest of the
+         * overlong line and skip it to prevent injection (CWE-120). */
         size_t len = strlen(line);
+        if (len > 0 && line[len - 1] != '\n' && !feof(f)) {
+            LOG_WARN("config: line %d too long (>%zu), skipping",
+                     lineno, sizeof(line) - 1);
+            int ch;
+            while ((ch = fgetc(f)) != EOF && ch != '\n')
+                ;
+            continue;
+        }
+        /* Strip trailing newline */
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
             line[--len] = '\0';
 

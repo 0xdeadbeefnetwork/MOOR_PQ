@@ -236,7 +236,10 @@ int moor_ob_publish(moor_ob_config_t *config) {
     memcpy(to_sign, desc.address_hash, 32);
     memcpy(to_sign + 32, desc.service_pk, 32);
     memcpy(to_sign + 64, desc.onion_pk, 32);
-    moor_crypto_sign(desc.signature, to_sign, 96, config->identity_sk);
+    if (moor_crypto_sign(desc.signature, to_sign, 96, config->identity_sk) != 0) {
+        LOG_ERROR("OB: descriptor signing failed");
+        return -1;
+    }
     desc.published = (uint64_t)time(NULL);
 
     /* Serialize and encrypt */

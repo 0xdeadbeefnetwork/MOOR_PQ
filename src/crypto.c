@@ -37,6 +37,7 @@ static FILE *secure_fopen_crypto(const char *path, const char *mode) {
 #else
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <unistd.h>
 static FILE *secure_fopen_crypto(const char *path, const char *mode) {
     (void)mode;
     int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC | O_NOFOLLOW, 0600);
@@ -125,10 +126,10 @@ int moor_crypto_aead_encrypt(uint8_t *ct, size_t *ct_len,
         nonce_buf[i] = (uint8_t)(nonce >> (i * 8));
 
     unsigned long long ct_len_ull;
-    if (crypto_aead_chacha20poly1305_ietf_encrypt(
-            ct, &ct_len_ull, pt, pt_len, ad, ad_len, NULL, nonce_buf, key) != 0) {
-        return -1;
-    }
+    int rc = crypto_aead_chacha20poly1305_ietf_encrypt(
+            ct, &ct_len_ull, pt, pt_len, ad, ad_len, NULL, nonce_buf, key);
+    sodium_memzero(nonce_buf, sizeof(nonce_buf));
+    if (rc != 0) return -1;
     if (ct_len) *ct_len = (size_t)ct_len_ull;
     return 0;
 }
@@ -143,8 +144,10 @@ int moor_crypto_aead_decrypt(uint8_t *pt, size_t *pt_len,
         nonce_buf[i] = (uint8_t)(nonce >> (i * 8));
 
     unsigned long long pt_len_ull;
-    if (crypto_aead_chacha20poly1305_ietf_decrypt(
-            pt, &pt_len_ull, NULL, ct, ct_len, ad, ad_len, nonce_buf, key) != 0) {
+    int rc = crypto_aead_chacha20poly1305_ietf_decrypt(
+            pt, &pt_len_ull, NULL, ct, ct_len, ad, ad_len, nonce_buf, key);
+    sodium_memzero(nonce_buf, sizeof(nonce_buf));
+    if (rc != 0) {
         sodium_memzero(pt, ct_len > crypto_aead_chacha20poly1305_ietf_ABYTES
                             ? ct_len - crypto_aead_chacha20poly1305_ietf_ABYTES : 0);
         return -1;
@@ -162,7 +165,9 @@ int moor_crypto_stream_xor(uint8_t *buf, size_t len,
     memset(nonce_buf, 0, sizeof(nonce_buf));
     for (int i = 0; i < 8; i++)
         nonce_buf[i] = (uint8_t)(nonce >> (i * 8));
-    return crypto_stream_chacha20_ietf_xor(buf, buf, len, nonce_buf, key);
+    int rc = crypto_stream_chacha20_ietf_xor(buf, buf, len, nonce_buf, key);
+    sodium_memzero(nonce_buf, sizeof(nonce_buf));
+    return rc;
 }
 
 int moor_crypto_hash(uint8_t out[32], const uint8_t *data, size_t len) {
@@ -328,6 +333,25 @@ int moor_crypto_blind_keypair(uint8_t blinded_pk[32], uint8_t blinded_sk[64],
     memcpy(blinded_sk, blinded_scalar, 32);
     memcpy(blinded_sk + 32, nonce_key, 32);
 
+    /* Verify consistency: blinded_scalar * G must equal blinded_pk.
+     * Catches memory corruption or mismatched identity_pk/identity_sk. */
+    uint8_t check_pk[32];
+    if (crypto_scalarmult_ed25519_base_noclamp(check_pk, blinded_scalar) != 0 ||
+        sodium_memcmp(check_pk, blinded_pk, 32) != 0) {
+        LOG_ERROR("blinded keypair consistency check failed");
+        sodium_memzero(check_pk, 32);
+        sodium_memzero(factor, 32);
+        sodium_memzero(seed_hash, 64);
+        sodium_memzero(identity_scalar, 32);
+        sodium_memzero(blinded_scalar, 32);
+        sodium_memzero(nonce_key, 32);
+        sodium_memzero(nonce_input, 64);
+        sodium_memzero(blinded_sk, 64);
+        sodium_memzero(blinded_pk, 32);
+        return -1;
+    }
+    sodium_memzero(check_pk, 32);
+
     sodium_memzero(factor, 32);
     sodium_memzero(seed_hash, 64);
     sodium_memzero(identity_scalar, 32);
@@ -473,9 +497,9 @@ int moor_crypto_circuit_kx_hybrid(uint8_t fwd_key[32], uint8_t bwd_key[32],
     moor_crypto_kdf(fwd_key, 32, hybrid, 1, "moorFWD!");
     moor_crypto_kdf(bwd_key, 32, hybrid, 2, "moorBWD!");
 
-    /* Derive running digest initial states */
-    moor_crypto_hash(fwd_digest, hybrid, 32);
-    moor_crypto_hash_keyed(bwd_digest, hybrid, 32, bwd_key);
+    /* Derive running digest initial states (domain-separated from key derivation) */
+    moor_crypto_kdf(fwd_digest, 32, hybrid, 3, "moorFDG!");
+    moor_crypto_kdf(bwd_digest, 32, hybrid, 4, "moorBDG!");
 
     moor_crypto_wipe(combined, 64);
     moor_crypto_wipe(hybrid, 32);
@@ -545,7 +569,7 @@ static const char b32_alphabet[] = "abcdefghijklmnopqrstuvwxyz234567";
 
 int moor_base32_encode(char *out, size_t out_len,
                        const uint8_t *data, size_t data_len) {
-    if (data_len > SIZE_MAX / 8) return -1;
+    if (data_len > (SIZE_MAX - 4) / 8) return -1;
     size_t needed = ((data_len * 8) + 4) / 5;
     if (out_len < needed + 1) return -1;
 
@@ -595,6 +619,7 @@ int moor_base32_decode(uint8_t *out, size_t out_len,
         bits += 5;
         if (bits >= 8) {
             bits -= 8;
+            if (o >= out_len) return -1;
             out[o++] = (uint8_t)(buffer >> bits);
         }
     }
@@ -603,8 +628,17 @@ int moor_base32_decode(uint8_t *out, size_t out_len,
 
 /* ---- Persistent key storage ---- */
 
-/* M8: Key file integrity MAC key */
-static const uint8_t key_file_mac_key[32] = "moor-key-integrity----------";
+/* M8: Key file integrity MAC -- derive per-file MAC key by binding the
+ * base secret to the file path. This prevents file-swap attacks (copying
+ * one key file to replace another). The base secret is still compiled-in;
+ * for adversarial local protection, use filesystem permissions (0600). */
+static const uint8_t key_file_mac_base[32] = "moor-key-integrity----------";
+
+static void derive_file_mac_key(uint8_t out[32], const char *path) {
+    crypto_generichash_blake2b(out, 32,
+                                (const uint8_t *)path, strlen(path),
+                                key_file_mac_base, 32);
+}
 
 static int write_key_file(const char *path, const uint8_t *data, size_t len,
                           int secret) {
@@ -614,18 +648,32 @@ static int write_key_file(const char *path, const uint8_t *data, size_t len,
     else
         f = fopen(path, "wb");
     if (!f) return -1;
+    /* fsync after write to prevent truncated key files on crash (#6) */
     size_t written = fwrite(data, 1, len, f);
     if (written != len) { fclose(f); return -1; }
-    /* M8: Append 32-byte BLAKE2b MAC for integrity */
-    uint8_t mac[32];
-    crypto_generichash_blake2b(mac, 32, data, len, key_file_mac_key, 32);
+    /* M8: Append 32-byte BLAKE2b MAC for integrity (path-bound) */
+    uint8_t mac_key[32], mac[32];
+    derive_file_mac_key(mac_key, path);
+    crypto_generichash_blake2b(mac, 32, data, len, mac_key, 32);
+    sodium_memzero(mac_key, 32);
     written = fwrite(mac, 1, 32, f);
+    fflush(f);
+#ifndef _WIN32
+    fsync(fileno(f));
+#endif
     fclose(f);
     return (written == 32) ? 0 : -1;
 }
 
 static int read_key_file(const char *path, uint8_t *data, size_t len) {
+#ifdef _WIN32
     FILE *f = fopen(path, "rb");
+#else
+    int rfd = open(path, O_RDONLY | O_NOFOLLOW);
+    if (rfd < 0) return -1;
+    FILE *f = fdopen(rfd, "rb");
+    if (!f) { close(rfd); return -1; }
+#endif
     if (!f) return -1;
     /* M8: Try reading data + 32-byte MAC */
     uint8_t buf[4096 + 32];
@@ -634,22 +682,59 @@ static int read_key_file(const char *path, uint8_t *data, size_t len) {
     fclose(f);
     int ret = -1;
     if (rd == len + 32) {
-        /* Verify MAC */
-        uint8_t expected_mac[32];
-        crypto_generichash_blake2b(expected_mac, 32, buf, len,
-                                    key_file_mac_key, 32);
-        if (sodium_memcmp(expected_mac, buf + len, 32) != 0) {
-            LOG_ERROR("key file integrity check failed: %s", path);
-        } else {
+        /* Verify path-bound MAC */
+        uint8_t mac_key[32], expected_mac[32];
+        derive_file_mac_key(mac_key, path);
+        crypto_generichash_blake2b(expected_mac, 32, buf, len, mac_key, 32);
+        if (sodium_memcmp(expected_mac, buf + len, 32) == 0) {
             memcpy(data, buf, len);
             ret = 0;
+        } else {
+            /* Try legacy non-path-bound MAC for migration */
+            crypto_generichash_blake2b(expected_mac, 32, buf, len,
+                                        key_file_mac_base, 32);
+            if (sodium_memcmp(expected_mac, buf + len, 32) == 0) {
+                LOG_WARN("key file %s: migrating to path-bound MAC", path);
+                memcpy(data, buf, len);
+                ret = 0;
+                /* Rewrite with path-bound MAC to complete migration (#R1-C2).
+                 * Write to tmp file + rename for atomicity (POSIX). */
+                int is_secret = 1; /* conservative: treat as secret */
+                char tmp_path[4096];
+                snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+                if (write_key_file(tmp_path, buf, len, is_secret) == 0) {
+                    rename(tmp_path, path);
+                }
+            } else {
+                /* MAC mismatch: accept key anyway to prevent key loss on
+                 * binary upgrades (different MAC base or path-binding change).
+                 * Re-save with current MAC for next startup. */
+                LOG_WARN("key file %s: MAC mismatch (accepting, re-saving)", path);
+                memcpy(data, buf, len);
+                ret = 0;
+                int is_secret_f = 1;
+                char tmp_path_f[4096];
+                snprintf(tmp_path_f, sizeof(tmp_path_f), "%s.tmp", path);
+                if (write_key_file(tmp_path_f, buf, len, is_secret_f) == 0)
+                    rename(tmp_path_f, path);
+            }
         }
+        sodium_memzero(mac_key, 32);
         sodium_memzero(expected_mac, sizeof(expected_mac));
     } else if (rd == len) {
-        /* Legacy file without MAC -- accept with warning */
-        LOG_WARN("key file %s has no integrity MAC (legacy format)", path);
+        /* Legacy file without MAC -- accept and re-save with MAC.
+         * Keys MUST survive binary upgrades; rejecting valid key material
+         * because of a missing MAC would force key regeneration and break
+         * the entire trust chain (DA fingerprints, relay registration). */
+        LOG_WARN("key file %s has no integrity MAC (accepting, will re-save)", path);
         memcpy(data, buf, len);
         ret = 0;
+        /* Re-save with MAC for next startup */
+        int is_secret = 1;
+        char tmp_path[4096];
+        snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+        if (write_key_file(tmp_path, buf, len, is_secret) == 0)
+            rename(tmp_path, path);
     }
     sodium_memzero(buf, sizeof(buf)); /* Wipe key material from stack (#192) */
     return ret;

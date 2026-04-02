@@ -274,9 +274,12 @@ moor_circuit_t *moor_circuit_alloc(void) {
         }
     }
 
-    /* Pool exhausted: try OOM kill to free slots */
+    /* Pool exhausted: release lock before OOM kill (which calls
+     * circuit_destroy -> circuit_free -> reacquires lock). */
+    circ_pool_unlock();
     int freed = moor_circuit_oom_kill(1);
     if (freed > 0) {
+        circ_pool_lock();
         /* Retry allocation after OOM kill */
         for (int i = 0; i < MOOR_MAX_CIRCUITS; i++) {
             if (g_circuit_pool[i].circuit_id == 0) {
@@ -302,10 +305,10 @@ moor_circuit_t *moor_circuit_alloc(void) {
                 return &g_circuit_pool[i];
             }
         }
+        circ_pool_unlock();
     }
 
     LOG_ERROR("circuit pool exhausted");
-    circ_pool_unlock();
     return NULL;
 }
 
@@ -342,6 +345,10 @@ static void circ_free_unlocked(moor_circuit_t *circ) {
     moor_crypto_wipe(circ->relay_backward_key, 32);
     moor_crypto_wipe(circ->relay_forward_digest, 32);
     moor_crypto_wipe(circ->relay_backward_digest, 32);
+    /* R10-CC2: Wipe HS e2e keys before zeroing the struct */
+    moor_crypto_wipe(circ->e2e_send_key, 32);
+    moor_crypto_wipe(circ->e2e_recv_key, 32);
+    moor_crypto_wipe(circ->e2e_dh_shared, 32);
     memset(circ, 0, sizeof(*circ));
 }
 
@@ -1256,6 +1263,13 @@ int moor_circuit_extend_pq(moor_circuit_t *circ,
 
     /* PQ hybrid key derivation: DH + KEM → circuit keys */
     int hop = circ->num_hops;
+    if (hop >= MOOR_CIRCUIT_HOPS) {
+        LOG_ERROR("EXTEND_PQ: hop index %d out of bounds", hop);
+        moor_crypto_wipe(eph_sk, 32);
+        moor_crypto_wipe(key_seed, 32);
+        moor_crypto_wipe(kem_ss, MOOR_KEM_SS_LEN);
+        return -1;
+    }
     moor_crypto_circuit_kx_hybrid(
         circ->hops[hop].forward_key, circ->hops[hop].backward_key,
         circ->hops[hop].forward_digest, circ->hops[hop].backward_digest,
@@ -1410,7 +1424,7 @@ int moor_circuit_open_stream(moor_circuit_t *circ, uint16_t *stream_id,
                            circ->streams[i].stream_id,
                            (uint8_t *)begin_data, (uint16_t)(n + 1));
 
-            moor_circuit_encrypt_forward(circ, &cell);
+            if (moor_circuit_encrypt_forward(circ, &cell) != 0) return -1;
             if (!circ->conn) return -1;
             moor_connection_send_cell(circ->conn, &cell);
 
@@ -1505,7 +1519,7 @@ int moor_circuit_send_data(moor_circuit_t *circ, uint16_t stream_id,
         moor_cell_t cell;
         moor_cell_relay(&cell, circ->circuit_id, RELAY_DATA,
                        stream_id, data, chunk);
-        moor_circuit_encrypt_forward(circ, &cell);
+        if (moor_circuit_encrypt_forward(circ, &cell) != 0) return -1;
 
         if (!circ->conn || moor_connection_send_cell(circ->conn, &cell) != 0)
             return -1;
@@ -1550,6 +1564,11 @@ int moor_circuit_send_data(moor_circuit_t *circ, uint16_t stream_id,
 int moor_circuit_handle_sendme(moor_circuit_t *circ, uint16_t stream_id,
                                const uint8_t *sendme_data, uint16_t sendme_len) {
     if (stream_id == 0) {
+        /* Reject SENDME before any data has been sent (auth bypass) */
+        if (circ->sendme_auth_count == 0) {
+            LOG_WARN("circuit %u: unexpected SENDME (no data sent yet)", circ->circuit_id);
+            return -1;
+        }
         /* SENDME auth (Prop 289): verify digest from peer */
         if (circ->sendme_auth_count > 0) {
             if (sendme_len < 8) {
@@ -1725,7 +1744,7 @@ int moor_circuit_maybe_send_sendme(moor_circuit_t *circ, uint16_t stream_id) {
             moor_cell_t cell;
             moor_cell_relay(&cell, circ->circuit_id, RELAY_SENDME,
                            0, sendme_body, 8);
-            moor_circuit_encrypt_forward(circ, &cell);
+            if (moor_circuit_encrypt_forward(circ, &cell) != 0 || !circ->conn) return -1;
             moor_connection_send_cell(circ->conn, &cell);
             circ->circ_deliver_window += MOOR_SENDME_INCREMENT;
             LOG_DEBUG("circuit %u: sent circuit SENDME (auth)", circ->circuit_id);
@@ -1743,7 +1762,7 @@ int moor_circuit_maybe_send_sendme(moor_circuit_t *circ, uint16_t stream_id) {
                 moor_cell_t cell;
                 moor_cell_relay(&cell, circ->circuit_id, RELAY_SENDME,
                                stream_id, NULL, 0);
-                moor_circuit_encrypt_forward(circ, &cell);
+                if (moor_circuit_encrypt_forward(circ, &cell) != 0 || !circ->conn) return -1;
                 moor_connection_send_cell(circ->conn, &cell);
                 stream->deliver_window += MOOR_SENDME_INCREMENT;
                 LOG_DEBUG("stream %u: sent stream SENDME", stream_id);
@@ -1788,12 +1807,32 @@ void moor_circuit_check_timeouts(void) {
     if (!g_circuit_pool_init) return;
     uint64_t now = (uint64_t)time(NULL);
 
+    /* Snapshot pool indices under lock to avoid racing with builder thread.
+     * We collect indices, then process outside the lock since destroy
+     * needs to re-acquire it. */
+    int timeout_indices[MOOR_MAX_CIRCUITS];
+    uint64_t timeout_ages[MOOR_MAX_CIRCUITS];
+    uint32_t timeout_ids[MOOR_MAX_CIRCUITS];
+    int timeout_count = 0;
+
+    circ_pool_lock();
     for (int i = 0; i < MOOR_MAX_CIRCUITS; i++) {
         moor_circuit_t *circ = &g_circuit_pool[i];
         if (circ->circuit_id == 0) continue;
-        if (now < circ->created_at) continue; /* Clock adjusted backward */
+        if (now < circ->created_at) continue;
+        timeout_indices[timeout_count] = i;
+        timeout_ages[timeout_count] = now - circ->created_at;
+        timeout_ids[timeout_count] = circ->circuit_id;
+        timeout_count++;
+    }
+    circ_pool_unlock();
 
-        uint64_t age = now - circ->created_at;
+    for (int ti = 0; ti < timeout_count; ti++) {
+        moor_circuit_t *circ = &g_circuit_pool[timeout_indices[ti]];
+        if (circ->circuit_id == 0) continue; /* already freed by earlier iteration */
+        if (circ->circuit_id != timeout_ids[ti]) continue; /* slot reused since snapshot */
+
+        uint64_t age = timeout_ages[ti];
 
         /* Building-phase timeout: circuit incomplete after CIRCUIT_TIMEOUT */
         if (circ->is_client && circ->num_hops < MOOR_CIRCUIT_HOPS &&
@@ -2040,6 +2079,10 @@ int moor_circuit_build(moor_circuit_t *circ,
         if (moor_circuit_create_pq(circ, guard->identity_pk, guard->kem_pk) != 0)
             return -1;
     } else {
+        /* R10-ADV2: Warn on possible PQ downgrade */
+        if (!sodium_is_zero(guard->kem_pk, 1184))
+            LOG_WARN("relay %s:%u lost PQ capability -- possible downgrade attack",
+                     guard->address, guard->or_port);
         if (moor_circuit_create(circ, guard->identity_pk) != 0)
             return -1;
     }
@@ -2086,14 +2129,22 @@ int moor_circuit_build(moor_circuit_t *circ,
     /* EXTEND to middle */
     if ((middle->features & NODE_FEATURE_PQ) && !sodium_is_zero(middle->kem_pk, 1184))
         { if (moor_circuit_extend_pq(circ, middle) != 0) return -1; }
-    else
-        { if (moor_circuit_extend(circ, middle) != 0) return -1; }
+    else {
+        if (!sodium_is_zero(middle->kem_pk, 1184))
+            LOG_WARN("relay %s:%u lost PQ capability -- possible downgrade attack",
+                     middle->address, middle->or_port);
+        if (moor_circuit_extend(circ, middle) != 0) return -1;
+    }
 
     /* EXTEND to exit */
     if ((exit_relay->features & NODE_FEATURE_PQ) && !sodium_is_zero(exit_relay->kem_pk, 1184))
         { if (moor_circuit_extend_pq(circ, exit_relay) != 0) return -1; }
-    else
-        { if (moor_circuit_extend(circ, exit_relay) != 0) return -1; }
+    else {
+        if (!sodium_is_zero(exit_relay->kem_pk, 1184))
+            LOG_WARN("relay %s:%u lost PQ capability -- possible downgrade attack",
+                     exit_relay->address, exit_relay->or_port);
+        if (moor_circuit_extend(circ, exit_relay) != 0) return -1;
+    }
 
     /* Path bias: record build success */
     moor_pathbias_count_build_success(&g_pathbias_guard_state,
@@ -2140,9 +2191,10 @@ int moor_circuit_build_bridge(moor_circuit_t *circ,
 
     /* Transport params: build appropriate struct based on transport type */
     union {
-        moor_scramble_client_params_t scramble;
-        moor_shade_client_params_t   shade;
-        moor_mirage_client_params_t  mirage;
+        moor_scramble_client_params_t    scramble;
+        moor_shade_client_params_t       shade;
+        moor_mirage_client_params_t      mirage;
+        moor_shitstorm_client_params_t   shitstorm;
     } tp_params;
     memset(&tp_params, 0, sizeof(tp_params));
     if (transport) {
@@ -2156,7 +2208,11 @@ int moor_circuit_build_bridge(moor_circuit_t *circ,
                 LOG_WARN("shade: Ed25519->Curve25519 pk conversion failed");
             tp_params.shade.iat_mode = MOOR_SHADE_IAT_NONE;
         } else if (strcmp(transport->name, "mirage") == 0) {
-            tp_params.mirage.sni[0] = '\0'; /* random SNI */
+            tp_params.mirage.sni[0] = '\0'; /* random SNI from local pool */
+            memcpy(tp_params.mirage.node_id, bridge->identity_pk, 32);
+        } else if (strcmp(transport->name, "shitstorm") == 0) {
+            tp_params.shitstorm.sni[0] = '\0'; /* random SNI from local pool */
+            memcpy(tp_params.shitstorm.identity_pk, bridge->identity_pk, 32);
         }
     }
 
@@ -2165,9 +2221,11 @@ int moor_circuit_build_bridge(moor_circuit_t *circ,
      * racing with main thread's circuit_read_cb on the same connection. */
     if (!skip_reuse) {
         moor_connection_t *existing = moor_connection_find_by_identity(bridge->identity_pk);
-        if (existing) {
+        if (existing && existing != bridge_conn) {
             LOG_INFO("circuit %u: reusing existing connection to bridge",
                      circ->circuit_id);
+            /* Free the freshly allocated connection — it's unused now */
+            moor_connection_free(bridge_conn);
             circ->conn = existing;
             bridge_conn = existing;
         }
@@ -2186,8 +2244,10 @@ int moor_circuit_build_bridge(moor_circuit_t *circ,
 
     /* CREATE with bridge (classical — bridges don't advertise KEM keys yet) */
     memcpy(circ->hops[0].node_id, bridge->identity_pk, 32);
-    if (moor_circuit_create(circ, bridge->identity_pk) != 0)
+    if (moor_circuit_create(circ, bridge->identity_pk) != 0) {
+        bridge_conn->circuit_refcount--;
         return -1;
+    }
 
     /* Select exit and middle from consensus (same as normal build) */
     uint8_t exclude[96]; /* up to 3 * 32 */
@@ -2208,6 +2268,7 @@ int moor_circuit_build_bridge(moor_circuit_t *circ,
     }
     if (!exit_relay) {
         LOG_ERROR("no suitable exit relay");
+        bridge_conn->circuit_refcount--;
         return -1;
     }
 
@@ -2225,20 +2286,29 @@ int moor_circuit_build_bridge(moor_circuit_t *circ,
     }
     if (!middle) {
         LOG_ERROR("no suitable middle relay");
+        bridge_conn->circuit_refcount--;
         return -1;
     }
 
     /* EXTEND to middle */
     if ((middle->features & NODE_FEATURE_PQ) && !sodium_is_zero(middle->kem_pk, 1184))
-        { if (moor_circuit_extend_pq(circ, middle) != 0) return -1; }
-    else
-        { if (moor_circuit_extend(circ, middle) != 0) return -1; }
+        { if (moor_circuit_extend_pq(circ, middle) != 0) { bridge_conn->circuit_refcount--; return -1; } }
+    else {
+        if (!sodium_is_zero(middle->kem_pk, 1184))
+            LOG_WARN("relay %s:%u lost PQ capability -- possible downgrade attack",
+                     middle->address, middle->or_port);
+        if (moor_circuit_extend(circ, middle) != 0) { bridge_conn->circuit_refcount--; return -1; }
+    }
 
     /* EXTEND to exit */
     if ((exit_relay->features & NODE_FEATURE_PQ) && !sodium_is_zero(exit_relay->kem_pk, 1184))
-        { if (moor_circuit_extend_pq(circ, exit_relay) != 0) return -1; }
-    else
-        { if (moor_circuit_extend(circ, exit_relay) != 0) return -1; }
+        { if (moor_circuit_extend_pq(circ, exit_relay) != 0) { bridge_conn->circuit_refcount--; return -1; } }
+    else {
+        if (!sodium_is_zero(exit_relay->kem_pk, 1184))
+            LOG_WARN("relay %s:%u lost PQ capability -- possible downgrade attack",
+                     exit_relay->address, exit_relay->or_port);
+        if (moor_circuit_extend(circ, exit_relay) != 0) { bridge_conn->circuit_refcount--; return -1; }
+    }
 
     LOG_INFO("circuit %u built via bridge: 3 hops (transport=%s)",
              circ->circuit_id,
@@ -2484,10 +2554,16 @@ int moor_padding_is_enabled(void) {
 }
 
 uint64_t moor_padding_next_interval(void) {
-    /* Random interval between MOOR_PADDING_MIN_MS and MOOR_PADDING_MAX_MS */
-    uint32_t r;
-    moor_crypto_random((uint8_t *)&r, sizeof(r));
+    /* Random interval between MOOR_PADDING_MIN_MS and MOOR_PADDING_MAX_MS.
+     * Use rejection sampling to avoid modulo bias. */
     uint64_t range = MOOR_PADDING_MAX_MS - MOOR_PADDING_MIN_MS;
+    /* R10-INT2: Guard against zero range (MIN == MAX) to avoid division by zero */
+    if (range == 0) return MOOR_PADDING_MIN_MS;
+    uint32_t limit = UINT32_MAX - (UINT32_MAX % range);
+    uint32_t r;
+    do {
+        moor_crypto_random((uint8_t *)&r, sizeof(r));
+    } while (r >= limit);
     return MOOR_PADDING_MIN_MS + (r % range);
 }
 
@@ -3672,8 +3748,8 @@ static void cbuild_send_extend(moor_circuit_t *circ, int hop_idx) {
             moor_cell_t kem_cell;
             moor_cell_relay(&kem_cell, circ->circuit_id, RELAY_KEM_OFFER,
                            0, ctx->kem_ct + ct_off, (uint16_t)chunk);
-            moor_circuit_encrypt_forward(circ, &kem_cell);
-            if (moor_connection_send_cell(circ->conn, &kem_cell) != 0) {
+            if (moor_circuit_encrypt_forward(circ, &kem_cell) != 0 ||
+                moor_connection_send_cell(circ->conn, &kem_cell) != 0) {
                 cbuild_finish(circ, -1);
                 return;
             }

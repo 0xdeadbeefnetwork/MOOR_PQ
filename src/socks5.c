@@ -33,6 +33,10 @@ static moor_socks5_config_t g_socks5_config;
 static moor_socks5_client_t g_socks5_clients[MAX_SOCKS5_CLIENTS];
 static moor_consensus_t g_client_consensus = {0};
 
+/* Bridge mode globals (defined in main.c) */
+extern int g_use_bridges;
+extern moor_config_t g_config;
+
 /* Forward declaration for XOFF/XON resume */
 static void socks_client_read_cb(int fd, int events, void *arg);
 
@@ -116,6 +120,12 @@ static int g_prebuilt_pool_count = 0;
 static int g_inflight_builds = 0;
 static int g_prebuilt_timer_id = -1;
 
+/* Adaptive backoff: doubles interval on consecutive failures, resets on success.
+ * Prevents hammering a dead bridge at 2/sec for hours. */
+static int g_consecutive_build_failures = 0;
+#define PREBUILT_BASE_INTERVAL_MS   500
+#define PREBUILT_MAX_INTERVAL_MS    30000  /* cap at 30s between retries */
+
 static prebuilt_entry_t *prebuilt_pop(void); /* forward decl */
 
 /* No locking needed -- everything is single-threaded now */
@@ -183,15 +193,38 @@ static void assign_circuits_to_waiting_clients(void) {
     }
 }
 
+/* Adjust prebuilt timer interval based on backoff state */
+static void prebuilt_adjust_interval(void) {
+    if (g_prebuilt_timer_id < 0) return;
+    int delay = PREBUILT_BASE_INTERVAL_MS;
+    if (g_consecutive_build_failures > 0) {
+        delay = PREBUILT_BASE_INTERVAL_MS << g_consecutive_build_failures;
+        if (delay > PREBUILT_MAX_INTERVAL_MS)
+            delay = PREBUILT_MAX_INTERVAL_MS;
+        if (delay < PREBUILT_BASE_INTERVAL_MS)
+            delay = PREBUILT_MAX_INTERVAL_MS; /* overflow guard */
+    }
+    moor_event_set_timer_interval(g_prebuilt_timer_id, (uint64_t)delay);
+}
+
 /* Async build completion callback */
 static void prebuilt_build_complete(moor_circuit_t *circ, int status, void *arg) {
     (void)arg;
     g_inflight_builds--;
 
     if (status != 0) {
-        LOG_WARN("prebuilt async circuit build failed");
+        g_consecutive_build_failures++;
+        prebuilt_adjust_interval();
+        LOG_WARN("prebuilt async circuit build failed (backoff: %d consecutive)",
+                 g_consecutive_build_failures);
         /* cbuild_finish already cleaned up conn refcount + freed circuit */
         return;
+    }
+
+    /* Success — reset backoff */
+    if (g_consecutive_build_failures > 0) {
+        g_consecutive_build_failures = 0;
+        prebuilt_adjust_interval();
     }
 
     /* Circuit is fully built -- add to prebuilt pool */
@@ -232,13 +265,43 @@ static void prebuilt_timer_cb(void *arg) {
         return;
     }
 
-    if (moor_circuit_build_async(circ, conn, &g_client_consensus,
-                                  g_socks5_config.identity_pk,
-                                  g_socks5_config.identity_sk,
-                                  prebuilt_build_complete, NULL) != 0) {
-        moor_circuit_free(circ);
-        moor_connection_free(conn);
-        return;
+    /* Route through bridge if configured.
+     * build_bridge is synchronous and blocks the event loop -- cap
+     * concurrent builds to 1 to prevent stacking (#R1-E2). */
+    if (g_use_bridges && g_config.num_bridges > 0) {
+        static int g_bridge_build_in_progress = 0;
+        if (g_bridge_build_in_progress) {
+            LOG_WARN("bridge build already in progress, skipping to avoid event loop stacking");
+            moor_circuit_free(circ);
+            moor_connection_free(conn);
+            return;
+        }
+        g_bridge_build_in_progress = 1;
+        if (moor_circuit_build_bridge(circ, conn, &g_client_consensus,
+                                       g_socks5_config.identity_pk,
+                                       g_socks5_config.identity_sk,
+                                       &g_config.bridges[0], 0) != 0) {
+            g_bridge_build_in_progress = 0;
+            moor_circuit_free(circ);
+            moor_connection_free(conn);
+            /* Track failure for backoff */
+            g_consecutive_build_failures++;
+            prebuilt_adjust_interval();
+            LOG_WARN("bridge build failed (backoff: %d consecutive)",
+                     g_consecutive_build_failures);
+            return;
+        }
+        g_bridge_build_in_progress = 0;
+        prebuilt_build_complete(circ, 0, NULL);
+    } else {
+        if (moor_circuit_build_async(circ, conn, &g_client_consensus,
+                                      g_socks5_config.identity_pk,
+                                      g_socks5_config.identity_sk,
+                                      prebuilt_build_complete, NULL) != 0) {
+            moor_circuit_free(circ);
+            moor_connection_free(conn);
+            return;
+        }
     }
 
     g_inflight_builds++;
@@ -448,9 +511,9 @@ static void hs_rp_read_cb(int fd, int events, void *arg) {
                                 pending->rp_circ->circuit_id,
                                 RELAY_E2E_KEM_CT, 0,
                                 kem_ct + ct_off, (uint16_t)chunk);
-                            moor_circuit_encrypt_forward(
-                                pending->rp_circ, &kcell);
-                            if (!pending->rp_circ->conn ||
+                            if (moor_circuit_encrypt_forward(
+                                pending->rp_circ, &kcell) != 0 ||
+                                !pending->rp_circ->conn ||
                                 moor_connection_send_cell(
                                     pending->rp_circ->conn, &kcell) != 0) {
                                 LOG_WARN("HS: failed to send e2e KEM CT");
@@ -637,10 +700,24 @@ static circuit_cache_entry_t *get_circuit_for_domain(const char *domain,
         moor_connection_t *bc = moor_connection_alloc();
         moor_circuit_t *bcirc = moor_circuit_alloc();
         if (bc && bcirc) {
-            if (moor_circuit_build_async(bcirc, bc, &g_client_consensus,
-                                          g_socks5_config.identity_pk,
-                                          g_socks5_config.identity_sk,
-                                          prebuilt_build_complete, NULL) == 0) {
+            int built = 0;
+            if (g_use_bridges && g_config.num_bridges > 0) {
+                if (moor_circuit_build_bridge(bcirc, bc, &g_client_consensus,
+                                               g_socks5_config.identity_pk,
+                                               g_socks5_config.identity_sk,
+                                               &g_config.bridges[0], 0) == 0) {
+                    prebuilt_build_complete(bcirc, 0, NULL);
+                    built = 1;
+                }
+            } else {
+                if (moor_circuit_build_async(bcirc, bc, &g_client_consensus,
+                                              g_socks5_config.identity_pk,
+                                              g_socks5_config.identity_sk,
+                                              prebuilt_build_complete, NULL) == 0) {
+                    built = 1;
+                }
+            }
+            if (built) {
                 g_inflight_builds++;
                 LOG_INFO("on-demand async build started for %s", domain);
             } else {
@@ -827,7 +904,9 @@ static int process_circuit_cell(moor_connection_t *conn, moor_cell_t *cell) {
 
     /* Decrypt all onion layers */
     if (moor_circuit_decrypt_backward(circ, cell) != 0) {
-        LOG_DEBUG("dropping cell with bad backward digest");
+        LOG_WARN("backward digest failure -- destroying circuit %u",
+                 circ->circuit_id);
+        moor_circuit_destroy(circ);
         return 0;
     }
 
@@ -1028,6 +1107,22 @@ static void circuit_read_cb(int fd, int events, void *arg) {
         moor_queue_flush(&conn->outq, conn, &conn->write_off);
         if (moor_queue_is_empty(&conn->outq))
             moor_event_modify(conn->fd, MOOR_EVENT_READ);
+
+        /* Resume any SOCKS5 clients that were paused due to backpressure.
+         * Now that the queue has space, re-enable reading from their fds
+         * so the kernel can deliver buffered TCP data. No bytes are lost. */
+        if (moor_queue_count(&conn->outq) < (MOOR_CELL_QUEUE_SIZE / 2)) {
+            for (int ci = 0; ci < MAX_SOCKS5_CLIENTS; ci++) {
+                moor_socks5_client_t *sc = &g_socks5_clients[ci];
+                if (sc->client_fd < 0) continue;
+                if (sc->paused && sc->circuit && sc->circuit->conn == conn) {
+                    sc->paused = 0;
+                    moor_event_add(sc->client_fd, MOOR_EVENT_READ,
+                                   socks_client_read_cb, NULL);
+                    LOG_DEBUG("backpressure: resumed client fd=%d", sc->client_fd);
+                }
+            }
+        }
     }
 
     if (!(events & MOOR_EVENT_READ))
@@ -1318,20 +1413,39 @@ int moor_socks5_handle_auth(moor_socks5_client_t *client,
     uint8_t plen = data[2 + ulen];
     if (len < (size_t)(3 + ulen + plen)) return -1;
 
-    /* Build isolation key as "user:pass" */
-    size_t off = 0;
-    size_t copy_ulen = ulen;
-    if (copy_ulen > sizeof(client->isolation_key) - 2)
-        copy_ulen = sizeof(client->isolation_key) - 2;
-    memcpy(client->isolation_key, data + 2, copy_ulen);
-    off = copy_ulen;
-    client->isolation_key[off++] = ':';
-    size_t copy_plen = plen;
-    if (off + copy_plen >= sizeof(client->isolation_key))
-        copy_plen = sizeof(client->isolation_key) - off - 1;
-    memcpy(client->isolation_key + off, data + 3 + ulen, copy_plen);
-    off += copy_plen;
-    client->isolation_key[off] = '\0';
+    /* Build isolation key as "user:pass@clientaddr" (CWE-284 fix).
+     * Including client_addr prevents different source IPs from sharing
+     * circuits via identical SOCKS credentials, which would bypass
+     * stream isolation and allow traffic correlation. */
+    {
+        /* Build "user:pass" into first half of isolation_key, then
+         * append "@clientaddr".  Cap auth_part so the full key fits. */
+        char auth_part[180];
+        size_t aoff = 0;
+        size_t copy_ulen = ulen;
+        if (copy_ulen > sizeof(auth_part) - 2)
+            copy_ulen = sizeof(auth_part) - 2;
+        memcpy(auth_part, data + 2, copy_ulen);
+        aoff = copy_ulen;
+        auth_part[aoff++] = ':';
+        size_t copy_plen = plen;
+        if (aoff + copy_plen >= sizeof(auth_part))
+            copy_plen = sizeof(auth_part) - aoff - 1;
+        memcpy(auth_part + aoff, data + 3 + ulen, copy_plen);
+        aoff += copy_plen;
+        auth_part[aoff] = '\0';
+
+        /* Compose: truncation is safe (snprintf null-terminates) */
+        size_t w = 0;
+        w += (size_t)snprintf(client->isolation_key,
+                              sizeof(client->isolation_key),
+                              "%s@", auth_part);
+        if (w < sizeof(client->isolation_key) - 1) {
+            snprintf(client->isolation_key + w,
+                     sizeof(client->isolation_key) - w,
+                     "%s", client->client_addr);
+        }
+    }
 
     /* Always accept (auth is for isolation, not access control) */
     uint8_t resp[2] = { 0x01, 0x00 }; /* success */
@@ -1562,6 +1676,22 @@ int moor_socks5_handle_request(moor_socks5_client_t *client,
 }
 
 int moor_socks5_handle_client(moor_socks5_client_t *client) {
+    /* Backpressure: for streaming states, check queue level BEFORE recv()
+     * so data stays in the kernel TCP buffer instead of being read and dropped.
+     * The kernel buffer filling up closes the sender's TCP window naturally. */
+    if ((client->state == SOCKS5_STATE_CONNECTED ||
+         client->state == SOCKS5_STATE_STREAMING) &&
+        client->circuit && client->circuit->conn &&
+        moor_queue_count(&client->circuit->conn->outq) >
+            (MOOR_CELL_QUEUE_SIZE * 3 / 4)) {
+        LOG_DEBUG("backpressure: output queue %d/%d, pausing client fd=%d (pre-recv)",
+                  moor_queue_count(&client->circuit->conn->outq),
+                  MOOR_CELL_QUEUE_SIZE, client->client_fd);
+        moor_event_remove(client->client_fd);
+        client->paused = 1;
+        return 0; /* data stays in kernel buffer, read when resumed */
+    }
+
     uint8_t buf[4096];
     ssize_t n = recv(client->client_fd, (char *)buf, sizeof(buf), 0);
     if (n <= 0) {
@@ -1570,8 +1700,8 @@ int moor_socks5_handle_client(moor_socks5_client_t *client) {
             moor_cell_t end_cell;
             moor_cell_relay(&end_cell, client->circuit->circuit_id,
                            RELAY_END, client->stream_id, NULL, 0);
-            moor_circuit_encrypt_forward(client->circuit, &end_cell);
-            if (client->circuit->conn)
+            if (moor_circuit_encrypt_forward(client->circuit, &end_cell) == 0 &&
+                client->circuit->conn)
                 moor_connection_send_cell(client->circuit->conn, &end_cell);
             moor_stream_t *s = moor_circuit_find_stream(client->circuit,
                                                          client->stream_id);
@@ -1609,6 +1739,22 @@ int moor_socks5_handle_client(moor_socks5_client_t *client) {
 int moor_socks5_forward_to_circuit(moor_socks5_client_t *client,
                                    const uint8_t *data, size_t len) {
     if (!client->circuit || !client->circuit->conn) return -1;
+
+    /* Backpressure: if the guard connection's output queue is >75% full,
+     * stop reading from this SOCKS5 client fd.  The kernel TCP receive
+     * buffer fills up, the sender's TCP window closes, and the
+     * application naturally slows down.  NO DATA IS DROPPED.
+     * The queue flush callback re-enables reading when space opens up. */
+    if (moor_queue_count(&client->circuit->conn->outq) >
+        (MOOR_CELL_QUEUE_SIZE * 3 / 4)) {
+        LOG_DEBUG("backpressure: output queue %d/%d, pausing client fd=%d",
+                  moor_queue_count(&client->circuit->conn->outq),
+                  MOOR_CELL_QUEUE_SIZE, client->client_fd);
+        moor_event_remove(client->client_fd);
+        client->paused = 1;
+        return 0; /* data already in kernel buffer, will be read when resumed */
+    }
+
     LOG_DEBUG("forwarding %zu bytes from SOCKS5 client to circuit (stream %u)",
               len, client->stream_id);
 
@@ -1831,8 +1977,8 @@ void moor_socks5_check_stream_timeouts(void) {
             moor_cell_t end_cell;
             moor_cell_relay(&end_cell, c->circuit->circuit_id,
                            RELAY_END, c->stream_id, NULL, 0);
-            moor_circuit_encrypt_forward(c->circuit, &end_cell);
-            if (c->circuit->conn)
+            if (moor_circuit_encrypt_forward(c->circuit, &end_cell) == 0 &&
+                c->circuit->conn)
                 moor_connection_send_cell(c->circuit->conn, &end_cell);
             moor_stream_t *s = moor_circuit_find_stream(c->circuit,
                                                          c->stream_id);

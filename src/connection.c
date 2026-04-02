@@ -29,6 +29,7 @@ static void ensure_wsa(void) {
 #include <netdb.h>
 #include <poll.h>
 #include <pthread.h>
+#include <netinet/tcp.h>
 #define ensure_wsa()
 #endif
 
@@ -120,8 +121,10 @@ moor_connection_t *moor_connection_alloc(void) {
     if (!g_conn_pool_init) moor_connection_init_pool();
     for (int i = 0; i < MOOR_MAX_CONNECTIONS; i++) {
         if (g_conn_pool[i].fd == -1 && g_conn_pool[i].state == CONN_STATE_NONE) {
+            uint32_t gen = g_conn_pool[i].generation;
             memset(&g_conn_pool[i], 0, sizeof(moor_connection_t));
             g_conn_pool[i].fd = -1;
+            g_conn_pool[i].generation = gen + 1; /* detect slot reuse (#CWE-362) */
             moor_queue_init(&g_conn_pool[i].outq);
             moor_monitor_stats()->connections_active++;
             conn_pool_unlock();
@@ -151,7 +154,9 @@ void moor_connection_free(moor_connection_t *conn) {
     moor_crypto_wipe(conn->recv_buf, sizeof(conn->recv_buf));
     if (moor_monitor_stats()->connections_active > 0)
         moor_monitor_stats()->connections_active--;
+    uint32_t saved_gen = conn->generation;
     memset(conn, 0, sizeof(*conn));
+    conn->generation = saved_gen;
     conn->fd = -1;
     conn_pool_unlock();
 }
@@ -216,12 +221,11 @@ int moor_tcp_connect_simple(const char *address, uint16_t port) {
             freeaddrinfo(res);
             return -1;
         }
-        /* Wait for connect to complete (5 second timeout) */
-        fd_set wfds;
-        FD_ZERO(&wfds);
-        FD_SET(fd, &wfds);
-        struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
-        if (select(fd + 1, NULL, &wfds, NULL, &tv) <= 0) {
+        /* Wait for connect to complete (5 second timeout).
+         * Use poll() instead of select() to avoid stack overflow
+         * when fd >= FD_SETSIZE (CWE-787). */
+        struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+        if (poll(&pfd, 1, 5000) <= 0) {
             close(fd);
             freeaddrinfo(res);
             return -1;
@@ -479,12 +483,14 @@ static int link_handshake_client(moor_connection_t *conn,
         LOG_ERROR("Noise_IK: peer identity unknown -- refusing handshake "
                   "(all connections require authenticated peer identity)");
         moor_crypto_wipe(our_curve_sk, 32);
+        moor_crypto_wipe(h, 32); moor_crypto_wipe(ck, 32);
         return -1;
     }
 
     if (moor_crypto_ed25519_to_curve25519_pk(peer_curve_pk, conn->peer_identity) != 0) {
         LOG_ERROR("Noise_IK: failed to convert peer identity");
         moor_crypto_wipe(our_curve_sk, 32);
+        moor_crypto_wipe(h, 32); moor_crypto_wipe(ck, 32);
         return -1;
     }
 
@@ -506,10 +512,9 @@ static int link_handshake_client(moor_connection_t *conn,
     /* -> es: DH(e_i, rs) */
     uint8_t dh_es[32];
     uint8_t k[32]; /* current symmetric key */
+    int ret = 0; /* success by default; set to -1 on error */
     if (moor_crypto_dh(dh_es, e_sk, peer_curve_pk) != 0) {
-        moor_crypto_wipe(e_sk, 32);
-        moor_crypto_wipe(our_curve_sk, 32);
-        return -1;
+        ret = -1; goto cleanup_client;
     }
     noise_mix_key(ck, k, dh_es, 32);
     moor_crypto_wipe(dh_es, 32);
@@ -519,17 +524,13 @@ static int link_handshake_client(moor_connection_t *conn,
     size_t enc_s_len;
     if (noise_encrypt_and_hash(encrypted_s, &enc_s_len,
                                 our_curve_pk, 32, h, k) != 0) {
-        moor_crypto_wipe(e_sk, 32);
-        moor_crypto_wipe(our_curve_sk, 32);
-        return -1;
+        ret = -1; goto cleanup_client;
     }
 
     /* -> ss: DH(is, rs) */
     uint8_t dh_ss[32];
     if (moor_crypto_dh(dh_ss, our_curve_sk, peer_curve_pk) != 0) {
-        moor_crypto_wipe(e_sk, 32);
-        moor_crypto_wipe(our_curve_sk, 32);
-        return -1;
+        ret = -1; goto cleanup_client;
     }
     noise_mix_key(ck, k, dh_ss, 32);
     moor_crypto_wipe(dh_ss, 32);
@@ -542,9 +543,7 @@ static int link_handshake_client(moor_connection_t *conn,
     ssize_t n = conn_send(conn, msg1, 80);
     if (n != 80) {
         LOG_ERROR("Noise_IK: msg1 send failed");
-        moor_crypto_wipe(e_sk, 32);
-        moor_crypto_wipe(our_curve_sk, 32);
-        return -1;
+        ret = -1; goto cleanup_client;
     }
 
     /* --- Receive Message 2 --- */
@@ -555,9 +554,7 @@ static int link_handshake_client(moor_connection_t *conn,
         ssize_t n = conn_recv(conn, msg2 + total, 48 - total);
         if (n <= 0) {
             LOG_ERROR("Noise_IK: msg2 recv failed");
-            moor_crypto_wipe(e_sk, 32);
-            moor_crypto_wipe(our_curve_sk, 32);
-            return -1;
+            ret = -1; goto cleanup_client;
         }
         total += n;
     }
@@ -569,9 +566,7 @@ static int link_handshake_client(moor_connection_t *conn,
     /* ee: DH(e_i, e_r) */
     uint8_t dh_ee[32];
     if (moor_crypto_dh(dh_ee, e_sk, re_pk) != 0) {
-        moor_crypto_wipe(e_sk, 32);
-        moor_crypto_wipe(our_curve_sk, 32);
-        return -1;
+        ret = -1; goto cleanup_client;
     }
     noise_mix_key(ck, k, dh_ee, 32);
     moor_crypto_wipe(dh_ee, 32);
@@ -583,9 +578,7 @@ static int link_handshake_client(moor_connection_t *conn,
      * From initiator's perspective for msg2: se = DH(is_sk, re_pk) */
     uint8_t dh_se[32];
     if (moor_crypto_dh(dh_se, our_curve_sk, re_pk) != 0) {
-        moor_crypto_wipe(e_sk, 32);
-        moor_crypto_wipe(our_curve_sk, 32);
-        return -1;
+        ret = -1; goto cleanup_client;
     }
     noise_mix_key(ck, k, dh_se, 32);
     moor_crypto_wipe(dh_se, 32);
@@ -596,9 +589,7 @@ static int link_handshake_client(moor_connection_t *conn,
     if (noise_decrypt_and_hash(empty_pt, &empty_len,
                                 msg2 + 32, 16, h, k) != 0) {
         LOG_ERROR("Noise_IK: msg2 auth failed -- wrong responder identity");
-        moor_crypto_wipe(e_sk, 32);
-        moor_crypto_wipe(our_curve_sk, 32);
-        return -1;
+        ret = -1; goto cleanup_client;
     }
 
     /* Split: derive send/recv keys from final chaining key */
@@ -616,15 +607,17 @@ static int link_handshake_client(moor_connection_t *conn,
 
     /* peer_identity is already set by caller (required for Noise_IK pre-message) */
 
-    moor_crypto_wipe(e_sk, 32);
-    moor_crypto_wipe(our_curve_sk, 32);
-    moor_crypto_wipe(ck, 32);
-    moor_crypto_wipe(k, 32);
     moor_crypto_wipe(k1, 32);
     moor_crypto_wipe(k2, 32);
-    moor_crypto_wipe(h, 32);
 
-    return 0;
+cleanup_client:
+    moor_crypto_wipe(e_sk, 32);
+    moor_crypto_wipe(our_curve_sk, 32);
+    moor_crypto_wipe(h, 32);
+    moor_crypto_wipe(ck, 32);
+    moor_crypto_wipe(k, 32);
+
+    return ret;
 }
 
 /* Noise_IK responder (server side) */
@@ -653,6 +646,10 @@ static int link_handshake_server(moor_connection_t *conn,
               our_identity_pk[0], our_identity_pk[1], our_identity_pk[2], our_identity_pk[3],
               our_curve_pk[0], our_curve_pk[1], our_curve_pk[2], our_curve_pk[3]);
 
+    uint8_t k[32];
+    memset(k, 0, 32);
+    int ret = 0; /* success by default; set to -1 on error */
+
     /* --- Receive Message 1 --- */
     uint8_t msg1[80]; /* e_pk(32) + encrypted_s(48) */
     size_t total = 0;
@@ -660,8 +657,7 @@ static int link_handshake_server(moor_connection_t *conn,
         ssize_t n = conn_recv(conn, msg1 + total, 80 - total);
         if (n <= 0) {
             LOG_ERROR("Noise_IK server: msg1 recv failed");
-            moor_crypto_wipe(our_curve_sk, 32);
-            return -1;
+            ret = -1; goto cleanup_server;
         }
         total += n;
     }
@@ -673,10 +669,8 @@ static int link_handshake_server(moor_connection_t *conn,
 
     /* es: DH(rs, e_i) -- from responder's perspective */
     uint8_t dh_es[32];
-    uint8_t k[32];
     if (moor_crypto_dh(dh_es, our_curve_sk, ie_pk) != 0) {
-        moor_crypto_wipe(our_curve_sk, 32);
-        return -1;
+        ret = -1; goto cleanup_server;
     }
     noise_mix_key(ck, k, dh_es, 32);
     moor_crypto_wipe(dh_es, 32);
@@ -687,15 +681,13 @@ static int link_handshake_server(moor_connection_t *conn,
     if (noise_decrypt_and_hash(initiator_curve_pk, &dec_s_len,
                                 msg1 + 32, 48, h, k) != 0) {
         LOG_ERROR("Noise_IK server: failed to decrypt initiator static pk");
-        moor_crypto_wipe(our_curve_sk, 32);
-        return -1;
+        ret = -1; goto cleanup_server;
     }
 
     /* ss: DH(rs, is) */
     uint8_t dh_ss[32];
     if (moor_crypto_dh(dh_ss, our_curve_sk, initiator_curve_pk) != 0) {
-        moor_crypto_wipe(our_curve_sk, 32);
-        return -1;
+        ret = -1; goto cleanup_server;
     }
     noise_mix_key(ck, k, dh_ss, 32);
     moor_crypto_wipe(dh_ss, 32);
@@ -714,8 +706,7 @@ static int link_handshake_server(moor_connection_t *conn,
     uint8_t dh_ee[32];
     if (moor_crypto_dh(dh_ee, e_sk, ie_pk) != 0) {
         moor_crypto_wipe(e_sk, 32);
-        moor_crypto_wipe(our_curve_sk, 32);
-        return -1;
+        ret = -1; goto cleanup_server;
     }
     noise_mix_key(ck, k, dh_ee, 32);
     moor_crypto_wipe(dh_ee, 32);
@@ -741,8 +732,7 @@ static int link_handshake_server(moor_connection_t *conn,
     uint8_t dh_se[32];
     if (moor_crypto_dh(dh_se, e_sk, initiator_curve_pk) != 0) {
         moor_crypto_wipe(e_sk, 32);
-        moor_crypto_wipe(our_curve_sk, 32);
-        return -1;
+        ret = -1; goto cleanup_server;
     }
     noise_mix_key(ck, k, dh_se, 32);
     moor_crypto_wipe(dh_se, 32);
@@ -753,8 +743,7 @@ static int link_handshake_server(moor_connection_t *conn,
     if (noise_encrypt_and_hash(encrypted_empty, &enc_empty_len,
                                 NULL, 0, h, k) != 0) {
         moor_crypto_wipe(e_sk, 32);
-        moor_crypto_wipe(our_curve_sk, 32);
-        return -1;
+        ret = -1; goto cleanup_server;
     }
 
     /* Send msg2: e_pk(32) + encrypted_empty(16) = 48 bytes */
@@ -766,8 +755,7 @@ static int link_handshake_server(moor_connection_t *conn,
     if (n != 48) {
         LOG_ERROR("Noise_IK server: msg2 send failed");
         moor_crypto_wipe(e_sk, 32);
-        moor_crypto_wipe(our_curve_sk, 32);
-        return -1;
+        ret = -1; goto cleanup_server;
     }
 
     /* Split: derive send/recv keys */
@@ -784,15 +772,18 @@ static int link_handshake_server(moor_connection_t *conn,
     memcpy(conn->our_kx_sk, our_curve_sk, 32);
 
     moor_crypto_wipe(e_sk, 32);
-    moor_crypto_wipe(our_curve_sk, 32);
-    moor_crypto_wipe(ck, 32);
-    moor_crypto_wipe(k, 32);
     moor_crypto_wipe(k1, 32);
     moor_crypto_wipe(k2, 32);
-    moor_crypto_wipe(h, 32);
 
     LOG_DEBUG("Noise_IK link handshake complete (responder)");
-    return 0;
+
+cleanup_server:
+    moor_crypto_wipe(our_curve_sk, 32);
+    moor_crypto_wipe(h, 32);
+    moor_crypto_wipe(ck, 32);
+    moor_crypto_wipe(k, 32);
+
+    return ret;
 }
 
 /*
@@ -812,6 +803,13 @@ int link_handshake_client_pq(moor_connection_t *conn,
     /* Step 1: Complete Noise_IK handshake first */
     if (link_handshake_client(conn, our_identity_pk, our_identity_sk) != 0)
         return -1;
+
+    /* Noise_IK established AEAD keys — mark connection as OPEN so
+     * send_cell/recv_cell work during the PQ key exchange.
+     * NOTE: CONN_STATE_OPEN is set early; pq_handshake_done tracks
+     * whether the PQ KEM mix has actually completed. */
+    conn->state = CONN_STATE_OPEN;
+    conn->pq_handshake_done = 0;
 
     /* Step 2: Generate ephemeral Kyber768 keypair */
     uint8_t kem_pk[MOOR_KEM_PK_LEN], kem_sk[MOOR_KEM_SK_LEN];
@@ -843,20 +841,26 @@ int link_handshake_client_pq(moor_connection_t *conn,
 
     /* Step 3: Receive kyber_ct through the AEAD cell channel */
     uint8_t kem_ct[MOOR_KEM_CT_LEN];
-    size_t total = 0;
-    while (total < MOOR_KEM_CT_LEN) {
+    size_t ct_total = 0;
+    while (ct_total < MOOR_KEM_CT_LEN) {
         moor_cell_t kcell;
-        if (moor_connection_recv_cell(conn, &kcell) <= 0 ||
-            kcell.command != CELL_KEM_CT) {
+        int rr = 0;
+        /* TODO: replace spin-loop with async I/O (temporary fix) */
+        for (int attempt = 0; attempt < 1000; attempt++) {
+            rr = moor_connection_recv_cell(conn, &kcell);
+            if (rr != 0) break;
+            usleep(1000);
+        }
+        if (rr <= 0 || kcell.command != CELL_KEM_CT) {
             LOG_ERROR("PQ hybrid: recv kyber_ct cell failed");
             moor_crypto_wipe(kem_sk, MOOR_KEM_SK_LEN);
             return -1;
         }
-        size_t space = MOOR_KEM_CT_LEN - total;
+        size_t space = MOOR_KEM_CT_LEN - ct_total;
         size_t chunk = MOOR_CELL_PAYLOAD;
         if (chunk > space) chunk = space;
-        memcpy(kem_ct + total, kcell.payload, chunk);
-        total += chunk;
+        memcpy(kem_ct + ct_total, kcell.payload, chunk);
+        ct_total += chunk;
     }
 
     /* Step 4: KEM decapsulate */
@@ -888,6 +892,7 @@ int link_handshake_client_pq(moor_connection_t *conn,
     moor_crypto_wipe(new_recv2, 32);
     moor_crypto_wipe(dummy, 32);
 
+    conn->pq_handshake_done = 1;
     LOG_DEBUG("PQ hybrid Noise_IK link handshake complete (client)");
     return 0;
 }
@@ -900,13 +905,28 @@ int link_handshake_server_pq(moor_connection_t *conn,
     if (link_handshake_server(conn, our_identity_pk, our_identity_sk) != 0)
         return -1;
 
-    /* Step 2: Receive kyber_pk from client via AEAD cell channel */
+    /* Noise_IK established AEAD keys — mark connection as OPEN so
+     * send_cell/recv_cell work during the PQ key exchange.
+     * NOTE: CONN_STATE_OPEN is set early; pq_handshake_done tracks
+     * whether the PQ KEM mix has actually completed. */
+    conn->state = CONN_STATE_OPEN;
+    conn->pq_handshake_done = 0;
+
+    /* Step 2: Receive kyber_pk from client via AEAD cell channel.
+     * recv_cell uses poll(0) which returns immediately if no data.
+     * In this sync handshake context, we need to wait for data. */
     uint8_t kem_pk[MOOR_KEM_PK_LEN];
     size_t total = 0;
     while (total < MOOR_KEM_PK_LEN) {
         moor_cell_t kcell;
-        if (moor_connection_recv_cell(conn, &kcell) <= 0 ||
-            kcell.command != CELL_KEM_CT) {
+        int rr = 0;
+        /* TODO: replace spin-loop with async I/O (temporary fix) */
+        for (int attempt = 0; attempt < 1000; attempt++) {
+            rr = moor_connection_recv_cell(conn, &kcell);
+            if (rr != 0) break; /* got data or error */
+            usleep(1000); /* wait 1ms before retry */
+        }
+        if (rr <= 0 || kcell.command != CELL_KEM_CT) {
             LOG_ERROR("PQ hybrid server: recv kyber_pk cell failed");
             return -1;
         }
@@ -961,6 +981,7 @@ int link_handshake_server_pq(moor_connection_t *conn,
     moor_crypto_wipe(new_recv2, 32);
     moor_crypto_wipe(dummy, 32);
 
+    conn->pq_handshake_done = 1;
     LOG_DEBUG("PQ hybrid Noise_IK link handshake complete (server)");
     return 0;
 }
@@ -1082,11 +1103,22 @@ int moor_connection_accept_fd(moor_connection_t *conn, int client_fd,
     /* Clear handshake timeout -- must not persist on data-path sockets */
     moor_set_socket_timeout(client_fd, 0);
 
-    /* Enable TCP keepalive to survive NAT/firewall idle timeouts */
+    /* Aggressive TCP keepalive: detect dead connections in ~90s instead
+     * of the default ~2h.  Prevents connection pool exhaustion when
+     * clients disconnect without sending RST (WSL, mobile, NAT). */
     int keepalive = 1;
     setsockopt(client_fd, SOL_SOCKET, SO_KEEPALIVE,
                (const char *)&keepalive, sizeof(keepalive));
+#ifdef __linux__
+    int keepidle = 60;   /* seconds before first probe */
+    int keepintvl = 10;  /* seconds between probes */
+    int keepcnt = 3;     /* probes before declaring dead */
+    setsockopt(client_fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
+    setsockopt(client_fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+    setsockopt(client_fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
+#endif
 
+    conn->last_activity = (uint64_t)time(NULL);
     LOG_INFO("accepted connection on fd %d", client_fd);
     return 0;
 }
@@ -1189,6 +1221,8 @@ int moor_connection_send_cell(moor_connection_t *conn,
         }
     }
 
+    conn->last_activity = (uint64_t)time(NULL);
+
     /* Bump monitoring stats */
     moor_stats_t *stats = moor_monitor_stats();
     stats->cells_sent++;
@@ -1278,6 +1312,7 @@ int moor_connection_recv_cell(moor_connection_t *conn, moor_cell_t *cell) {
 
     /* Network liveness: any successful cell decrypt = network is alive */
     moor_liveness_note_activity();
+    conn->last_activity = (uint64_t)time(NULL);
 
     /* Bump monitoring stats */
     {
@@ -1324,6 +1359,11 @@ moor_connection_t *moor_connection_find_by_identity(const uint8_t peer_id[32]) {
         }
     }
     conn_pool_unlock();
+    /* SAFETY: The returned pointer is valid because all callers run on the
+     * single-threaded event loop.  No connection can be freed between unlock
+     * and the caller's first use of the result.  If MOOR ever moves to
+     * multi-threaded connection management, this must be changed to bump
+     * circuit_refcount under the lock and require callers to release it. */
     return found;
 }
 
@@ -1491,4 +1531,34 @@ int moor_connection_connect_async(moor_connection_t *conn,
     moor_event_add(fd, MOOR_EVENT_WRITE, async_connect_write_cb, conn);
 
     return 0;
+}
+
+/* Reap idle connections that have had no cell activity for max_idle_sec.
+ * Called periodically by relay/bridge timer to prevent pool exhaustion
+ * from zombie connections (clients that vanished without RST). */
+int moor_connection_reap_idle(int max_idle_sec) {
+    uint64_t now = (uint64_t)time(NULL);
+    int reaped = 0;
+
+    conn_pool_lock();
+    for (int i = 0; i < MOOR_MAX_CONNECTIONS; i++) {
+        moor_connection_t *c = &g_conn_pool[i];
+        if (c->fd < 0 || c->state != CONN_STATE_OPEN) continue;
+        if (c->last_activity == 0) continue; /* never stamped = just opened */
+        if ((int64_t)(now - c->last_activity) > max_idle_sec) {
+            LOG_DEBUG("reaper: closing idle connection fd=%d (idle %lus)",
+                      c->fd, (unsigned long)(now - c->last_activity));
+            conn_pool_unlock();
+            moor_event_remove(c->fd);
+            moor_circuit_teardown_for_conn(c);
+            moor_connection_close(c);
+            conn_pool_lock();
+            reaped++;
+        }
+    }
+    conn_pool_unlock();
+
+    if (reaped > 0)
+        LOG_INFO("reaper: closed %d idle connections", reaped);
+    return reaped;
 }

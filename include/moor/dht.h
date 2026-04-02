@@ -108,6 +108,62 @@ int moor_dht_handle_fetch(moor_circuit_t *circ,
 int moor_dht_handle_pir_query(moor_circuit_t *circ,
                                 const uint8_t *payload, uint16_t len);
 
+/* --- DPF-PIR (Distributed Point Function) ---
+ *
+ * Upgrade from XOR-bitmask PIR to DPF-based PIR using the
+ * Boyle-Gilboa-Ishai construction.  DPF keys are O(lambda * log(n))
+ * bits, much smaller than the n-bit bitmask for large n.
+ *
+ * For n=256 (MOOR_DHT_MAX_STORED), DPF keys are ~152 bytes
+ * vs 32 bytes for the bitmask.  The advantage is that DPF keys
+ * reveal no information about the target index to either server
+ * individually, whereas the bitmask reveals which bits differ.
+ *
+ * Each DPF key contains a seed and log2(n)=8 correction words.
+ * Evaluation uses ChaCha20 as the PRG at each tree level.
+ */
+
+#define DPF_LAMBDA       16   /* 128-bit security parameter (bytes) */
+#define DPF_LEVELS        8   /* log2(256) = 8 tree levels */
+#define DPF_DOMAIN_SIZE 256   /* number of points = MOOR_DHT_MAX_STORED */
+
+/* Correction word: PRG block + control bit */
+typedef struct {
+    uint8_t s[DPF_LAMBDA];    /* seed correction */
+    uint8_t t_left;           /* control bit correction for left child */
+    uint8_t t_right;          /* control bit correction for right child */
+} dpf_cw_t;
+
+/* DPF key (one half of the key pair) */
+typedef struct {
+    uint8_t  seed[DPF_LAMBDA];           /* initial seed */
+    uint8_t  t;                          /* initial control bit (0 or 1) */
+    dpf_cw_t cw[DPF_LEVELS];            /* correction words */
+    uint8_t  cw_leaf[DPF_LAMBDA];       /* leaf-level correction word */
+} dpf_key_t;
+
+/* Wire size: seed(16) + t(1) + 8*(16+1+1) + 16 = 177 bytes */
+#define DPF_KEY_WIRE_SIZE  (DPF_LAMBDA + 1 + DPF_LEVELS * (DPF_LAMBDA + 2) + DPF_LAMBDA)
+
+/* Generate a DPF key pair for the point function f(target)=1, f(x)=0.
+ * key_a is for server A, key_b is for server B. */
+void moor_dpf_gen(dpf_key_t *key_a, dpf_key_t *key_b, uint8_t target);
+
+/* Evaluate a DPF key at all points [0, n).  output[i] is 1 if the
+ * point function evaluates to 1 at i, 0 otherwise.  The XOR of
+ * eval(key_a) and eval(key_b) produces the point function. */
+void moor_dpf_eval_full(uint8_t *output, const dpf_key_t *key, int n);
+
+/* Serialize/deserialize DPF key for wire transmission */
+void moor_dpf_key_serialize(uint8_t *out, const dpf_key_t *key);
+int  moor_dpf_key_deserialize(dpf_key_t *key, const uint8_t *data, size_t len);
+
+/* Handle RELAY_DHT_DPF_QUERY: DPF-PIR query over the DHT store.
+ * Payload: query_id(4) + dpf_key(DPF_KEY_WIRE_SIZE) = 181 bytes.
+ * Responds with RELAY_DHT_DPF_RESPONSE containing evaluation result. */
+int moor_dht_handle_dpf_query(moor_circuit_t *circ,
+                               const uint8_t *payload, uint16_t len);
+
 /* --- HS-side publish and client-side fetch --- */
 
 /* HS publishes descriptor to k responsible relays + DA fallback.

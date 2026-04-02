@@ -189,6 +189,7 @@ typedef enum {
 #include "exit_sla.h"
 #include "transport_shade.h"
 #include "transport_mirage.h"
+#include "transport_shitstorm.h"
 #include "crypto_worker.h"
 #include "dht.h"
 #include "mix.h"

@@ -51,6 +51,55 @@
 #define TLS_AES_256_GCM_SHA384        0x1302
 #define TLS_CHACHA20_POLY1305_SHA256  0x1303
 
+/* Default SNI pool -- rotated per connection to prevent fingerprinting.
+ * Bridge operators can override via MirageSNI config (comma-separated).
+ * Selected domains: widely used, TLS 1.3, cloud-hosted, hard to block. */
+static const char *g_default_sni_pool[] = {
+    "cdn.jsdelivr.net",
+    "cdnjs.cloudflare.com",
+    "ajax.googleapis.com",
+    "fonts.googleapis.com",
+    "unpkg.com",
+    "cdn.bootcdn.net",
+    "lib.baomitu.com",
+    "assets-cdn.github.com",
+    "stackpath.bootstrapcdn.com",
+    "use.fontawesome.com",
+};
+#define DEFAULT_SNI_POOL_SIZE (sizeof(g_default_sni_pool) / sizeof(g_default_sni_pool[0]))
+
+/* Operator-configurable SNI pool (set via MirageSNI in moorrc) */
+#define MAX_CUSTOM_SNI 64
+static char g_custom_sni_buf[MAX_CUSTOM_SNI][256];
+static const char *g_custom_sni[MAX_CUSTOM_SNI];
+static int g_custom_sni_count = 0;
+
+void moor_mirage_set_sni_pool(const char *csv) {
+    g_custom_sni_count = 0;
+    if (!csv || !csv[0]) return;
+    char buf[4096];
+    snprintf(buf, sizeof(buf), "%s", csv);
+    char *saveptr = NULL;
+    char *tok = strtok_r(buf, ",", &saveptr);
+    while (tok && g_custom_sni_count < MAX_CUSTOM_SNI) {
+        while (*tok == ' ') tok++;
+        if (*tok) {
+            snprintf(g_custom_sni_buf[g_custom_sni_count], 256, "%s", tok);
+            g_custom_sni[g_custom_sni_count] = g_custom_sni_buf[g_custom_sni_count];
+            g_custom_sni_count++;
+        }
+        tok = strtok_r(NULL, ",", &saveptr);
+    }
+}
+
+static int sni_pool_size(void) {
+    return g_custom_sni_count > 0 ? g_custom_sni_count : (int)DEFAULT_SNI_POOL_SIZE;
+}
+static const char *sni_pool_get(int idx) {
+    if (g_custom_sni_count > 0) return g_custom_sni[idx % g_custom_sni_count];
+    return g_default_sni_pool[idx % DEFAULT_SNI_POOL_SIZE];
+}
+
 /* Transport state -- includes ChaCha20 stream cipher keys derived from
  * a real x25519 DH during the fake TLS handshake. This makes the TLS
  * camouflage indistinguishable from genuine TLS 1.3 to deep inspection. */
@@ -62,6 +111,7 @@ typedef struct {
     uint8_t  recv_key[32];   /* ChaCha20 key for incoming records */
     uint64_t send_nonce;
     uint64_t recv_nonce;
+    uint64_t records_sent;   /* Track sent records for first-record padding */
 } mirage_state_t;
 
 /* Helper: send all bytes */
@@ -95,29 +145,103 @@ static void tls_record_header(uint8_t *hdr, uint8_t type, uint16_t length) {
     hdr[4] = (uint8_t)(length);
 }
 
-/* Generate random domain-like string for SNI (M2: expanded to 64 high-traffic domains) */
+/* Select a random SNI from the CDN/cloud pool to prevent fingerprinting.
+ * These domains are all CDN/cloud-hosted, TLS 1.3, multi-IP, and unlikely
+ * to be individually blocked -- much harder to fingerprint than major sites. */
 static void generate_random_sni(char *out, size_t out_len) {
-    static const char *domains[] = {
-        "www.google.com", "www.youtube.com", "www.facebook.com", "www.amazon.com",
-        "www.wikipedia.org", "www.twitter.com", "www.instagram.com", "www.linkedin.com",
-        "www.reddit.com", "www.netflix.com", "www.microsoft.com", "www.apple.com",
-        "www.bing.com", "www.yahoo.com", "www.whatsapp.com", "www.tiktok.com",
-        "cdn.cloudflare.com", "cdn.cloudfront.net", "ajax.googleapis.com", "fonts.gstatic.com",
-        "static.akamai.net", "content.googleapis.com", "ssl.gstatic.com", "apis.google.com",
-        "maps.googleapis.com", "play.google.com", "clients.google.com", "lh3.googleusercontent.com",
-        "update.googleapis.com", "storage.googleapis.com", "translate.googleapis.com", "fonts.googleapis.com",
-        "cdn.jsdelivr.net", "cdnjs.cloudflare.com", "unpkg.com", "stackpath.bootstrapcdn.com",
-        "code.jquery.com", "maxcdn.bootstrapcdn.com", "use.fontawesome.com", "cdn.shopify.com",
-        "api.github.com", "raw.githubusercontent.com", "objects.githubusercontent.com", "camo.githubusercontent.com",
-        "gateway.discord.gg", "cdn.discordapp.com", "media.discordapp.net", "images-na.ssl-images-amazon.com",
-        "m.media-amazon.com", "fls-na.amazon.com", "completion.amazon.com", "s3.amazonaws.com",
-        "ec2.amazonaws.com", "sqs.amazonaws.com", "dynamodb.amazonaws.com", "lambda.amazonaws.com",
-        "graph.facebook.com", "static.xx.fbcdn.net", "scontent.xx.fbcdn.net", "connect.facebook.net",
-        "platform.twitter.com", "abs.twimg.com", "pbs.twimg.com", "api.twitter.com",
-    };
-    uint32_t idx;
-    moor_crypto_random((uint8_t *)&idx, 4);
-    snprintf(out, out_len, "%s", domains[idx % (sizeof(domains) / sizeof(domains[0]))]);
+    uint32_t sni_idx;
+    moor_crypto_random((uint8_t *)&sni_idx, sizeof(sni_idx));
+    snprintf(out, out_len, "%s", sni_pool_get(sni_idx % sni_pool_size()));
+}
+
+/* Send fake encrypted handshake records to close the missing-Certificate tell.
+ * Real TLS 1.3 sends EncryptedExtensions + Certificate + CertificateVerify +
+ * Finished as encrypted records after ServerHello + CCS.  Without these, DPI
+ * can detect the absence of a certificate chain.
+ *
+ * We generate 3-5 records with content_type=0x17 (application data -- TLS 1.3
+ * wraps all post-ServerHello content in app-data records) with random content
+ * totalling 2000-4000 bytes, mimicking a real certificate chain exchange. */
+static int send_fake_encrypted_hs(int fd) {
+    uint32_t rval;
+    moor_crypto_random((uint8_t *)&rval, sizeof(rval));
+    size_t total_target = 2000 + (rval % 2001); /* 2000-4000 bytes total */
+
+    /* Split into 3-5 records of varying size */
+    uint32_t nrecs_rnd;
+    moor_crypto_random((uint8_t *)&nrecs_rnd, sizeof(nrecs_rnd));
+    int num_records = 3 + (int)(nrecs_rnd % 3); /* 3, 4, or 5 records */
+    size_t remaining = total_target;
+
+    for (int i = 0; i < num_records; i++) {
+        size_t rec_payload;
+        if (i == num_records - 1) {
+            rec_payload = remaining;
+        } else {
+            /* Distribute remaining bytes unevenly across remaining records */
+            uint32_t frac;
+            moor_crypto_random((uint8_t *)&frac, sizeof(frac));
+            int left = num_records - i;
+            size_t avg = remaining / (size_t)left;
+            /* Vary between 60%-140% of average */
+            rec_payload = (avg * 60 + (avg * 80 * (frac % 100)) / 100) / 100;
+            if (rec_payload > remaining) rec_payload = remaining;
+            if (rec_payload < 32) rec_payload = 32;
+        }
+        if (rec_payload > TLS_MAX_FRAGMENT) rec_payload = TLS_MAX_FRAGMENT;
+
+        uint8_t hdr[TLS_RECORD_HEADER];
+        tls_record_header(hdr, TLS_APPLICATION_DATA, (uint16_t)rec_payload);
+        if (send_all(fd, hdr, TLS_RECORD_HEADER) != 0) return -1;
+
+        /* Send random content in chunks to avoid huge stack allocation */
+        size_t sent = 0;
+        while (sent < rec_payload) {
+            uint8_t chunk[512];
+            size_t csz = rec_payload - sent;
+            if (csz > sizeof(chunk)) csz = sizeof(chunk);
+            moor_crypto_random(chunk, csz);
+            if (send_all(fd, chunk, csz) != 0) return -1;
+            sent += csz;
+        }
+        remaining -= rec_payload;
+    }
+
+    /* Send zero-length marker record so client knows fake HS is done */
+    uint8_t marker[TLS_RECORD_HEADER];
+    tls_record_header(marker, TLS_APPLICATION_DATA, 0);
+    if (send_all(fd, marker, TLS_RECORD_HEADER) != 0) return -1;
+
+    return 0;
+}
+
+/* Consume fake encrypted handshake records sent by server after CCS.
+ * Reads TLS application data records until we see a short marker record
+ * (0 bytes payload) or until total bytes consumed reaches 4000+.
+ * These are random-filled and simply discarded. */
+static int recv_fake_encrypted_hs(int fd) {
+    size_t total = 0;
+    const size_t max_total = 5000; /* generous upper bound */
+    while (total < max_total) {
+        uint8_t hdr[TLS_RECORD_HEADER];
+        if (recv_all(fd, hdr, TLS_RECORD_HEADER) != 0) return -1;
+        if (hdr[0] != TLS_APPLICATION_DATA) return -1;
+        uint16_t rec_len = ((uint16_t)hdr[3] << 8) | hdr[4];
+        if (rec_len == 0) break; /* marker: end of fake HS records */
+        if (rec_len > TLS_MAX_FRAGMENT) return -1;
+
+        /* Read and discard in chunks */
+        size_t consumed = 0;
+        while (consumed < rec_len) {
+            uint8_t discard[512];
+            size_t csz = rec_len - consumed;
+            if (csz > sizeof(discard)) csz = sizeof(discard);
+            if (recv_all(fd, discard, csz) != 0) return -1;
+            consumed += csz;
+        }
+        total += rec_len;
+    }
+    return 0;
 }
 
 /* Extract x25519 public key from a ClientHello body's key_share extension */
@@ -139,10 +263,14 @@ static int extract_key_share_from_ch(const uint8_t *body, size_t body_len,
         uint16_t ext_type = ((uint16_t)body[pos] << 8) | body[pos + 1];
         uint16_t ext_len  = ((uint16_t)body[pos + 2] << 8) | body[pos + 3];
         pos += 4;
+        /* R10-INT4: Bounds check extension length against body size */
+        if (pos + ext_len > body_len) return -1;
         if (ext_type == 0x0033 && ext_len >= 38 && pos + 38 <= ext_end) {
             /* key_share: shares_len(2) + group(2) + key_len(2) + key(32) */
+            uint16_t group = ((uint16_t)body[pos + 2] << 8) | body[pos + 3];
             uint16_t key_len = ((uint16_t)body[pos + 4] << 8) | body[pos + 5];
-            if (key_len == 32) {
+            /* R10-INT3: Reject non-x25519 groups to match ShitStorm validation */
+            if (group == 0x001d && key_len == 32) {
                 memcpy(pk_out, body + pos + 6, 32);
                 return 0;
             }
@@ -154,10 +282,12 @@ static int extract_key_share_from_ch(const uint8_t *body, size_t body_len,
 
 /* Derive transport send/recv keys from x25519 DH shared secret + transcript.
  * H1: Binds handshake transcript into key derivation to prevent MitM.
+ * static_dh: optional 32-byte static-ephemeral DH result for MITM resistance (#6).
  * is_initiator: 1 for client, 0 for server (determines key direction). */
 static int mirage_derive_keys(mirage_state_t *st,
                                  const uint8_t our_sk[32],
                                  const uint8_t their_pk[32],
+                                 const uint8_t *static_dh,
                                  int is_initiator,
                                  const uint8_t *transcript,
                                  size_t transcript_len) {
@@ -178,20 +308,26 @@ static int mirage_derive_keys(mirage_state_t *st,
     if (moor_crypto_dh(shared, our_sk, their_pk) != 0)
         return -1;
 
-    /* H1: Build hkdf_input = shared(32) || BLAKE2b(transcript)(32) */
+    /* H1: Build hkdf_input = shared(32) [|| static_dh(32)] || BLAKE2b(transcript)(32)
+     * When static_dh is present, MITM cannot derive keys without the server's
+     * identity secret key (#6). */
     uint8_t transcript_hash[32];
     crypto_generichash_blake2b(transcript_hash, 32,
                                 transcript, transcript_len, NULL, 0);
-    uint8_t hkdf_input[64];
-    memcpy(hkdf_input, shared, 32);
-    memcpy(hkdf_input + 32, transcript_hash, 32);
+    uint8_t hkdf_input[96]; /* max: shared(32) + static_dh(32) + hash(32) */
+    size_t hkdf_len = 0;
+    memcpy(hkdf_input + hkdf_len, shared, 32); hkdf_len += 32;
     sodium_memzero(shared, 32);
+    if (static_dh) {
+        memcpy(hkdf_input + hkdf_len, static_dh, 32); hkdf_len += 32;
+    }
+    memcpy(hkdf_input + hkdf_len, transcript_hash, 32); hkdf_len += 32;
 
     /* HKDF-BLAKE2b: derive 64 bytes of key material */
     uint8_t km[64];
     static const uint8_t label[] = "moor-tls-camo-keys";
-    crypto_generichash_blake2b(km, 64, hkdf_input, 64, label, sizeof(label) - 1);
-    sodium_memzero(hkdf_input, 64);
+    crypto_generichash_blake2b(km, 64, hkdf_input, hkdf_len, label, sizeof(label) - 1);
+    sodium_memzero(hkdf_input, sizeof(hkdf_input));
     sodium_memzero(transcript_hash, 32);
 
     if (is_initiator) {
@@ -225,6 +361,8 @@ static int extract_key_share_from_sh(const uint8_t *body, size_t body_len,
         uint16_t ext_type = ((uint16_t)body[pos] << 8) | body[pos + 1];
         uint16_t ext_len  = ((uint16_t)body[pos + 2] << 8) | body[pos + 3];
         pos += 4;
+        /* R10-INT4: Bounds check extension length against body size */
+        if (pos + ext_len > body_len) return -1;
         if (ext_type == 0x0033 && ext_len >= 36 && pos + 36 <= ext_end) {
             /* ServerHello key_share: group(2) + key_len(2) + key(32) */
             uint16_t key_len = ((uint16_t)body[pos + 2] << 8) | body[pos + 3];
@@ -243,7 +381,8 @@ static int extract_key_share_from_sh(const uint8_t *body, size_t body_len,
  * The eph_sk_out receives the ephemeral secret key for DH.
  */
 static int build_client_hello(uint8_t *buf, size_t buf_len, const char *sni,
-                               size_t *out_len, uint8_t eph_sk_out[32]) {
+                               size_t *out_len, uint8_t eph_sk_out[32],
+                               const uint8_t node_id[32]) {
     if (buf_len < 512) return -1;
 
     size_t sni_len = strlen(sni);
@@ -259,11 +398,18 @@ static int build_client_hello(uint8_t *buf, size_t buf_len, const char *sni,
 
     /* random (32 bytes) */
     moor_crypto_random(body + pos, 32);
+    uint8_t *client_random = body + pos;
     pos += 32;
 
-    /* session_id (32 bytes, random) */
+    /* session_id = HMAC-BLAKE2b(node_id, client_random)[:32]
+     * Proves to server that client knows the relay's identity,
+     * preventing active probing by censors (#7). */
     body[pos++] = 32;  /* length */
-    moor_crypto_random(body + pos, 32);
+    if (node_id && !sodium_is_zero(node_id, 32)) {
+        moor_crypto_hash_keyed(body + pos, client_random, 32, node_id);
+    } else {
+        moor_crypto_random(body + pos, 32);
+    }
     pos += 32;
 
     /* cipher_suites */
@@ -424,7 +570,8 @@ static int mirage_client_handshake(int fd, const void *params,
     uint8_t ch_buf[512];
     size_t ch_len;
     uint8_t our_eph_sk[32];
-    if (build_client_hello(ch_buf, sizeof(ch_buf), sni, &ch_len, our_eph_sk) != 0)
+    if (build_client_hello(ch_buf, sizeof(ch_buf), sni, &ch_len, our_eph_sk,
+                           p ? p->node_id : NULL) != 0)
         return -1;
     if (send_all(fd, ch_buf, ch_len) != 0) {
         sodium_memzero(our_eph_sk, 32);
@@ -477,6 +624,15 @@ static int mirage_client_handshake(int fd, const void *params,
         return -1;
     }
 
+    /* Consume fake encrypted handshake records (EncryptedExtensions,
+     * Certificate, CertificateVerify, Finished) sent by server.
+     * These are random-filled and discarded; they exist to make the
+     * handshake indistinguishable from real TLS 1.3. */
+    if (recv_fake_encrypted_hs(fd) != 0) {
+        sodium_memzero(our_eph_sk, 32);
+        return -1;
+    }
+
     /* H1: Accumulate transcript = CH record || SH record for key binding */
     size_t transcript_len = ch_len + TLS_RECORD_HEADER + sh_len;
     uint8_t *transcript = malloc(transcript_len);
@@ -487,21 +643,39 @@ static int mirage_client_handshake(int fd, const void *params,
     memcpy(transcript, ch_buf, ch_len);
     memcpy(transcript + ch_len, sh_buf, TLS_RECORD_HEADER + sh_len);
 
+    /* Compute static-ephemeral DH for MITM resistance (#6):
+     * DH(our_eph_sk, curve25519(node_id)) binds server's identity key
+     * into session keys. MITM cannot derive this without identity_sk. */
+    uint8_t static_dh[32];
+    uint8_t *static_dh_ptr = NULL;
+    if (p && !sodium_is_zero(p->node_id, 32)) {
+        uint8_t node_curve[32];
+        if (crypto_sign_ed25519_pk_to_curve25519(node_curve, p->node_id) == 0) {
+            if (crypto_scalarmult(static_dh, our_eph_sk, node_curve) == 0 &&
+                !sodium_is_zero(static_dh, 32))
+                static_dh_ptr = static_dh;
+            sodium_memzero(node_curve, 32);
+        }
+    }
+
     /* Handshake complete -- derive transport encryption keys from DH */
     mirage_state_t *st = calloc(1, sizeof(mirage_state_t));
     if (!st) {
         sodium_memzero(our_eph_sk, 32);
+        sodium_memzero(static_dh, 32);
         free(transcript);
         return -1;
     }
-    if (mirage_derive_keys(st, our_eph_sk, server_eph_pk, 1,
+    if (mirage_derive_keys(st, our_eph_sk, server_eph_pk, static_dh_ptr, 1,
                               transcript, transcript_len) != 0) {
         sodium_memzero(our_eph_sk, 32);
+        sodium_memzero(static_dh, 32);
         free(transcript);
         free(st);
         return -1;
     }
     sodium_memzero(our_eph_sk, 32);
+    sodium_memzero(static_dh, 32);
     free(transcript);
     st->handshake_done = 1;
     *state_out = (moor_transport_state_t *)st;
@@ -510,7 +684,8 @@ static int mirage_client_handshake(int fd, const void *params,
 
 static int mirage_server_handshake(int fd, const void *params,
                                       moor_transport_state_t **state_out) {
-    (void)params;
+    const moor_mirage_server_params_t *sp =
+        (const moor_mirage_server_params_t *)params;
 
     /* Receive ClientHello */
     uint8_t ch_hdr[TLS_RECORD_HEADER];
@@ -524,6 +699,26 @@ static int mirage_server_handshake(int fd, const void *params,
     if (recv_all(fd, ch_body, ch_len) != 0) return -1;
     /* Verify handshake type is ClientHello */
     if (ch_body[0] != TLS_HS_CLIENT_HELLO) return -1;
+
+    /* Active probing defense (#7): verify session_id = HMAC(identity_pk, client_random).
+     * Only MOOR clients who know our identity can produce a valid session_id.
+     * Reject silently (return -1) to be indistinguishable from a connection timeout. */
+    if (sp && !sodium_is_zero(sp->identity_pk, 32)) {
+        if (ch_len >= 4 + 2 + 32 + 1 + 32) {
+            uint8_t *client_random = ch_body + 4 + 2; /* offset: hs_type(1)+len(3)+ver(2) */
+            uint8_t sid_len = ch_body[4 + 34];
+            if (sid_len != 32) return -1;
+            uint8_t expected_sid[32];
+            moor_crypto_hash_keyed(expected_sid, client_random, 32, sp->identity_pk);
+            if (sodium_memcmp(expected_sid, ch_body + 4 + 35, 32) != 0) {
+                sodium_memzero(expected_sid, 32);
+                return -1; /* Not a MOOR client — silent reject */
+            }
+            sodium_memzero(expected_sid, 32);
+        } else {
+            return -1; /* CH too short for session_id */
+        }
+    }
 
     uint8_t client_eph_pk[32];
     /* Body starts at offset 4 past handshake type+length */
@@ -555,6 +750,14 @@ static int mirage_server_handshake(int fd, const void *params,
         return -1;
     }
 
+    /* Send fake encrypted handshake records (EncryptedExtensions, Certificate,
+     * CertificateVerify, Finished) to close the missing-Certificate tell.
+     * Real TLS 1.3 always has these after ServerHello + CCS. */
+    if (send_fake_encrypted_hs(fd) != 0) {
+        sodium_memzero(our_eph_sk, 32);
+        return -1;
+    }
+
     /* H1: Accumulate transcript = CH record || SH record for key binding.
      * sh_buf contains SH record + CCS record; extract SH record length
      * from its header to exclude CCS (matching what client receives). */
@@ -570,21 +773,39 @@ static int mirage_server_handshake(int fd, const void *params,
     memcpy(transcript + TLS_RECORD_HEADER, ch_body, ch_len);
     memcpy(transcript + TLS_RECORD_HEADER + ch_len, sh_buf, sh_record_len);
 
+    /* Compute static-ephemeral DH for MITM resistance (#6):
+     * DH(curve25519(identity_sk), client_eph_pk) — matches client's
+     * DH(client_eph_sk, curve25519(identity_pk)). MITM cannot compute this. */
+    uint8_t static_dh[32];
+    uint8_t *static_dh_ptr = NULL;
+    if (sp && !sodium_is_zero(sp->identity_sk, 64)) {
+        uint8_t our_curve_sk[32];
+        if (moor_crypto_ed25519_to_curve25519_sk(our_curve_sk, sp->identity_sk) == 0) {
+            if (crypto_scalarmult(static_dh, our_curve_sk, client_eph_pk) == 0 &&
+                !sodium_is_zero(static_dh, 32))
+                static_dh_ptr = static_dh;
+            sodium_memzero(our_curve_sk, 32);
+        }
+    }
+
     /* Derive transport encryption keys from DH */
     mirage_state_t *st = calloc(1, sizeof(mirage_state_t));
     if (!st) {
         sodium_memzero(our_eph_sk, 32);
+        sodium_memzero(static_dh, 32);
         free(transcript);
         return -1;
     }
-    if (mirage_derive_keys(st, our_eph_sk, client_eph_pk, 0,
+    if (mirage_derive_keys(st, our_eph_sk, client_eph_pk, static_dh_ptr, 0,
                               transcript, transcript_len) != 0) {
         sodium_memzero(our_eph_sk, 32);
+        sodium_memzero(static_dh, 32);
         free(transcript);
         free(st);
         return -1;
     }
     sodium_memzero(our_eph_sk, 32);
+    sodium_memzero(static_dh, 32);
     free(transcript);
     st->handshake_done = 1;
     *state_out = (moor_transport_state_t *)st;
@@ -601,9 +822,25 @@ static ssize_t mirage_send(moor_transport_state_t *state, int fd,
     if (len > TLS_MAX_FRAGMENT - 2)
         len = TLS_MAX_FRAGMENT - 2;
 
-    uint8_t pad_len;
-    moor_crypto_random(&pad_len, 1);
-    pad_len = (pad_len % 32);  /* 0-31 bytes padding */
+    uint16_t pad_len;
+
+    /* Pad first app data record to defeat encapsulated-TLS fingerprint.
+     * First record size is a strong classifier (Xue et al. 2023).
+     * Pad to 1400-1500 bytes to match common HTTP response sizes. */
+    if (st->records_sent == 0) {
+        uint32_t rval;
+        moor_crypto_random((uint8_t *)&rval, sizeof(rval));
+        size_t target = 1400 + (rval % 101); /* 1400-1500 bytes plaintext */
+        size_t base = 2 + len;
+        if (base < target && target <= TLS_MAX_FRAGMENT)
+            pad_len = (uint16_t)(target - base);
+        else
+            pad_len = 0;
+    } else {
+        uint8_t rnd;
+        moor_crypto_random(&rnd, 1);
+        pad_len = (rnd % 32);  /* 0-31 bytes padding */
+    }
 
     uint16_t record_len = (uint16_t)(2 + len + pad_len);
     if (record_len > TLS_MAX_FRAGMENT) {
@@ -651,6 +888,7 @@ static ssize_t mirage_send(moor_transport_state_t *state, int fd,
     }
 
     sodium_memzero(plain, sizeof(plain));
+    st->records_sent++;
     return (ssize_t)len;
 }
 

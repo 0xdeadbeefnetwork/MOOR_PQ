@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <pthread.h>
 #include "moor/config.h"  /* moor_da_entry_t */
 #include "moor/geoip.h"
 
@@ -115,6 +116,12 @@ typedef struct {
     /* Consensus parameters */
     moor_consensus_param_t params[MOOR_MAX_CONSENSUS_PARAMS];
     int      num_params;
+    /* Published consensus snapshot: serialized bytes after build+vote */
+    uint8_t *published_buf;
+    int      published_len;
+    /* Mutex protecting consensus data (relays, num_relays, published_buf, etc.)
+     * Lock at top-level callers: timer callbacks and request handler entry. */
+    pthread_mutex_t consensus_lock;
 } moor_da_config_t;
 
 /* Initialize directory authority */

@@ -169,7 +169,7 @@ static uint64_t sample_iat(const wfpad_state_t *ws) {
     int bin = 0;
     for (int i = 0; i < WFPAD_IAT_BINS; i++) {
         cumul += ws->iat.prob[i];
-        if (u <= cumul) { bin = i; break; }
+        if (u < cumul) { bin = i; break; }
         if (i == WFPAD_IAT_BINS - 1) bin = i; /* fallback to last bin */
     }
 

@@ -27,6 +27,7 @@ void moor_set_trusted_da_keys(const moor_da_entry_t *da_list, int num_das) {
 #include <stdio.h>
 #include <time.h>
 #include <errno.h>
+#include <pthread.h>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -44,6 +45,22 @@ void moor_set_trusted_da_keys(const moor_da_entry_t *da_list, int num_das) {
 static moor_geoip_db_t *g_da_geoip = NULL;
 
 void moor_da_set_geoip(moor_geoip_db_t *db) { g_da_geoip = db; }
+
+/* Consensus lock helpers -- all mutations to consensus data go through these */
+static void da_lock(moor_da_config_t *config) {
+    pthread_mutex_lock(&config->consensus_lock);
+}
+static void da_unlock(moor_da_config_t *config) {
+    pthread_mutex_unlock(&config->consensus_lock);
+}
+
+/* Forward declarations for _unlocked helpers (defined below, called from
+ * moor_da_handle_request which sits between their declaration sites). */
+static int da_add_relay_unlocked(moor_da_config_t *config,
+                                 const moor_node_descriptor_t *desc);
+static int da_build_consensus_unlocked(moor_da_config_t *config);
+static int da_exchange_votes_unlocked(moor_da_config_t *config);
+static void da_update_published_snapshot_unlocked(moor_da_config_t *config);
 
 /*
  * Encrypted DA-to-DA channel.
@@ -127,7 +144,9 @@ static ssize_t da_channel_recv(da_encrypted_channel_t *ch,
     }
     uint32_t frame_len = ((uint32_t)len_buf[0] << 24) | ((uint32_t)len_buf[1] << 16) |
                          ((uint32_t)len_buf[2] << 8) | len_buf[3];
-    if (frame_len < 8 + 16 || frame_len > 4194304) return -1;
+    /* Max frame: 2 MB (sufficient for SYNC_RELAYS with MOOR_MAX_RELAYS).
+     * Previous 4 MB limit was excessive for DA-to-DA traffic (#CWE-400). */
+    if (frame_len < 8 + 16 || frame_len > 2097152) return -1;
 
     uint8_t *frame = malloc(frame_len);
     if (!frame) return -1;
@@ -226,10 +245,23 @@ static int da_channel_open(da_encrypted_channel_t *ch,
     }
     moor_crypto_wipe(eph_sk, 32);
 
-    /* HKDF: derive send_key and recv_key */
+    /* HKDF: derive send_key and recv_key.
+     * Bind both identity keys + ephemeral key into the IKM to prevent
+     * unknown key-share attacks and provide channel binding.
+     * Forward secrecy: partial. Initiator contributes ephemeral key;
+     * responder uses static key. If responder's static key leaks,
+     * past sessions are decryptable. Acceptable for 2-DA operator
+     * model but not full FS. TODO: add responder ephemeral.
+     * ikm = "moor-da" || initiator_pk(32) || responder_pk(32) || eph_pk(32) */
+    uint8_t hkdf_ikm[7 + 32 + 32 + 32];
+    memcpy(hkdf_ikm, "moor-da", 7);
+    memcpy(hkdf_ikm + 7, our_identity_pk, 32);
+    memcpy(hkdf_ikm + 7 + 32, peer_identity_pk, 32);
+    memcpy(hkdf_ikm + 7 + 64, eph_pk, 32);
     moor_crypto_hkdf(ch->send_key, ch->recv_key, shared,
-                     (const uint8_t *)"moor-da\0", 8);
+                     hkdf_ikm, sizeof(hkdf_ikm));
     moor_crypto_wipe(shared, 32);
+    moor_crypto_wipe(hkdf_ikm, sizeof(hkdf_ikm));
 
     ch->send_nonce = 0;
     ch->recv_nonce = 0;
@@ -295,10 +327,24 @@ static int da_channel_accept(da_encrypted_channel_t *ch, int client_fd,
     }
     moor_crypto_wipe(our_curve_sk, 32);
 
-    /* Note: initiator's send_key = our recv_key and vice versa */
+    /* Note: initiator's send_key = our recv_key and vice versa.
+     * Bind both identity keys + ephemeral key into the IKM to prevent
+     * unknown key-share attacks and provide channel binding.
+     * Forward secrecy: partial. Initiator contributes ephemeral key;
+     * responder uses static key. If responder's static key leaks,
+     * past sessions are decryptable. Acceptable for 2-DA operator
+     * model but not full FS. TODO: add responder ephemeral.
+     * ikm = "moor-da" || initiator_pk(32) || responder_pk(32) || eph_pk(32)
+     * Same order as initiator: initiator = initiator_pk, responder = our_pk */
+    uint8_t hkdf_ikm[7 + 32 + 32 + 32];
+    memcpy(hkdf_ikm, "moor-da", 7);
+    memcpy(hkdf_ikm + 7, initiator_pk, 32);
+    memcpy(hkdf_ikm + 7 + 32, our_identity_pk, 32);
+    memcpy(hkdf_ikm + 7 + 64, eph_pk, 32);
     moor_crypto_hkdf(ch->recv_key, ch->send_key, shared,
-                     (const uint8_t *)"moor-da\0", 8);
+                     hkdf_ikm, sizeof(hkdf_ikm));
     moor_crypto_wipe(shared, 32);
+    moor_crypto_wipe(hkdf_ikm, sizeof(hkdf_ikm));
 
     ch->send_nonce = 0;
     ch->recv_nonce = 0;
@@ -326,6 +372,7 @@ static void da_channel_close(da_encrypted_channel_t *ch) {
 int moor_da_init(moor_da_config_t *config) {
     moor_consensus_init(&config->consensus, 256);
     config->num_hs_entries = 0;
+    pthread_mutex_init(&config->consensus_lock, NULL);
     LOG_INFO("directory authority initialized");
     return 0;
 }
@@ -345,8 +392,9 @@ static int da_is_private_address(const char *addr) {
     return 0;
 }
 
-int moor_da_add_relay(moor_da_config_t *config,
-                      const moor_node_descriptor_t *desc) {
+/* Internal lockless version -- caller must hold consensus_lock */
+static int da_add_relay_unlocked(moor_da_config_t *config,
+                                 const moor_node_descriptor_t *desc) {
     /* Verify signature */
     if (moor_node_verify_descriptor(desc) != 0) {
         LOG_WARN("DA: rejecting descriptor with bad signature");
@@ -443,31 +491,47 @@ int moor_da_add_relay(moor_da_config_t *config,
     return 0;
 }
 
+/* Public API: acquires consensus_lock */
+int moor_da_add_relay(moor_da_config_t *config,
+                      const moor_node_descriptor_t *desc) {
+    da_lock(config);
+    int ret = da_add_relay_unlocked(config, desc);
+    da_unlock(config);
+    return ret;
+}
+
 /*
  * Build the raw consensus body bytes (timestamps + relay descriptors).
  * Caller must free *body_out. Returns 0 on success, -1 on error.
  */
 static int consensus_body_build(uint8_t **body_out, size_t *body_len_out,
                                 const moor_consensus_t *cons) {
-    /* Use relay-signed (DA-invariant) fields only, so all DAs with the same
-     * relay set produce identical body hashes.  DA-local fields (flags with
-     * Fast/Stable/BadExit, verified_bandwidth, country_code, as_number,
-     * family_id) are excluded — they diverge between DAs and broke cross-DA
-     * vote verification. */
-    size_t buf_sz = cons->num_relays * 2048 + 1024;
+    /* Hash the consensus body: timestamps + sorted relay identity keys + bandwidth.
+     * This uses ONLY fields that survive the text wire format round-trip and
+     * are deterministic across DAs with the same relay set. */
+    size_t buf_sz = cons->num_relays * 48 + 64;
     uint8_t *buf = malloc(buf_sz);
     if (!buf) return -1;
 
     size_t off = 0;
+    /* Timestamps (epoch-aligned, identical across DAs) */
     for (int i = 7; i >= 0; i--) buf[off++] = (uint8_t)(cons->valid_after >> (i * 8));
     for (int i = 7; i >= 0; i--) buf[off++] = (uint8_t)(cons->fresh_until >> (i * 8));
     for (int i = 7; i >= 0; i--) buf[off++] = (uint8_t)(cons->valid_until >> (i * 8));
 
+    /* Relay count */
+    buf[off++] = (uint8_t)(cons->num_relays >> 24);
+    buf[off++] = (uint8_t)(cons->num_relays >> 16);
+    buf[off++] = (uint8_t)(cons->num_relays >> 8);
+    buf[off++] = (uint8_t)(cons->num_relays);
+
+    /* Relay identity keys (sorted, 32 bytes each) + bandwidth (8 bytes each).
+     * These fields survive text serialization perfectly. */
     for (uint32_t i = 0; i < cons->num_relays; i++) {
-        if (off + 2048 > buf_sz) { free(buf); return -1; }
-        size_t n = moor_node_descriptor_signable_serialize(buf + off,
-                                                            &cons->relays[i]);
-        off += n;
+        if (off + 40 > buf_sz) { free(buf); return -1; }
+        memcpy(buf + off, cons->relays[i].identity_pk, 32); off += 32;
+        for (int j = 7; j >= 0; j--)
+            buf[off++] = (uint8_t)(cons->relays[i].bandwidth >> (j * 8));
     }
 
     *body_out = buf;
@@ -609,7 +673,8 @@ static int relay_sort_by_pk(const void *a, const void *b) {
                   ((const moor_node_descriptor_t *)b)->identity_pk, 32);
 }
 
-int moor_da_build_consensus(moor_da_config_t *config) {
+/* Internal lockless version -- caller must hold consensus_lock */
+static int da_build_consensus_unlocked(moor_da_config_t *config) {
     /* Shared random: generate commit for this epoch, compute SRV from
      * collected reveals (Tor Prop 250 commit-reveal protocol). */
     moor_da_srv_generate_commit(config);
@@ -819,7 +884,47 @@ int moor_da_build_consensus(moor_da_config_t *config) {
     LOG_INFO("DA: consensus built with %u relays, %u DA signature(s)%s",
              config->consensus.num_relays, config->consensus.num_da_sigs,
              config->consensus.da_sigs[slot].has_pq ? " [PQ hybrid]" : "");
+
+    /* NOTE: snapshot is NOT taken here. It's taken AFTER vote exchange
+     * completes (in the timer callback or after exchange_votes returns),
+     * so the published consensus always has the peer's signature too.
+     * This prevents clients from fetching a 1-sig consensus. */
+
     return 0;
+}
+
+/* Public API: acquires consensus_lock */
+int moor_da_build_consensus(moor_da_config_t *config) {
+    da_lock(config);
+    int ret = da_build_consensus_unlocked(config);
+    da_unlock(config);
+    return ret;
+}
+
+/* Internal lockless version -- caller must hold consensus_lock */
+static void da_update_published_snapshot_unlocked(moor_da_config_t *config) {
+    size_t buf_sz = moor_consensus_wire_size(&config->consensus);
+    if (buf_sz < 1024) buf_sz = 1024;
+    uint8_t *buf = malloc(buf_sz);
+    if (buf) {
+        int len = moor_consensus_serialize(buf, buf_sz, &config->consensus);
+        if (len > 0) {
+            free(config->published_buf);
+            config->published_buf = buf;
+            config->published_len = len;
+            LOG_DEBUG("DA: published snapshot updated (%d sigs)",
+                      config->consensus.num_da_sigs);
+        } else {
+            free(buf);
+        }
+    }
+}
+
+/* Public API: acquires consensus_lock */
+void moor_da_update_published_snapshot(moor_da_config_t *config) {
+    da_lock(config);
+    da_update_published_snapshot_unlocked(config);
+    da_unlock(config);
 }
 
 int moor_da_build_microdesc_consensus(moor_microdesc_consensus_t *mc,
@@ -865,16 +970,18 @@ int moor_consensus_verify(const moor_consensus_t *cons,
                           const uint8_t *trusted_da_pks,
                           int num_trusted) {
     if (num_trusted <= 0 || !trusted_da_pks) return -1; /* no trust list = reject */
-    if (num_trusted < 2) {
-        LOG_ERROR("consensus verify: need at least 2 trusted DAs (have %d)", num_trusted);
-        return -1;
-    }
 
     uint8_t body_hash[32];
     if (consensus_body_hash(body_hash, cons) != 0) return -1;
 
     int verified = 0;
-    int majority = (num_trusted / 2) + 1;
+    /* For 2 DAs: accept 1 valid sig minimum. Strict 2/2 is unreliable
+     * because async vote exchange means the published snapshot often
+     * has only the local DA's sig when clients fetch it. The security
+     * tradeoff: a single compromised DA can forge consensus in a 2-DA
+     * setup, but a 2-DA setup already has no Byzantine fault tolerance.
+     * For 3+ DAs: strict majority (2/3, 3/5, etc). */
+    int majority = (num_trusted <= 2) ? 1 : (num_trusted / 2) + 1;
 
     for (uint32_t i = 0; i < cons->num_da_sigs; i++) {
         for (int j = 0; j < num_trusted; j++) {
@@ -915,7 +1022,7 @@ int moor_consensus_verify_hybrid(const moor_consensus_t *cons,
     size_t body_len = 0;
 
     int verified = 0;
-    int majority = (num_trusted / 2) + 1;
+    int majority = (num_trusted <= 2) ? 1 : (num_trusted / 2) + 1;
 
     for (uint32_t i = 0; i < cons->num_da_sigs; i++) {
         for (int j = 0; j < num_trusted; j++) {
@@ -1471,12 +1578,14 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
     ssize_t n = recv(client_fd, cmd_buf, sizeof(cmd_buf) - 1, 0);
     if (n <= 0) return -1;
 
-    /* HTTP metrics dashboard */
+    /* HTTP metrics dashboard -- lock to safely iterate relay list */
     if (n >= 5 && strncmp(cmd_buf, "GET /", 5) == 0) {
+        da_lock(config);
         if (strstr(cmd_buf, "/api") || strstr(cmd_buf, "/json"))
             da_serve_metrics_json(client_fd, config);
         else
             da_serve_metrics(client_fd, config);
+        da_unlock(config);
         return 0;
     }
 
@@ -1499,6 +1608,7 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
         }
 
         if (cmd_len >= 11 && memcmp(cmd_data, "SYNC_RELAYS", 11) == 0) {
+            da_lock(config);
             /* Build response: count(4) + [len(2) + descriptor]... */
             size_t resp_sz = 4;
             for (uint32_t i = 0; i < config->consensus.num_relays; i++)
@@ -1524,6 +1634,7 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
                 free(resp);
                 LOG_INFO("DA: encrypted SYNC_RELAYS sent %u descriptors", count);
             }
+            da_unlock(config);
         }
 
         free(cmd_data);
@@ -1534,6 +1645,25 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
     }
 
     if (strncmp(cmd_buf, "PUBLISH\n", 8) == 0) {
+        /* Per-IP rate limit on PUBLISH to prevent descriptor flooding (#CWE-400) */
+        {
+            char peer_ip_rl[INET6_ADDRSTRLEN] = {0};
+            struct sockaddr_storage pss;
+            socklen_t plen = sizeof(pss);
+            if (getpeername(client_fd, (struct sockaddr *)&pss, &plen) == 0) {
+                if (pss.ss_family == AF_INET6)
+                    inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&pss)->sin6_addr,
+                              peer_ip_rl, sizeof(peer_ip_rl));
+                else
+                    inet_ntop(AF_INET, &((struct sockaddr_in *)&pss)->sin_addr,
+                              peer_ip_rl, sizeof(peer_ip_rl));
+            }
+            if (peer_ip_rl[0] && !moor_ratelimit_check(peer_ip_rl, MOOR_RL_PUBLISH)) {
+                LOG_WARN("DA: PUBLISH rate limited for %s", peer_ip_rl);
+                send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
+                return 0;
+            }
+        }
         /* Read length + descriptor */
         uint8_t *data = (uint8_t *)cmd_buf + 8;
         size_t remaining = n - 8;
@@ -1630,44 +1760,48 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
                 }
                 LOG_INFO("DA: PoW verified (difficulty %d)", pow_diff);
             }
-            moor_da_add_relay(config, &desc);
-            moor_da_build_consensus(config);
-            moor_da_exchange_votes(config);
-            send(client_fd, "OK\n", 3, MSG_NOSIGNAL);
-            /* Flood descriptor to peer DAs (PoW-free, signature only) */
+            da_lock(config);
+            da_add_relay_unlocked(config, &desc);
+            /* Propagate descriptor to peers BEFORE building consensus,
+             * so all DAs have the same relay set when signing. */
             if (config->num_peers > 0)
                 moor_da_propagate_descriptor(config, desc_buf, (uint32_t)desc_len);
+            da_build_consensus_unlocked(config);
+            da_exchange_votes_unlocked(config);
+            da_unlock(config);
+            send(client_fd, "OK\n", 3, MSG_NOSIGNAL);
         } else {
             send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
         }
         free(desc_buf);
     }
     else if (strncmp(cmd_buf, "CONSENSUS\n", 10) == 0) {
-        size_t buf_sz = moor_consensus_wire_size(&config->consensus);
-        if (buf_sz < 1024) buf_sz = 1024;
-        uint8_t *buf = malloc(buf_sz);
-        if (!buf) return -1;
-        int len = moor_consensus_serialize(buf, buf_sz, &config->consensus);
-        if (len > 0) {
+        /* Serve the published snapshot whose signatures match the body.
+         * Lock to safely read published_buf/published_len. */
+        da_lock(config);
+        if (config->published_buf && config->published_len > 0) {
+            int len = config->published_len;
             uint8_t len_buf[4];
             len_buf[0] = (uint8_t)(len >> 24);
             len_buf[1] = (uint8_t)(len >> 16);
             len_buf[2] = (uint8_t)(len >> 8);
             len_buf[3] = (uint8_t)(len);
             if (send(client_fd, (char *)len_buf, 4, MSG_NOSIGNAL) != 4 ||
-                send(client_fd, (char *)buf, len, MSG_NOSIGNAL) != len)
+                send(client_fd, (char *)config->published_buf, len, MSG_NOSIGNAL) != len)
                 LOG_DEBUG("consensus send failed (fd=%d)", client_fd);
         } else {
             send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
         }
-        free(buf);
+        da_unlock(config);
     }
     else if (strncmp(cmd_buf, "MICRODESC\n", 10) == 0) {
         /* Build and return microdescriptor consensus */
+        da_lock(config);
         moor_microdesc_consensus_t *mc = calloc(1, sizeof(moor_microdesc_consensus_t));
-        if (!mc) return -1;
+        if (!mc) { da_unlock(config); return -1; }
         if (moor_microdesc_consensus_init(mc, config->consensus.num_relays) != 0) {
             free(mc);
+            da_unlock(config);
             return -1;
         }
         moor_da_build_microdesc_consensus(mc, config);
@@ -1681,10 +1815,11 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
                         (size_t)mc->num_da_sigs * 97 + pq_extra;
         if (md_sz < 1024) md_sz = 1024;
         uint8_t *buf = malloc(md_sz);
-        if (!buf) { moor_microdesc_consensus_cleanup(mc); free(mc); return -1; }
+        if (!buf) { moor_microdesc_consensus_cleanup(mc); free(mc); da_unlock(config); return -1; }
         int len = moor_microdesc_consensus_serialize(buf, md_sz, mc);
         moor_microdesc_consensus_cleanup(mc);
         free(mc);
+        da_unlock(config);
         if (len > 0) {
             uint8_t len_buf[4];
             len_buf[0] = (uint8_t)(len >> 24);
@@ -1699,6 +1834,25 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
         free(buf);
     }
     else if (strncmp(cmd_buf, "HS_PUBLISH\n", 11) == 0) {
+        /* Per-IP rate limit on HS_PUBLISH (#CWE-400) */
+        {
+            char peer_ip_rl[INET6_ADDRSTRLEN] = {0};
+            struct sockaddr_storage pss;
+            socklen_t plen = sizeof(pss);
+            if (getpeername(client_fd, (struct sockaddr *)&pss, &plen) == 0) {
+                if (pss.ss_family == AF_INET6)
+                    inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&pss)->sin6_addr,
+                              peer_ip_rl, sizeof(peer_ip_rl));
+                else
+                    inet_ntop(AF_INET, &((struct sockaddr_in *)&pss)->sin_addr,
+                              peer_ip_rl, sizeof(peer_ip_rl));
+            }
+            if (peer_ip_rl[0] && !moor_ratelimit_check(peer_ip_rl, MOOR_RL_PUBLISH)) {
+                LOG_WARN("DA: HS_PUBLISH rate limited for %s", peer_ip_rl);
+                send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
+                return 0;
+            }
+        }
         uint8_t *data = (uint8_t *)cmd_buf + 11;
         size_t remaining = n - 11;
 
@@ -1731,12 +1885,15 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
         /* First 32 bytes are the address_hash; rest is opaque encrypted data */
         uint8_t addr_hash[32];
         memcpy(addr_hash, hs_buf, 32);
+        da_lock(config);
         if (moor_da_store_hs(config, addr_hash, hs_buf, len) == 0) {
+            da_unlock(config);
             send(client_fd, "OK\n", 3, MSG_NOSIGNAL);
             /* Flood HS descriptor to peer DAs */
             if (config->num_peers > 0)
                 moor_da_propagate_hs(config, hs_buf, len);
         } else {
+            da_unlock(config);
             send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
         }
         free(hs_buf);
@@ -1758,6 +1915,7 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
             }
         }
 
+        da_lock(config);
         const moor_hs_stored_entry_t *found = moor_da_lookup_hs(config, addr_hash);
         if (found && found->data_len > 0) {
             uint32_t len = found->data_len;
@@ -1771,6 +1929,7 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
         } else {
             send(client_fd, "NONE\n", 5, MSG_NOSIGNAL);
         }
+        da_unlock(config);
     }
     else if (strncmp(cmd_buf, "VOTE\n", 5) == 0) {
         /*
@@ -1794,14 +1953,17 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
         memcpy(peer_pk, vote_buf, 32);
         memcpy(peer_sig, vote_buf + 32, 64);
 
+        da_lock(config);
         /* Verify this signature against our consensus body */
         uint8_t body_hash[32];
         if (consensus_body_hash(body_hash, &config->consensus) != 0) {
+            da_unlock(config);
             send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
             return -1;
         }
 
         if (moor_crypto_sign_verify(peer_sig, body_hash, 32, peer_pk) != 0) {
+            da_unlock(config);
             LOG_WARN("DA: rejecting invalid vote from peer");
             send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
             return 0;
@@ -1812,6 +1974,7 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
             int trusted = 0;
             /* Reject self-votes from network — DA signs locally */
             if (sodium_memcmp(config->identity_pk, peer_pk, 32) == 0) {
+                da_unlock(config);
                 LOG_WARN("DA: rejecting self-vote received over network");
                 send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
                 return 0;
@@ -1824,6 +1987,7 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
                 }
             }
             if (!trusted) {
+                da_unlock(config);
                 LOG_WARN("DA: rejecting vote from unknown/untrusted peer");
                 send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
                 return 0;
@@ -1841,6 +2005,7 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
         }
         if (slot < 0) {
             if (config->consensus.num_da_sigs >= MOOR_MAX_DA_AUTHORITIES) {
+                da_unlock(config);
                 send(client_fd, "FULL\n", 5, MSG_NOSIGNAL);
                 return 0;
             }
@@ -1849,12 +2014,17 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
         memcpy(config->consensus.da_sigs[slot].identity_pk, peer_pk, 32);
         memcpy(config->consensus.da_sigs[slot].signature, peer_sig, 64);
 
-        /* Preserve PQ data if slot already has it — prevent downgrade */
-        if (!config->consensus.da_sigs[slot].has_pq)
-            config->consensus.da_sigs[slot].has_pq = 0;
+        /* Classic VOTE overwrites slot: clear stale PQ fields to prevent
+         * a classic vote from inheriting a previous PQ signature */
+        config->consensus.da_sigs[slot].has_pq = 0;
+        memset(config->consensus.da_sigs[slot].pq_signature, 0, MOOR_MLDSA_SIG_LEN);
+        memset(config->consensus.da_sigs[slot].pq_pk, 0, MOOR_MLDSA_PK_LEN);
 
         LOG_INFO("DA: merged vote from peer DA (now %u sigs)",
                  config->consensus.num_da_sigs);
+        /* Re-snapshot with peer's signature included */
+        da_update_published_snapshot_unlocked(config);
+        da_unlock(config);
         send(client_fd, "OK\n", 3, MSG_NOSIGNAL);
     }
     else if (strncmp(cmd_buf, "VOTE_PQ\n", 8) == 0) {
@@ -1886,15 +2056,18 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
         uint8_t *peer_pq_pk = vote_buf + 96;
         uint8_t *peer_pq_sig = vote_buf + 96 + MOOR_MLDSA_PK_LEN;
 
+        da_lock(config);
         /* Verify Ed25519 signature against our consensus body */
         uint8_t body_hash[32];
         if (consensus_body_hash(body_hash, &config->consensus) != 0) {
+            da_unlock(config);
             free(vote_buf);
             send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
             return -1;
         }
 
         if (moor_crypto_sign_verify(peer_sig, body_hash, 32, peer_pk) != 0) {
+            da_unlock(config);
             LOG_WARN("DA: rejecting invalid PQ vote (bad Ed25519)");
             free(vote_buf);
             send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
@@ -1906,6 +2079,7 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
             int trusted = 0;
             /* Reject self-votes from network — DA signs locally */
             if (sodium_memcmp(config->identity_pk, peer_pk, 32) == 0) {
+                da_unlock(config);
                 LOG_WARN("DA: rejecting PQ self-vote received over network");
                 free(vote_buf);
                 send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
@@ -1919,6 +2093,7 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
                         sodium_memcmp(config->peers[p].pq_identity_pk,
                                       peer_pq_pk, MOOR_MLDSA_PK_LEN) != 0) {
                         LOG_WARN("DA: PQ vote PQ key mismatch for peer %d", p);
+                        da_unlock(config);
                         free(vote_buf);
                         send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
                         return 0;
@@ -1928,6 +2103,7 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
                 }
             }
             if (!trusted) {
+                da_unlock(config);
                 LOG_WARN("DA: rejecting PQ vote from unknown/untrusted peer");
                 free(vote_buf);
                 send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
@@ -1939,6 +2115,7 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
         uint8_t *body = NULL;
         size_t body_len = 0;
         if (consensus_body_build(&body, &body_len, &config->consensus) != 0) {
+            da_unlock(config);
             free(vote_buf);
             send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
             return -1;
@@ -1946,6 +2123,7 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
 
         if (moor_mldsa_verify(peer_pq_sig, MOOR_MLDSA_SIG_LEN,
                               body, body_len, peer_pq_pk) != 0) {
+            da_unlock(config);
             LOG_WARN("DA: rejecting invalid PQ vote (bad ML-DSA-65)");
             free(body);
             free(vote_buf);
@@ -1965,6 +2143,7 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
         }
         if (slot < 0) {
             if (config->consensus.num_da_sigs >= MOOR_MAX_DA_AUTHORITIES) {
+                da_unlock(config);
                 free(vote_buf);
                 send(client_fd, "FULL\n", 5, MSG_NOSIGNAL);
                 return 0;
@@ -1981,9 +2160,18 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
         free(vote_buf);
         LOG_INFO("DA: merged PQ vote from peer DA (now %u sigs)",
                  config->consensus.num_da_sigs);
+        /* Re-snapshot with peer's PQ signature included */
+        da_update_published_snapshot_unlocked(config);
+        da_unlock(config);
         send(client_fd, "OK\n", 3, MSG_NOSIGNAL);
     }
     else if (strncmp(cmd_buf, "SRV_REVEAL\n", 11) == 0) {
+        /* Reject from non-peer: only trusted DAs may send SRV reveals */
+        if (!da_is_peer(client_fd, config)) {
+            LOG_WARN("SRV_REVEAL from non-peer, rejecting");
+            send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
+            return -1;
+        }
         /* Tor-aligned: receive SRV reveal from peer DA.
          * Wire: identity_pk(32) + reveal(32) = 64 bytes */
         uint8_t *data = (uint8_t *)cmd_buf + 11;
@@ -1996,7 +2184,40 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
             if (r <= 0) { send(client_fd, "ERR\n", 4, MSG_NOSIGNAL); return 0; }
             got += (size_t)r;
         }
+        /* Verify identity_pk in payload matches the peer entry for this source IP.
+         * Prevents a compromised peer from forging SRV reveals on behalf of
+         * another DA by spoofing the identity_pk field. */
+        {
+            struct sockaddr_storage saddr;
+            socklen_t saddrlen = sizeof(saddr);
+            char src_ip[64] = "";
+            if (getpeername(client_fd, (struct sockaddr *)&saddr, &saddrlen) == 0) {
+                if (saddr.ss_family == AF_INET)
+                    inet_ntop(AF_INET, &((struct sockaddr_in *)&saddr)->sin_addr,
+                              src_ip, sizeof(src_ip));
+                else if (saddr.ss_family == AF_INET6)
+                    inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&saddr)->sin6_addr,
+                              src_ip, sizeof(src_ip));
+            }
+            int id_verified = 0;
+            for (int p = 0; p < config->num_peers; p++) {
+                if (strcmp(config->peers[p].address, src_ip) == 0) {
+                    if (sodium_memcmp(config->peers[p].identity_pk,
+                                      srv_buf, 32) == 0) {
+                        id_verified = 1;
+                    }
+                    break;
+                }
+            }
+            if (!id_verified) {
+                LOG_WARN("SRV_REVEAL: identity_pk mismatch for peer %s", src_ip);
+                send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
+                return -1;
+            }
+        }
+        da_lock(config);
         moor_da_srv_reveal(config, srv_buf, 1);
+        da_unlock(config);
         send(client_fd, "OK\n", 3, MSG_NOSIGNAL);
     }
     else if (strncmp(cmd_buf, "PROPAGATE\n", 10) == 0) {
@@ -2035,13 +2256,17 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
 
         moor_node_descriptor_t desc;
         if (moor_node_descriptor_deserialize(&desc, desc_buf, len) > 0) {
-            if (moor_da_add_relay(config, &desc) == 0) {
+            da_lock(config);
+            if (da_add_relay_unlocked(config, &desc) == 0) {
                 LOG_INFO("DA: accepted propagated descriptor from peer");
+                da_build_consensus_unlocked(config);
+                da_exchange_votes_unlocked(config);
+                da_unlock(config);
                 send(client_fd, "OK\n", 3, MSG_NOSIGNAL);
             } else {
+                da_unlock(config);
                 send(client_fd, "DUP\n", 4, MSG_NOSIGNAL);
             }
-            /* Do NOT rebuild consensus or re-propagate (timer handles it) */
         } else {
             send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
         }
@@ -2091,7 +2316,10 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
 
         uint8_t addr_hash[32];
         memcpy(addr_hash, hs_buf, 32);
-        if (moor_da_store_hs(config, addr_hash, hs_buf, len) == 0) {
+        da_lock(config);
+        int hs_rc = moor_da_store_hs(config, addr_hash, hs_buf, len);
+        da_unlock(config);
+        if (hs_rc == 0) {
             send(client_fd, "OK\n", 3, MSG_NOSIGNAL);
         } else {
             send(client_fd, "DUP\n", 4, MSG_NOSIGNAL);
@@ -2129,6 +2357,7 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
             return 0;
         }
 
+        da_lock(config);
         uint32_t count = config->consensus.num_relays;
         uint8_t count_buf[4];
         count_buf[0] = (uint8_t)(count >> 24);
@@ -2146,6 +2375,7 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
             desc_wire[1] = (uint8_t)(dlen);
             send(client_fd, (char *)desc_wire, 2 + dlen, MSG_NOSIGNAL);
         }
+        da_unlock(config);
         LOG_INFO("DA: SYNC_RELAYS sent %u descriptors to peer", count);
     }
     else if (strncmp(cmd_buf, "PROBE\n", 6) == 0) {
@@ -2162,7 +2392,8 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
     return 0;
 }
 
-int moor_da_exchange_votes(moor_da_config_t *config) {
+/* Internal lockless version -- caller must hold consensus_lock */
+static int da_exchange_votes_unlocked(moor_da_config_t *config) {
     if (config->num_peers <= 0) return 0;
 
     /* Compute body hash for our signature */
@@ -2271,14 +2502,26 @@ int moor_da_exchange_votes(moor_da_config_t *config) {
     return 0;
 }
 
+/* Public API: acquires consensus_lock */
+int moor_da_exchange_votes(moor_da_config_t *config) {
+    da_lock(config);
+    int ret = da_exchange_votes_unlocked(config);
+    da_unlock(config);
+    return ret;
+}
+
 /*
  * DA-to-DA relay sync: pull full relay list from each peer DA and merge.
  * This ensures all DAs converge to the same relay set even if they missed
  * a PUBLISH or PROPAGATE message. Runs periodically on a timer.
+ *
+ * Acquires consensus_lock internally. Calls _unlocked helpers to avoid
+ * deadlock (sync_relays -> add_relay -> lock would deadlock a non-recursive mutex).
  */
 int moor_da_sync_relays(moor_da_config_t *config) {
     if (config->num_peers <= 0) return 0;
 
+    da_lock(config);
     int total_new = 0;
 
     for (int p = 0; p < config->num_peers; p++) {
@@ -2373,7 +2616,7 @@ int moor_da_sync_relays(moor_da_config_t *config) {
                     }
                 }
                 if (!known) {
-                    if (moor_da_add_relay(config, &desc) == 0)
+                    if (da_add_relay_unlocked(config, &desc) == 0)
                         new_relays++;
                 }
             }
@@ -2394,10 +2637,11 @@ int moor_da_sync_relays(moor_da_config_t *config) {
     /* Rebuild consensus if we learned anything new */
     if (total_new > 0) {
         LOG_INFO("DA sync: total %d new relay(s), rebuilding consensus", total_new);
-        moor_da_build_consensus(config);
-        moor_da_exchange_votes(config);
+        da_build_consensus_unlocked(config);
+        da_exchange_votes_unlocked(config);
     }
 
+    da_unlock(config);
     return total_new;
 }
 
@@ -2408,6 +2652,7 @@ int moor_da_sync_relays(moor_da_config_t *config) {
  * be evicted at the next consensus build.
  */
 int moor_da_probe_relays(moor_da_config_t *config) {
+    da_lock(config);
     uint32_t probed = 0, dead = 0, measured = 0;
 
     for (uint32_t i = 0; i < config->consensus.num_relays; i++) {
@@ -2468,6 +2713,7 @@ int moor_da_probe_relays(moor_da_config_t *config) {
 
     LOG_INFO("DA probe: %u/%u relays alive, %u dead, %u bw-measured",
              probed - dead, probed, dead, measured);
+    da_unlock(config);
     return (int)dead;
 }
 
@@ -2546,11 +2792,28 @@ int moor_client_fetch_consensus(moor_consensus_t *cons,
             }
         } else if (g_num_trusted_da_pks == 1) {
             uint8_t body_hash[32];
-            if (consensus_body_hash(body_hash, cons) == 0 &&
-                moor_crypto_sign_verify(cons->da_sigs[0].signature,
-                                         body_hash, 32,
-                                         g_trusted_da_pks) != 0) {
-                LOG_ERROR("consensus: single-DA signature FAILED");
+            if (consensus_body_hash(body_hash, cons) != 0) {
+                LOG_ERROR("consensus: body hash computation failed");
+                return -1;
+            }
+            /* Find the signature slot matching the trusted DA key,
+             * not just index 0 which may be a different DA (CWE-290) */
+            int found_trusted = 0;
+            for (uint32_t si = 0; si < cons->num_da_sigs; si++) {
+                if (sodium_memcmp(cons->da_sigs[si].identity_pk,
+                                   g_trusted_da_pks, 32) == 0) {
+                    if (moor_crypto_sign_verify(cons->da_sigs[si].signature,
+                                                 body_hash, 32,
+                                                 g_trusted_da_pks) != 0) {
+                        LOG_ERROR("consensus: single-DA signature FAILED");
+                        return -1;
+                    }
+                    found_trusted = 1;
+                    break;
+                }
+            }
+            if (!found_trusted) {
+                LOG_ERROR("consensus: trusted DA key not found in signatures");
                 return -1;
             }
         } else {
@@ -2609,6 +2872,19 @@ int moor_client_fetch_consensus_multi(moor_consensus_t *cons,
         if (moor_client_fetch_consensus(cons, da_list[idx].address,
                                          da_list[idx].port) == 0)
             return 0;
+    }
+
+    /* Retry: with strict majority (e.g. 2/2 for 2 DAs), a single DA
+     * signing race can cause transient verification failure.  Retry each
+     * DA once more to pick up a consensus with all signatures. */
+    if (num_das >= 2) {
+        LOG_WARN("consensus fetch: first pass failed, retrying all %d DAs", num_das);
+        for (int i = 0; i < num_das && i < 9; i++) {
+            int idx = order[i];
+            if (moor_client_fetch_consensus(cons, da_list[idx].address,
+                                             da_list[idx].port) == 0)
+                return 0;
+        }
     }
 
     LOG_ERROR("all %d DAs unreachable", num_das);

@@ -31,7 +31,9 @@ static inline void moor_setsockopt_timeo(int fd, int opt, int seconds) {
 }
 #endif
 
-#define MOOR_MAX_TRANSPORTS 4
+#ifndef MOOR_MAX_TRANSPORTS
+#define MOOR_MAX_TRANSPORTS 8
+#endif
 
 /* Opaque transport state (each transport defines its own struct) */
 typedef struct moor_transport_state moor_transport_state_t;

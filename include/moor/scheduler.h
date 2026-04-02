@@ -7,7 +7,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define MOOR_CELL_QUEUE_SIZE 256  /* cells per connection */
+#define MOOR_CELL_QUEUE_SIZE 512  /* cells per connection (was 256, overflowed under load) */
 #define MOOR_CELL_WIRE_SIZE  532  /* 2-byte length + 530 ciphertext */
 
 typedef struct {

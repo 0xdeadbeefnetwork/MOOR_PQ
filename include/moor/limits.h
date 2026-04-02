@@ -37,7 +37,7 @@
 #define MOOR_MAX_HIDDEN_SERVICES 8      /* Max HS instances per relay */
 #define MOOR_MAX_BRIDGES        8       /* Max bridges for client */
 #define MOOR_MAX_FALLBACKS      16      /* Max fallback DA servers */
-#define MOOR_MAX_TRANSPORTS     4       /* Max pluggable transports */
+#define MOOR_MAX_TRANSPORTS     8       /* Max pluggable transports */
 
 /* ===== INTERNAL -- File Descriptors ===== */
 #if defined(__linux__) && !defined(MOOR_NO_EPOLL)
@@ -75,7 +75,7 @@
 #define MOOR_DOS_CELL_RATE_PER_CONN     1000    /* Cells/sec per connection */
 #define MOOR_DOS_CELL_BURST_PER_CONN    2000    /* Burst per connection */
 #define MOOR_POW_DEFAULT_DIFFICULTY     8       /* PoW leading zero bits (Argon2id) */
-#define MOOR_POW_TIMESTAMP_WINDOW       3600    /* PoW validity (1h) */
+#define MOOR_POW_TIMESTAMP_WINDOW       300     /* PoW validity (5min, was 1h -- see CWE-330 fix) */
 #define MOOR_POW_MEMLIMIT_DEFAULT       (256U * 1024U)  /* Argon2id memory: 256 KB */
 #define MOOR_POW_MEMLIMIT_MIN           (8U * 1024U)
 #define MOOR_POW_MEMLIMIT_MAX           (64U * 1024U * 1024U)  /* 64 MB */

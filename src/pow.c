@@ -25,10 +25,19 @@ typedef struct {
 static pow_nonce_entry_t g_nonce_cache[POW_NONCE_CACHE_SIZE];
 static int g_nonce_cache_init = 0;
 
+/* Secret key folded into cache slot hash to prevent attacker-controlled
+ * collision attacks (all other hash inputs are publicly visible). */
+static uint8_t g_nonce_cache_secret[32];
+static int g_nonce_cache_secret_init = 0;
+
 static void nonce_cache_ensure_init(void) {
     if (!g_nonce_cache_init) {
         memset(g_nonce_cache, 0, sizeof(g_nonce_cache));
         g_nonce_cache_init = 1;
+    }
+    if (!g_nonce_cache_secret_init) {
+        randombytes_buf(g_nonce_cache_secret, sizeof(g_nonce_cache_secret));
+        g_nonce_cache_secret_init = 1;
     }
 }
 
@@ -38,8 +47,11 @@ static int nonce_cache_check_and_insert(uint64_t nonce, uint64_t timestamp,
     nonce_cache_ensure_init();
     uint64_t now = (uint64_t)time(NULL);
 
-    /* Hash to slot — include context to separate different identities */
-    uint64_t h = nonce ^ (timestamp * 2654435761ULL) ^ (ctx * 0x9E3779B97F4A7C15ULL);
+    /* Hash to slot — include context to separate different identities,
+     * and fold in a secret key so attackers cannot predict slot placement. */
+    uint64_t secret_word;
+    memcpy(&secret_word, g_nonce_cache_secret, 8);
+    uint64_t h = nonce ^ (timestamp * 2654435761ULL) ^ (ctx * 0x9E3779B97F4A7C15ULL) ^ secret_word;
     uint32_t slot = (uint32_t)(h % POW_NONCE_CACHE_SIZE);
 
     /* Linear probe up to 8 slots */
@@ -89,13 +101,19 @@ static int nonce_cache_check_and_insert(uint64_t nonce, uint64_t timestamp,
 static pow_nonce_entry_t g_hs_nonce_cache[POW_NONCE_CACHE_SIZE];
 static int g_hs_nonce_cache_init = 0;
 
-static int hs_nonce_cache_check_and_insert(uint64_t nonce) {
+/* HS PoW replay check: bind nonce to seed+service_pk so a valid PoW for
+ * one seed rotation or intro point cannot be replayed elsewhere (CWE-331). */
+static int hs_nonce_cache_check_and_insert(uint64_t nonce,
+                                           uint64_t seed_hash,
+                                           uint64_t service_hash) {
     if (!g_hs_nonce_cache_init) {
         memset(g_hs_nonce_cache, 0, sizeof(g_hs_nonce_cache));
         g_hs_nonce_cache_init = 1;
     }
     uint64_t now = (uint64_t)time(NULL);
-    uint32_t slot = (uint32_t)((nonce * 2654435761ULL) % POW_NONCE_CACHE_SIZE);
+    uint64_t ctx = seed_hash ^ (service_hash * 0x9E3779B97F4A7C15ULL);
+    uint64_t h = nonce ^ (ctx * 2654435761ULL);
+    uint32_t slot = (uint32_t)(h % POW_NONCE_CACHE_SIZE);
 
     for (int probe = 0; probe < 8; probe++) {
         uint32_t idx = (slot + probe) % POW_NONCE_CACHE_SIZE;
@@ -107,11 +125,11 @@ static int hs_nonce_cache_check_and_insert(uint64_t nonce) {
         }
         if (e->insert_time == 0) {
             e->nonce = nonce;
-            e->timestamp = 0;
+            e->context_hash = ctx;
             e->insert_time = now;
             return 0;
         }
-        if (e->nonce == nonce)
+        if (e->nonce == nonce && e->context_hash == ctx)
             return 1; /* replay */
     }
 
@@ -126,6 +144,7 @@ static int hs_nonce_cache_check_and_insert(uint64_t nonce) {
         }
     }
     g_hs_nonce_cache[oldest_idx].nonce = nonce;
+    g_hs_nonce_cache[oldest_idx].context_hash = ctx;
     g_hs_nonce_cache[oldest_idx].insert_time = now;
     return 0;
 }
@@ -161,10 +180,34 @@ static uint32_t resolve_memlimit(uint32_t memlimit) {
 
 /*
  * Relay PoW:
- *   salt = BLAKE2b-128(identity_pk)  (16 bytes, deterministic)
+ *   epoch = floor(timestamp / MOOR_POW_TIMESTAMP_WINDOW)
+ *   salt = BLAKE2b-128(identity_pk || epoch)  (16 bytes, epoch-bound)
  *   passwd = nonce(8) || timestamp(8) (16 bytes)
  *   hash = Argon2id(passwd, salt, opslimit=1, memlimit)
+ *
+ * Fix CWE-330: Mix a time-based epoch into the salt so that solutions
+ * cannot be precomputed from the publicly-known identity_pk alone.
+ * Solutions are only valid within the epoch derived from their timestamp.
  */
+
+/* Derive epoch-bound salt: BLAKE2b-128(identity_pk(32) || epoch(8)) */
+static void derive_epoch_salt(uint8_t salt[crypto_pwhash_SALTBYTES],
+                              uint8_t salt_full_out[32],
+                              const uint8_t identity_pk[32],
+                              uint64_t epoch) {
+    uint8_t preimage[40]; /* identity_pk(32) + epoch(8) */
+    memcpy(preimage, identity_pk, 32);
+    /* Big-endian encoding for cross-platform consistency (CWE-330) */
+    for (int i = 7; i >= 0; i--)
+        preimage[32 + (7 - i)] = (uint8_t)(epoch >> (i * 8));
+    uint8_t hash[32];
+    moor_crypto_hash(hash, preimage, sizeof(preimage));
+    memcpy(salt, hash, crypto_pwhash_SALTBYTES);
+    if (salt_full_out)
+        memcpy(salt_full_out, hash, 32);
+    sodium_memzero(preimage, sizeof(preimage));
+}
+
 int moor_pow_solve(uint64_t *nonce_out, uint64_t *timestamp_out,
                    const uint8_t identity_pk[32], int difficulty,
                    uint32_t memlimit) {
@@ -173,14 +216,13 @@ int moor_pow_solve(uint64_t *nonce_out, uint64_t *timestamp_out,
 
     memlimit = resolve_memlimit(memlimit);
 
-    /* Derive deterministic 16-byte salt from identity_pk */
-    uint8_t salt_full[32];
-    moor_crypto_hash(salt_full, identity_pk, 32);
-    uint8_t salt[crypto_pwhash_SALTBYTES]; /* 16 bytes */
-    memcpy(salt, salt_full, sizeof(salt));
-
     uint64_t timestamp = (uint64_t)time(NULL);
     *timestamp_out = timestamp;
+
+    /* Derive epoch-bound salt: ties solution to current time window */
+    uint64_t epoch = timestamp / MOOR_POW_TIMESTAMP_WINDOW;
+    uint8_t salt[crypto_pwhash_SALTBYTES]; /* 16 bytes */
+    derive_epoch_salt(salt, NULL, identity_pk, epoch);
 
     /* passwd = nonce(8) || timestamp(8) */
     uint8_t passwd[16];
@@ -231,11 +273,21 @@ int moor_pow_verify(const uint8_t identity_pk[32],
     if (now > timestamp && (now - timestamp) > MOOR_POW_TIMESTAMP_WINDOW)
         return -1;
 
-    /* Derive salt (also used as context for replay cache) */
+    /* Fix CWE-330: Derive epoch-bound salt from the solution's timestamp.
+     * The epoch is floor(timestamp / WINDOW), so the salt changes every epoch.
+     * Accept both current and previous epoch to handle boundary transitions
+     * (client solves near end of epoch N, server verifies in epoch N+1). */
+    uint64_t solution_epoch = timestamp / MOOR_POW_TIMESTAMP_WINDOW;
+    uint64_t current_epoch  = now / MOOR_POW_TIMESTAMP_WINDOW;
+
+    /* Only accept solution's epoch if it matches current or previous epoch */
+    if (solution_epoch != current_epoch && solution_epoch + 1 != current_epoch) {
+        return -1; /* epoch too old */
+    }
+
     uint8_t salt_full[32];
-    moor_crypto_hash(salt_full, identity_pk, 32);
     uint8_t salt[crypto_pwhash_SALTBYTES];
-    memcpy(salt, salt_full, sizeof(salt));
+    derive_epoch_salt(salt, salt_full, identity_pk, solution_epoch);
 
     /* passwd = nonce(8) || timestamp(8) */
     uint8_t passwd[16];
@@ -339,9 +391,13 @@ int moor_pow_verify_hs(const uint8_t seed[32], const uint8_t service_pk[32],
     int ok = has_leading_zeros(hash, 32, difficulty) ? 0 : -1;
     sodium_memzero(hash, sizeof(hash));
 
-    /* Fix #177: Check replay cache AFTER verification (same as relay PoW) */
+    /* Fix #177: Check replay cache AFTER verification (same as relay PoW).
+     * Bind to seed + service_pk to prevent cross-identity/cross-seed replay. */
     if (ok == 0) {
-        if (hs_nonce_cache_check_and_insert(nonce))
+        uint64_t seed_h, svc_h;
+        memcpy(&seed_h, seed, 8);
+        memcpy(&svc_h, service_pk, 8);
+        if (hs_nonce_cache_check_and_insert(nonce, seed_h, svc_h))
             return -1;
     }
     return ok;

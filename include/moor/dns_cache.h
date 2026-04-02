@@ -6,17 +6,20 @@
 
 #define MOOR_DNS_CACHE_SIZE   512
 #define MOOR_DNS_TTL_DEFAULT  300  /* 5 minutes */
+#define MOOR_DNS_HASH_BUCKETS 1024 /* power-of-2 for fast modulo */
 
 typedef struct {
     char hostname[256];
     char resolved_ip[64];
     uint64_t expires_at;
     uint64_t last_used;
+    int hash_next;  /* next index in hash chain, -1 = end */
 } moor_dns_entry_t;
 
 typedef struct {
     moor_dns_entry_t entries[MOOR_DNS_CACHE_SIZE];
     int count;
+    int hash_buckets[MOOR_DNS_HASH_BUCKETS]; /* index into entries[], -1 = empty */
 } moor_dns_cache_t;
 
 void moor_dns_cache_init(moor_dns_cache_t *cache);

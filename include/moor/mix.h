@@ -22,6 +22,7 @@ typedef struct {
     uint32_t circuit_id;
     uint8_t  command;
     struct moor_connection *target_conn;
+    int      target_fd;   /* fd at enqueue time; detect stale conn pointers */
     uint64_t fire_time_ms;
     int      active;
 } moor_mix_entry_t;

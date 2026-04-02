@@ -169,6 +169,7 @@ typedef struct {
 
     /* PIR for HS lookups */
     int             pir;                /* 1=enable PIR HS fetch, 0=legacy */
+    int             pir_dpf;            /* 1=use DPF-PIR (preferred), 0=XOR-bitmask PIR */
 
     /* Force specific guard relay (like Tor's EntryNodes).
      * Hex fingerprint (64 chars) or nickname. Empty = normal selection. */

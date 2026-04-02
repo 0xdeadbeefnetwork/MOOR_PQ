@@ -65,8 +65,10 @@ typedef enum {
     RELAY_DHT_FETCH            = 62,   /* Fetch HS descriptor from DHT */
     RELAY_DHT_FOUND            = 63,   /* Response: descriptor found */
     RELAY_DHT_NOT_FOUND        = 64,   /* Response: descriptor not found */
-    RELAY_DHT_PIR_QUERY        = 66,   /* PIR: 256-bit bitmask query */
+    RELAY_DHT_PIR_QUERY        = 66,   /* PIR: 256-bit bitmask query (legacy) */
     RELAY_DHT_PIR_RESPONSE     = 67,   /* PIR: XOR-aggregated response */
+    RELAY_DHT_DPF_QUERY        = 68,   /* DPF-PIR: DPF key query */
+    RELAY_DHT_DPF_RESPONSE     = 69,   /* DPF-PIR: DPF-evaluated response */
 } moor_relay_cmd_t;
 
 /* DESTROY cell reason codes */

@@ -11,9 +11,24 @@
 #include <string.h>
 #include <math.h>
 
+#ifdef _WIN32
+#include <windows.h>
+static CRITICAL_SECTION g_mix_mutex;
+static void mix_lock_init(void) { InitializeCriticalSection(&g_mix_mutex); }
+static void mix_lock(void) { EnterCriticalSection(&g_mix_mutex); }
+static void mix_unlock(void) { LeaveCriticalSection(&g_mix_mutex); }
+#else
+#include <pthread.h>
+static pthread_mutex_t g_mix_mutex = PTHREAD_MUTEX_INITIALIZER;
+static void mix_lock_init(void) { (void)0; }
+static void mix_lock(void) { pthread_mutex_lock(&g_mix_mutex); }
+static void mix_unlock(void) { pthread_mutex_unlock(&g_mix_mutex); }
+#endif
+
 static moor_mix_pool_t g_mix_pool;
 
 void moor_mix_init(uint64_t lambda_ms) {
+    mix_lock_init();
     memset(&g_mix_pool, 0, sizeof(g_mix_pool));
     g_mix_pool.lambda_ms = lambda_ms;
 }
@@ -64,12 +79,14 @@ int moor_mix_enqueue(struct moor_connection *conn,
                      const uint8_t payload[509]) {
     if (!conn || !payload) return -1;
     if (g_mix_pool.lambda_ms == 0) return -1; /* Mixing disabled */
+    mix_lock();
 
     /* Find free slot */
     for (int i = 0; i < MOOR_MIX_POOL_SIZE; i++) {
         if (!g_mix_pool.entries[i].active) {
             moor_mix_entry_t *e = &g_mix_pool.entries[i];
             e->target_conn = conn;
+            e->target_fd = conn->fd;
             e->circuit_id = circuit_id;
             e->command = command;
             memcpy(e->payload, payload, 509);
@@ -88,24 +105,35 @@ int moor_mix_enqueue(struct moor_connection *conn,
 
             e->active = 1;
             g_mix_pool.count++;
+            mix_unlock();
             return 0;
         }
     }
 
-    /* Pool full -- evict oldest entry (send it now, replace with new cell) */
+    /* Pool full -- evict oldest *due* entry (fire_time already passed).
+     * Only send cells whose delay has elapsed to preserve mixing guarantees.
+     * If no cells are due, drop the incoming cell rather than bypassing delay. */
     {
+        uint64_t now = moor_time_ms();
         int oldest = -1;
         uint64_t oldest_time = UINT64_MAX;
         for (int i = 0; i < MOOR_MIX_POOL_SIZE; i++) {
             moor_mix_entry_t *e = &g_mix_pool.entries[i];
-            if (e->active && e->fire_time_ms < oldest_time) {
+            if (e->active && e->fire_time_ms <= now &&
+                e->fire_time_ms < oldest_time) {
                 oldest = i;
                 oldest_time = e->fire_time_ms;
             }
         }
+        if (oldest < 0) {
+            /* No due cells -- drop incoming rather than send with zero delay */
+            mix_unlock();
+            return -1;
+        }
         if (oldest >= 0) {
             moor_mix_entry_t *victim = &g_mix_pool.entries[oldest];
             if (victim->target_conn &&
+                victim->target_conn->fd == victim->target_fd &&
                 victim->target_conn->state == CONN_STATE_OPEN) {
                 moor_cell_t cell;
                 cell.circuit_id = victim->circuit_id;
@@ -115,6 +143,7 @@ int moor_mix_enqueue(struct moor_connection *conn,
             }
             /* Replace with new cell */
             victim->target_conn = conn;
+            victim->target_fd = conn->fd;
             victim->circuit_id = circuit_id;
             victim->command = command;
             memcpy(victim->payload, payload, 509);
@@ -123,15 +152,17 @@ int moor_mix_enqueue(struct moor_connection *conn,
             if (prev > 0 && desired <= prev)
                 desired = prev + 1;
             victim->fire_time_ms = desired;
+            mix_unlock();
             return 0;
         }
     }
+    mix_unlock();
     return -1;
 }
 
 int moor_mix_drain(void) {
-    if (g_mix_pool.count == 0) return 0;
-
+    mix_lock();
+    if (g_mix_pool.count == 0) { mix_unlock(); return 0; }
     uint64_t now = moor_time_ms();
     int sent = 0;
 
@@ -159,7 +190,8 @@ int moor_mix_drain(void) {
         if (best < 0) break;
 
         moor_mix_entry_t *e = &g_mix_pool.entries[best];
-        if (e->target_conn && e->target_conn->state == CONN_STATE_OPEN) {
+        if (e->target_conn && e->target_conn->fd == e->target_fd &&
+            e->target_conn->state == CONN_STATE_OPEN) {
             moor_cell_t cell;
             cell.circuit_id = e->circuit_id;
             cell.command = e->command;
@@ -169,22 +201,25 @@ int moor_mix_drain(void) {
         }
         sodium_memzero(e->payload, 509);  /* Wipe relay cell data (#196) */
         e->active = 0;
-        g_mix_pool.count--;
+        if (g_mix_pool.count > 0) g_mix_pool.count--;
     }
 
+    mix_unlock();
     return sent;
 }
 
 void moor_mix_purge_conn(const struct moor_connection *conn) {
     if (!conn) return;
+    mix_lock();
     for (int i = 0; i < MOOR_MIX_POOL_SIZE; i++) {
         if (g_mix_pool.entries[i].active &&
             g_mix_pool.entries[i].target_conn == conn) {
             sodium_memzero(g_mix_pool.entries[i].payload, 509); /* (#196) */
             g_mix_pool.entries[i].active = 0;
-            g_mix_pool.count--;
+            if (g_mix_pool.count > 0) g_mix_pool.count--;
         }
     }
+    mix_unlock();
 }
 
 void moor_mix_flush_circuit(struct moor_connection *conn, uint32_t circuit_id) {
@@ -196,12 +231,14 @@ void moor_mix_flush_circuit(struct moor_connection *conn, uint32_t circuit_id) {
      * overtaking queued relay cells — the #1 failure mode when mixing is
      * enabled and circuits are torn down quickly.
      */
+    mix_lock();
     for (;;) {
         int best = -1;
         uint64_t best_time = UINT64_MAX;
         for (int i = 0; i < MOOR_MIX_POOL_SIZE; i++) {
             moor_mix_entry_t *e = &g_mix_pool.entries[i];
             if (e->active && e->target_conn == conn &&
+                e->target_fd == conn->fd &&
                 e->circuit_id == circuit_id &&
                 e->fire_time_ms < best_time) {
                 best = i;
@@ -220,6 +257,7 @@ void moor_mix_flush_circuit(struct moor_connection *conn, uint32_t circuit_id) {
         }
         sodium_memzero(e->payload, 509);  /* Wipe relay cell data (#196) */
         e->active = 0;
-        g_mix_pool.count--;
+        if (g_mix_pool.count > 0) g_mix_pool.count--;
     }
+    mix_unlock();
 }

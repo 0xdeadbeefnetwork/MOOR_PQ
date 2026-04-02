@@ -9,7 +9,8 @@
 #define MOOR_RL_INTRO    2   /* INTRODUCE1 rate */
 #define MOOR_RL_ESTAB    3   /* ESTABLISH_INTRO rate */
 #define MOOR_RL_REND     4   /* RENDEZVOUS1 rate */
-#define MOOR_RL_NUM_TYPES 5
+#define MOOR_RL_PUBLISH  5   /* DA PUBLISH/HS_PUBLISH rate */
+#define MOOR_RL_NUM_TYPES 6
 
 /* Default limits (tokens per minute) */
 #define MOOR_RL_CONN_LIMIT    60
@@ -17,6 +18,7 @@
 #define MOOR_RL_INTRO_LIMIT   100
 #define MOOR_RL_ESTAB_LIMIT   30   /* Max intro establishments per minute */
 #define MOOR_RL_REND_LIMIT    60   /* Max rendezvous per minute */
+#define MOOR_RL_PUBLISH_LIMIT 10   /* Max descriptor publishes per minute per IP */
 
 /* Max tracked IPs (LRU eviction beyond this) */
 #define MOOR_RL_MAX_IPS 1024

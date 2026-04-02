@@ -70,10 +70,13 @@ SOURCES = $(SRCDIR)/log.c \
           $(SRCDIR)/exit_sla.c \
           $(SRCDIR)/crypto_worker.c \
           $(SRCDIR)/transport_mirage.c \
+          $(SRCDIR)/transport_shitstorm.c \
           $(SRCDIR)/dht.c \
           $(SRCDIR)/sig.c \
           $(SRCDIR)/mix.c \
-          $(SRCDIR)/wfpad.c
+          $(SRCDIR)/wfpad.c \
+          $(SRCDIR)/sandbox.c \
+          $(SRCDIR)/elligator2.c
 
 KYBER_SOURCES = $(wildcard $(SRCDIR)/kyber/*.c)
 DILITHIUM_SOURCES = $(wildcard $(SRCDIR)/dilithium/*.c)
@@ -357,7 +360,7 @@ clean:
 	rm -f $(TEST_PADDING_ADV_TARGET) $(TEST_BW_AUTH_TARGET) $(TEST_CONFLUX_TARGET)
 	rm -f $(TEST_RATELIMIT_TARGET) $(TEST_CONSENSUS_CACHE_TARGET)
 	rm -f $(TEST_SCHEDULER_TARGET) $(TEST_MONITOR_TARGET)
-	rm -f $(TEST_CKE_TARGET) $(TEST_NOISE_TARGET) $(TEST_SOCKS_TARGET) $(TEST_OB_TARGET) $(TEST_BRIDGEDB_TARGET) $(TEST_DNS_CACHE_TARGET) $(TEST_SHADE_TARGET) $(TEST_BRIDGE_AUTH_TARGET) $(TEST_EXIT_SLA_TARGET) $(TEST_CC_TARGET) $(TEST_FEATURES2_TARGET) $(TEST_INFRA_TARGET) $(TEST_DHT_TARGET) $(TEST_MLDSA_TARGET)
+	rm -f $(TEST_CKE_TARGET) $(TEST_NOISE_TARGET) $(TEST_SOCKS_TARGET) $(TEST_OB_TARGET) $(TEST_BRIDGEDB_TARGET) $(TEST_DNS_CACHE_TARGET) $(TEST_SHADE_TARGET) $(TEST_BRIDGE_AUTH_TARGET) $(TEST_EXIT_SLA_TARGET) $(TEST_CC_TARGET) $(TEST_FEATURES2_TARGET) $(TEST_INFRA_TARGET) $(TEST_DHT_TARGET) $(TEST_MLDSA_TARGET) $(TEST_PATHBIAS_TARGET)
 	rm -f $(TEST_KYBER_KAT_TARGET) $(TEST_MLDSA_KAT_TARGET) $(BUILDDIR)/dudect_crypto
 	rm -rf obj_cov coverage_report
 	rm -f *.exe
@@ -465,7 +468,7 @@ TEST_SOURCES = $(TEST_CRYPTO_SRC) $(TEST_CELL_SRC) $(TEST_CIRCUIT_SRC) \
                $(TEST_BRIDGEDB_SRC) $(TEST_DNS_CACHE_SRC) $(TEST_SHADE_SRC) \
                $(TEST_BRIDGE_AUTH_SRC) $(TEST_EXIT_SLA_SRC) $(TEST_CC_SRC) \
                $(TEST_FEATURES2_SRC) $(TEST_INFRA_SRC) $(TEST_DHT_SRC) \
-               $(TEST_MLDSA_SRC)
+               $(TEST_MLDSA_SRC) $(TEST_PATHBIAS_SRC)
 
 ASAN_TEST_TARGETS = $(patsubst tests/%.c,asan_%,$(TEST_SOURCES))
 
@@ -565,7 +568,8 @@ FUZZ_HARNESSES = fuzz/fuzz_cell fuzz/fuzz_socks5 fuzz/fuzz_cke \
                  fuzz/fuzz_lspec fuzz/fuzz_transport fuzz/fuzz_microdesc \
                  fuzz/fuzz_wfpad fuzz/fuzz_pow fuzz/fuzz_padding \
                  fuzz/fuzz_conflux fuzz/fuzz_ratelimit \
-                 fuzz/fuzz_descriptor fuzz/fuzz_geoip
+                 fuzz/fuzz_descriptor fuzz/fuzz_geoip \
+                 fuzz/fuzz_relay_cell fuzz/fuzz_base32 fuzz/fuzz_dpf
 
 $(FUZZ_OBJDIR):
 	mkdir -p $(FUZZ_OBJDIR)

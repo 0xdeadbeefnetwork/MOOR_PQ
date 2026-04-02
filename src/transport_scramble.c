@@ -6,7 +6,7 @@
  * then derives transport-layer encryption keys.
  *
  * Handshake:
- *   Client: [eph_pk:32][random_pad:32-480][HMAC:32]
+ *   Client: [ascii_cover:26][eph_pk:32][random_pad:32-480][HMAC:32]
  *   Server: [eph_pk:32][random_pad:32-480][HMAC:32]
  *   Both derive transport keys from DH(client_eph, server_eph)
  *
@@ -20,6 +20,7 @@
 #include <sodium.h>
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -28,7 +29,12 @@
 #else
 #include <sys/socket.h>
 #include <poll.h>
+#include <pthread.h>
 #endif
+
+/* Fixed-length ASCII cover prefix to defeat entropy-based DPI (GFW).
+ * Client prepends this before the ephemeral key; server strips it. */
+#define SCRAMBLE_COVER_LEN 26
 
 /* Scramble transport state */
 typedef struct {
@@ -142,19 +148,28 @@ static int scramble_client_handshake(int fd, const void *params,
     moor_crypto_random((uint8_t *)&pad_len_raw, 4);
     size_t pad_len = 32 + (pad_len_raw % 449); /* 32..480 */
 
-    /* Build message: eph_pk(32) + pad(pad_len) + HMAC(32) */
-    size_t msg_len = 32 + pad_len + 32;
+    /* Prepend ASCII cover to defeat entropy-based DPI (GFW).
+     * The first 26 bytes look like an HTTP request line, lowering
+     * the entropy of the initial burst so deep-packet inspectors
+     * that flag high-entropy first-bytes let the connection through.
+     * The server strips this fixed-length prefix before processing. */
+    static const char ascii_cover[] = "GET / HTTP/1.1\r\nHost: cdn.";
+
+    /* Build message: cover(26) + eph_pk(32) + pad(pad_len) + HMAC(32) */
+    size_t msg_len = SCRAMBLE_COVER_LEN + 32 + pad_len + 32;
     uint8_t *msg = malloc(msg_len);
     if (!msg) {
         moor_crypto_wipe(eph_sk, 32);
         return -1;
     }
 
-    memcpy(msg, eph_pk, 32);
-    moor_crypto_random(msg + 32, pad_len);
+    memcpy(msg, ascii_cover, SCRAMBLE_COVER_LEN);
+    memcpy(msg + SCRAMBLE_COVER_LEN, eph_pk, 32);
+    moor_crypto_random(msg + SCRAMBLE_COVER_LEN + 32, pad_len);
 
-    /* HMAC over eph_pk + pad */
-    compute_hmac(msg + 32 + pad_len, msg, 32 + pad_len, hmac_key);
+    /* HMAC over eph_pk + pad (not including cover prefix) */
+    compute_hmac(msg + SCRAMBLE_COVER_LEN + 32 + pad_len,
+                 msg + SCRAMBLE_COVER_LEN, 32 + pad_len, hmac_key);
 
     if (send_all(fd, msg, msg_len) != 0) {
         free(msg);
@@ -250,6 +265,14 @@ static int scramble_server_handshake(int fd, const void *params,
         return -1;
     }
 
+    /* Skip the 26-byte ASCII cover prefix the client prepends to
+     * defeat entropy-based DPI before the real handshake data. */
+    uint8_t cover_discard[SCRAMBLE_COVER_LEN];
+    if (recv_all(fd, cover_discard, SCRAMBLE_COVER_LEN) != 0) {
+        moor_crypto_wipe(our_curve_sk, 32);
+        return -1;
+    }
+
     /* Read client message: at least 96 bytes, up to 544 */
     uint8_t client_buf[544];
     size_t client_total = 0;
@@ -260,9 +283,33 @@ static int scramble_server_handshake(int fd, const void *params,
     }
     client_total = 96;
 
-    /* Extract client ephemeral pk (first 32 bytes) */
+    /* Extract client ephemeral pk (first 32 bytes after cover) */
     uint8_t client_eph_pk[32];
     memcpy(client_eph_pk, client_buf, 32);
+
+    /* Replay cache: reject previously-seen ephemeral keys (CWE-294).
+     * Mirrors Shade pattern: 256 entries with timestamp + 600s TTL (#R1-D4). */
+    {
+        #define SCRAMBLE_REPLAY_CACHE_SIZE 256
+        #define SCRAMBLE_REPLAY_TTL_SECS   600  /* 10 minutes */
+        static struct { uint8_t key[32]; uint64_t timestamp; } replay_cache[SCRAMBLE_REPLAY_CACHE_SIZE];
+        static int replay_idx = 0;
+        static pthread_mutex_t replay_mutex = PTHREAD_MUTEX_INITIALIZER;
+        pthread_mutex_lock(&replay_mutex);
+        uint64_t now = (uint64_t)time(NULL);
+        for (int r = 0; r < SCRAMBLE_REPLAY_CACHE_SIZE; r++) {
+            if (now - replay_cache[r].timestamp < SCRAMBLE_REPLAY_TTL_SECS &&
+                sodium_memcmp(replay_cache[r].key, client_eph_pk, 32) == 0) {
+                pthread_mutex_unlock(&replay_mutex);
+                moor_crypto_wipe(our_curve_sk, 32);
+                return -1; /* replay detected */
+            }
+        }
+        memcpy(replay_cache[replay_idx].key, client_eph_pk, 32);
+        replay_cache[replay_idx].timestamp = now;
+        replay_idx = (replay_idx + 1) % SCRAMBLE_REPLAY_CACHE_SIZE;
+        pthread_mutex_unlock(&replay_mutex);
+    }
 
     /* DH for auth */
     uint8_t auth_shared[32];
@@ -372,6 +419,9 @@ static ssize_t scramble_send(moor_transport_state_t *state, int fd,
                               const uint8_t *data, size_t len) {
     moor_scramble_state_t *st = (moor_scramble_state_t *)state;
 
+    /* Reject oversized payloads (wire length is uint16) */
+    if (len > UINT16_MAX - 16) return -1;
+
     /* Random padding: 0-15 bytes */
     uint8_t pad_len = 0;
     moor_crypto_random(&pad_len, 1);
@@ -406,6 +456,7 @@ static ssize_t scramble_send(moor_transport_state_t *state, int fd,
     free(pt);
 
     /* Encrypted length header */
+    if (actual_ct_len > UINT16_MAX) { free(ct); return -1; }
     uint8_t hdr[2];
     uint16_t wire_len = (uint16_t)actual_ct_len;
     hdr[0] = (uint8_t)(wire_len >> 8);

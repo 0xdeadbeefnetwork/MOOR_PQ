@@ -33,6 +33,7 @@ typedef int socklen_t;
 #define MSG_NOSIGNAL 0
 #else
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -87,16 +88,18 @@ static int write_cookie_file(void) {
 
     char path[512];
     snprintf(path, sizeof(path), "%s/control_auth_cookie", g_data_dir);
+#ifdef _WIN32
     FILE *f = fopen(path, "wb");
+#else
+    int cookie_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    FILE *f = cookie_fd >= 0 ? fdopen(cookie_fd, "wb") : NULL;
+#endif
     if (!f) {
         LOG_WARN("monitor: cannot write cookie to %s", path);
         return -1;
     }
     fwrite(g_auth_cookie, 1, MOOR_CTRL_COOKIE_LEN, f);
     fclose(f);
-#ifndef _WIN32
-    chmod(path, 0600);
-#endif
     LOG_INFO("monitor: cookie auth file written to %s", path);
     return 0;
 }

@@ -13,6 +13,8 @@ typedef enum {
 
 void moor_log_set_level(moor_log_level_t level);
 moor_log_level_t moor_log_get_level(void);
+/* Enable safe mode: redact IP addresses and key material from log output */
+void moor_log_set_safe_mode(int enabled);
 void moor_log_impl(moor_log_level_t level, const char *file, int line,
                    const char *fmt, ...)
 #ifdef __GNUC__

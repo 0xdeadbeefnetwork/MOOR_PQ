@@ -248,8 +248,8 @@ int moor_conflux_send_data(moor_conflux_set_t *cset,
         moor_cell_relay(&cell, circ->circuit_id, RELAY_DATA,
                         stream_id, cell_data, (uint16_t)(8 + chunk));
 
-        moor_circuit_encrypt_forward(circ, &cell);
-        if (moor_connection_send_cell(circ->conn, &cell) != 0)
+        if (moor_circuit_encrypt_forward(circ, &cell) != 0 ||
+            moor_connection_send_cell(circ->conn, &cell) != 0)
             return -1;
 
         leg->sent_count++;

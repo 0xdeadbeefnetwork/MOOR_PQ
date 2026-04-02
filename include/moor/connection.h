@@ -73,6 +73,16 @@ struct moor_connection {
      * Set by the event loop owner (socks5/relay) so EXTEND can
      * process cells for other circuits without buffering. */
     void (*on_other_cell)(struct moor_connection *, moor_cell_t *);
+    /* PQ handshake tracking: CONN_STATE_OPEN is set early (before PQ
+     * exchange completes) so send_cell/recv_cell work during the PQ
+     * key exchange.  pq_handshake_done is 0 until the PQ mix is done. */
+    int pq_handshake_done;
+    /* Generation counter: incremented on each alloc from pool.
+     * Used by extend workers to detect connection slot reuse (#CWE-362). */
+    uint32_t generation;
+    /* Last cell activity timestamp (seconds since epoch).
+     * Used by connection reaper to cull idle connections. */
+    uint64_t last_activity;
 };
 
 /* Initialize connection pool */
@@ -170,5 +180,9 @@ int moor_connection_connect_async(moor_connection_t *conn,
 
 /* Non-blocking TCP connect. Returns fd (with EINPROGRESS) or -1. */
 int moor_tcp_connect_nonblocking(const char *address, uint16_t port);
+
+/* Reap connections idle for more than max_idle_sec seconds.
+ * Returns number of connections reaped. */
+int moor_connection_reap_idle(int max_idle_sec);
 
 #endif /* MOOR_CONNECTION_H */

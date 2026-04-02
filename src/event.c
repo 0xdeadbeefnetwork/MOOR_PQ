@@ -66,7 +66,7 @@ int moor_event_init(void) {
     if (g_epoll_fd >= 0) {
         close(g_epoll_fd);
     }
-    g_epoll_fd = epoll_create1(0);
+    g_epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     if (g_epoll_fd < 0) {
         LOG_ERROR("epoll_create1 failed");
         return -1;
@@ -235,8 +235,16 @@ int moor_event_loop(void) {
         if (g_shutdown_requested) break;
         if (nready < 0) {
             if (errno == EINTR) continue;
-            LOG_ERROR("epoll_wait error");
-            break;
+            /* EBADF can happen transiently when a stale fd is removed
+             * between epoll_ctl and epoll_wait.  Log and continue rather
+             * than killing the entire event loop — stability trumps. */
+            LOG_ERROR("epoll_wait error: %s (errno=%d)", strerror(errno), errno);
+            if (errno == EBADF || errno == EINVAL) {
+                /* Transient — sleep briefly and retry */
+                usleep(10000); /* 10ms */
+                continue;
+            }
+            break; /* Fatal: EFAULT, ENOMEM */
         }
 
         fire_timers();

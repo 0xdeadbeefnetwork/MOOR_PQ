@@ -41,6 +41,10 @@ int crypto_kem_enc(uint8_t *ct, uint8_t *ss, const uint8_t *pk) {
     /* K = KDF(K' || H(c)) */
     kyber_kdf(ss, kr, 2*KYBER_SYMBYTES);
 
+    /* Wipe secret intermediates (CWE-401) */
+    sodium_memzero(buf, sizeof(buf));
+    sodium_memzero(kr, sizeof(kr));
+
     return 0;
 }
 
@@ -72,6 +76,11 @@ int crypto_kem_dec(uint8_t *ss, const uint8_t *ct, const uint8_t *sk) {
 
     /* K = KDF(K' || H(c)) */
     kyber_kdf(ss, kr, 2*KYBER_SYMBYTES);
+
+    /* Wipe secret intermediates (CWE-401) */
+    sodium_memzero(buf, sizeof(buf));
+    sodium_memzero(kr, sizeof(kr));
+    sodium_memzero(cmp, sizeof(cmp));
 
     return 0;
 }

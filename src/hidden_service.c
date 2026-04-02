@@ -23,7 +23,7 @@ static FILE *secure_fopen(const char *path, const char *mode) {
     (void)mode;
     int fd;
     _sopen_s(&fd, path, _O_CREAT | _O_WRONLY | _O_TRUNC | _O_BINARY,
-              _SH_DENYNO, _S_IREAD | _S_IWRITE);
+              _SH_DENYRW, _S_IREAD | _S_IWRITE);
     if (fd < 0) return NULL;
     return _fdopen(fd, "wb");
 }
@@ -116,6 +116,11 @@ int moor_hs_keygen(moor_hs_config_t *config) {
 }
 
 int moor_hs_save_keys(const moor_hs_config_t *config) {
+    if (strlen(config->hs_dir) > 480) {
+        LOG_ERROR("hs_dir path too long (max 480 chars)");
+        return -1;
+    }
+
     /* Create directory */
     mkdir(config->hs_dir, 0700);
 
@@ -167,6 +172,44 @@ int moor_hs_save_keys(const moor_hs_config_t *config) {
     fflush(f);
     fclose(f);
 
+    /* Save KEM keypair if generated (PQ hybrid e2e) */
+    if (config->kem_generated) {
+        snprintf(path, sizeof(path), "%s/kem_sk", config->hs_dir);
+        f = secure_fopen(path, "wb");
+        if (!f) return -1;
+        if (fwrite(config->kem_sk, 1, sizeof(config->kem_sk), f) !=
+            sizeof(config->kem_sk)) {
+            LOG_ERROR("failed to write %s", path);
+            fclose(f);
+            return -1;
+        }
+        fflush(f);
+        fclose(f);
+
+        /* Save kem_sk path before overwriting for cleanup on failure (#R1-D2) */
+        char kem_sk_path[512];
+        snprintf(kem_sk_path, sizeof(kem_sk_path), "%s/kem_sk", config->hs_dir);
+
+        snprintf(path, sizeof(path), "%s/kem_pk", config->hs_dir);
+        f = fopen(path, "wb");
+        if (!f) {
+            /* Wipe sk on partial write to avoid orphaned secret key (CWE-459) */
+            sodium_memzero((void *)config->kem_sk, sizeof(config->kem_sk));
+            unlink(kem_sk_path);
+            return -1;
+        }
+        if (fwrite(config->kem_pk, 1, sizeof(config->kem_pk), f) !=
+            sizeof(config->kem_pk)) {
+            LOG_ERROR("failed to write %s", path);
+            fclose(f);
+            sodium_memzero((void *)config->kem_sk, sizeof(config->kem_sk));
+            unlink(kem_sk_path);
+            return -1;
+        }
+        fflush(f);
+        fclose(f);
+    }
+
     /* Save address */
     snprintf(path, sizeof(path), "%s/hostname", config->hs_dir);
     f = fopen(path, "w");
@@ -183,35 +226,71 @@ int moor_hs_save_keys(const moor_hs_config_t *config) {
     return 0;
 }
 
+/* Open file for reading without following symlinks (CWE-59) */
+static FILE *nofollow_fopen(const char *path) {
+#ifdef _WIN32
+    return fopen(path, "rb");
+#else
+    int fd = open(path, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) return NULL;
+    return fdopen(fd, "rb");
+#endif
+}
+
 int moor_hs_load_keys(moor_hs_config_t *config) {
+    if (strlen(config->hs_dir) > 480) {
+        LOG_ERROR("hs_dir path too long (max 480 chars)");
+        return -1;
+    }
+
     char path[512];
 
     snprintf(path, sizeof(path), "%s/identity_sk", config->hs_dir);
-    FILE *f = fopen(path, "rb");
+    FILE *f = nofollow_fopen(path);
     if (!f) return -1;
     if (fread(config->identity_sk, 1, 64, f) != 64) { fclose(f); return -1; }
     fclose(f);
 
     snprintf(path, sizeof(path), "%s/identity_pk", config->hs_dir);
-    f = fopen(path, "rb");
+    f = nofollow_fopen(path);
     if (!f) return -1;
     if (fread(config->identity_pk, 1, 32, f) != 32) { fclose(f); return -1; }
     fclose(f);
 
     snprintf(path, sizeof(path), "%s/onion_sk", config->hs_dir);
-    f = fopen(path, "rb");
+    f = nofollow_fopen(path);
     if (!f) return -1;
     if (fread(config->onion_sk, 1, 32, f) != 32) { fclose(f); return -1; }
     fclose(f);
 
     snprintf(path, sizeof(path), "%s/onion_pk", config->hs_dir);
-    f = fopen(path, "rb");
+    f = nofollow_fopen(path);
     if (!f) return -1;
     if (fread(config->onion_pk, 1, 32, f) != 32) { fclose(f); return -1; }
     fclose(f);
 
     moor_hs_compute_address(config->moor_address, sizeof(config->moor_address),
                             config->identity_pk);
+
+    /* Load KEM keypair if it exists (PQ hybrid e2e) */
+    snprintf(path, sizeof(path), "%s/kem_sk", config->hs_dir);
+    f = nofollow_fopen(path);
+    if (f) {
+        if (fread(config->kem_sk, 1, sizeof(config->kem_sk), f) ==
+            sizeof(config->kem_sk)) {
+            fclose(f);
+            snprintf(path, sizeof(path), "%s/kem_pk", config->hs_dir);
+            f = nofollow_fopen(path);
+            if (f && fread(config->kem_pk, 1, sizeof(config->kem_pk), f) ==
+                sizeof(config->kem_pk)) {
+                config->kem_generated = 1;
+                LOG_INFO("HS KEM keys loaded");
+            }
+            if (f) fclose(f);
+        } else {
+            fclose(f);
+        }
+    }
 
     /* Derive blinded keys for current time period */
     config->current_time_period = current_time_period();
@@ -456,8 +535,12 @@ int moor_hs_establish_intro(moor_hs_config_t *config,
         moor_cell_t cell;
         moor_cell_relay(&cell, circ->circuit_id, RELAY_ESTABLISH_INTRO, 0,
                        intro_data, (uint16_t)intro_data_len);
-        moor_circuit_encrypt_forward(circ, &cell);
-        moor_connection_send_cell(circ->conn, &cell);
+        if (moor_circuit_encrypt_forward(circ, &cell) != 0 ||
+            moor_connection_send_cell(circ->conn, &cell) != 0) {
+            LOG_WARN("HS: failed to send ESTABLISH_INTRO");
+            moor_circuit_free(circ);
+            continue;
+        }
 
         config->intro_circuits[num_intros] = circ;
         config->intro_established_at[num_intros] = (uint64_t)time(NULL);
@@ -500,8 +583,12 @@ int moor_hs_publish_descriptor(moor_hs_config_t *config) {
     memcpy(desc.onion_pk, config->onion_pk, 32);
     memcpy(desc.blinded_pk, config->blinded_pk, 32);
     desc.num_intro_points = config->num_intro_circuits;
+    /* Cap to 3 intro points per spec -- more would leak topology info
+     * and the descriptor format only supports 3 slots */
+    if (desc.num_intro_points > 3)
+        desc.num_intro_points = 3;
 
-    for (int i = 0; i < config->num_intro_circuits; i++) {
+    for (int i = 0; i < (int)desc.num_intro_points; i++) {
         moor_circuit_t *circ = config->intro_circuits[i];
         if (circ && circ->num_hops > 0) {
             int last = circ->num_hops - 1;
@@ -545,12 +632,17 @@ int moor_hs_publish_descriptor(moor_hs_config_t *config) {
     memcpy(to_sign, desc.address_hash, 32);
     memcpy(to_sign + 32, desc.service_pk, 32);
     memcpy(to_sign + 64, content_hash, 32);
-    moor_crypto_sign(desc.signature, to_sign, 96, config->identity_sk);
+    if (moor_crypto_sign(desc.signature, to_sign, 96, config->identity_sk) != 0) {
+        LOG_ERROR("HS: descriptor signing failed");
+        sodium_memzero(&desc, sizeof(desc));
+        return -1;
+    }
     desc.published = (uint64_t)time(NULL);
 
     /* Serialize the plaintext descriptor (before client-auth encryption).
-     * Buffer must fit KEM pk (1184 bytes) + other fields. */
-    uint8_t plaintext[2560];
+     * Buffer must fit KEM pk (1184 bytes) + auth entries (16*80) + other fields.
+     * Worst case: 1717 base + 1281 auth = 2998, rounded up to 4096. */
+    uint8_t plaintext[4096];
     int pt_len = moor_hs_descriptor_serialize(plaintext, sizeof(plaintext), &desc);
     if (pt_len < 0) {
         sodium_memzero(&desc, sizeof(desc));
@@ -581,7 +673,7 @@ int moor_hs_publish_descriptor(moor_hs_config_t *config) {
      * This hides intro points, PoW params, and all metadata from anyone
      * who doesn't hold a listed client key. The outer desc_key layer
      * (derived from identity_pk) is still present for DA-opaque storage. */
-    uint8_t to_encrypt[2048]; /* buffer for outer AEAD input */
+    uint8_t to_encrypt[4096]; /* buffer for outer AEAD input (fits superencrypted PQ desc) */
     size_t to_encrypt_len;
 
     if (config->num_auth_clients > 0) {
@@ -590,7 +682,7 @@ int moor_hs_publish_descriptor(moor_hs_config_t *config) {
         moor_crypto_random(inner_key, 32);
 
         /* Seal inner_key to each authorized client (crypto_box_seal: 48 bytes each) */
-        uint8_t super_buf[2 + 16 * 48 + 8 + 1024 + 16]; /* max superencrypted */
+        uint8_t super_buf[2 + 16 * 48 + 8 + sizeof(plaintext) + 16]; /* max superencrypted */
         size_t spos = 0;
         super_buf[spos++] = 2; /* auth_type 2 = superencrypted descriptor */
         super_buf[spos++] = (uint8_t)config->num_auth_clients;
@@ -607,7 +699,7 @@ int moor_hs_publish_descriptor(moor_hs_config_t *config) {
         for (int i = 7; i >= 0; i--)
             super_buf[spos++] = (uint8_t)(inner_nonce >> (i * 8));
 
-        uint8_t inner_ct[1024 + 16];
+        uint8_t inner_ct[sizeof(plaintext) + 16];
         size_t inner_ct_len;
         const uint8_t inner_ad[] = "moor-hs-auth";
         if (moor_crypto_aead_encrypt(inner_ct, &inner_ct_len,
@@ -616,6 +708,8 @@ int moor_hs_publish_descriptor(moor_hs_config_t *config) {
                                       inner_key, inner_nonce) != 0) {
             moor_crypto_wipe(inner_key, 32);
             sodium_memzero(&desc, sizeof(desc));
+            sodium_memzero(super_buf, sizeof(super_buf));
+            sodium_memzero(to_encrypt, sizeof(to_encrypt));
             return -1;
         }
         memcpy(super_buf + spos, inner_ct, inner_ct_len);
@@ -624,6 +718,7 @@ int moor_hs_publish_descriptor(moor_hs_config_t *config) {
 
         memcpy(to_encrypt, super_buf, spos);
         to_encrypt_len = (int)spos;
+        sodium_memzero(super_buf, sizeof(super_buf));
         LOG_INFO("HS: descriptor superencrypted for %d authorized clients",
                  config->num_auth_clients);
     } else {
@@ -653,19 +748,20 @@ int moor_hs_publish_descriptor(moor_hs_config_t *config) {
     moor_crypto_random((uint8_t *)&nonce, 8);
 
     /* Outer encrypt: AEAD(body, ad=address_hash, key=desc_key, nonce) */
-    uint8_t ciphertext[2048 + 16];
+    uint8_t ciphertext[sizeof(to_encrypt) + 16];
     size_t ct_len;
     if (moor_crypto_aead_encrypt(ciphertext, &ct_len,
                                   to_encrypt, to_encrypt_len,
                                   desc.address_hash, 32,
                                   desc_key, nonce) != 0) {
         moor_crypto_wipe(desc_key, 32);
+        sodium_memzero(to_encrypt, sizeof(to_encrypt));
         return -1;
     }
     moor_crypto_wipe(desc_key, 32);
 
     /* Build encrypted wire data: address_hash(32) + nonce(8) + ciphertext */
-    uint8_t wire[2048 + 56];
+    uint8_t wire[sizeof(ciphertext) + 40]; /* address_hash(32) + nonce(8) + ciphertext */
     size_t wire_len = 0;
     memcpy(wire, desc.address_hash, 32); wire_len += 32;
     for (int i = 7; i >= 0; i--) wire[wire_len++] = (uint8_t)(nonce >> (i * 8));
@@ -673,11 +769,12 @@ int moor_hs_publish_descriptor(moor_hs_config_t *config) {
 
     if (wire_len > UINT16_MAX) {
         LOG_ERROR("HS: wire_len %zu exceeds uint16_t max", wire_len);
+        sodium_memzero(to_encrypt, sizeof(to_encrypt));
         return -1;
     }
 
     /* Publish to all configured DAs (best-effort, first success is enough) */
-    uint8_t send_buf[11 + 4 + 2048 + 56]; /* match wire[] max */
+    uint8_t send_buf[11 + 4 + sizeof(wire)]; /* match wire[] max */
     memcpy(send_buf, "HS_PUBLISH\n", 11);
     send_buf[11] = (uint8_t)(wire_len >> 24);
     send_buf[12] = (uint8_t)(wire_len >> 16);
@@ -711,6 +808,7 @@ int moor_hs_publish_descriptor(moor_hs_config_t *config) {
         LOG_ERROR("HS: failed to publish descriptor to any DA");
         sodium_memzero(&desc, sizeof(desc));
         sodium_memzero(plaintext, sizeof(plaintext));
+        sodium_memzero(to_encrypt, sizeof(to_encrypt));
         return -1;
     }
 
@@ -747,6 +845,7 @@ int moor_hs_publish_descriptor(moor_hs_config_t *config) {
     /* Wipe sensitive stack buffers */
     sodium_memzero(&desc, sizeof(desc));
     sodium_memzero(plaintext, sizeof(plaintext));
+    sodium_memzero(to_encrypt, sizeof(to_encrypt));
 
     return 0;
 }
@@ -799,7 +898,13 @@ int moor_hs_handle_introduce(moor_hs_config_t *config,
      * Decrypt to get: rp_node_id(32) + rendezvous_cookie(20) + client_eph_pk(32)
      * The introduction point cannot read this payload.
      */
-    (void)intro_circ;
+    /* Increment intro_count for the matching introduction point */
+    for (int i = 0; i < config->num_intro_circuits; i++) {
+        if (config->intro_circuits[i] == intro_circ) {
+            config->intro_count[i]++;
+            break;
+        }
+    }
 
     if (len < 84 + MOOR_SEAL_OVERHEAD) {
         LOG_ERROR("INTRODUCE2 payload too short for sealed box");
@@ -916,8 +1021,15 @@ int moor_hs_rendezvous(moor_hs_config_t *config,
     moor_cell_t cell;
     moor_cell_relay(&cell, rp_circ->circuit_id, RELAY_RENDEZVOUS1, 0,
                    rv1_data, sizeof(rv1_data));
-    moor_circuit_encrypt_forward(rp_circ, &cell);
-    moor_connection_send_cell(rp_circ->conn, &cell);
+    if (moor_circuit_encrypt_forward(rp_circ, &cell) != 0 ||
+        moor_connection_send_cell(rp_circ->conn, &cell) != 0) {
+        LOG_ERROR("HS rendezvous: failed to send RENDEZVOUS1");
+        moor_circuit_free(rp_circ);
+        free(heap_cons);
+        moor_crypto_wipe(shared, 32);
+        moor_crypto_wipe(eph_sk, 32);
+        return -1;
+    }
 
     LOG_INFO("HS: RENDEZVOUS1 sent");
 
@@ -1010,7 +1122,7 @@ int moor_hs_client_connect_start(const char *moor_address,
     moor_hs_descriptor_t hs_desc;
     int desc_fetched = 0;
     /* Outer decrypted body — may be raw descriptor or superencrypted */
-    uint8_t outer_pt[2048];
+    uint8_t outer_pt[MOOR_DHT_MAX_DESC_DATA];
     size_t outer_pt_len = 0;
 
     if (consensus && consensus->num_relays > 0) {
@@ -1045,7 +1157,8 @@ int moor_hs_client_connect_start(const char *moor_address,
                         if (moor_crypto_aead_decrypt(pt, &outer_pt_len,
                                                       dht_data + 40, ct_len,
                                                       dht_data, 32,
-                                                      desc_key, nonce) == 0) {
+                                                      desc_key, nonce) == 0 &&
+                            outer_pt_len <= sizeof(outer_pt)) {
                             memcpy(outer_pt, pt, outer_pt_len);
                             desc_fetched = 1;
                             LOG_INFO("HS: descriptor fetched via DHT (tp=%lu)",
@@ -1130,7 +1243,7 @@ int moor_hs_client_connect_start(const char *moor_address,
 
         const uint8_t *inner_ct = outer_pt + nonce_off + 8;
         size_t inner_ct_len = outer_pt_len - nonce_off - 8;
-        uint8_t inner_pt[1024];
+        uint8_t inner_pt[MOOR_DHT_MAX_DESC_DATA];
         size_t inner_pt_len;
         const uint8_t inner_ad[] = "moor-hs-auth";
         if (moor_crypto_aead_decrypt(inner_pt, &inner_pt_len,
@@ -1262,8 +1375,13 @@ verify_descriptor:
     moor_cell_t cell;
     moor_cell_relay(&cell, rp_circ->circuit_id, RELAY_ESTABLISH_RENDEZVOUS, 0,
                    cookie, sizeof(cookie));
-    moor_circuit_encrypt_forward(rp_circ, &cell);
-    moor_connection_send_cell(rp_circ->conn, &cell);
+    if (moor_circuit_encrypt_forward(rp_circ, &cell) != 0 ||
+        moor_connection_send_cell(rp_circ->conn, &cell) != 0) {
+        LOG_ERROR("HS: failed to send ESTABLISH_RENDEZVOUS");
+        moor_circuit_free(rp_circ);
+        moor_connection_close(rp_conn);
+        return -1;
+    }
 
     /* Wait synchronously for RENDEZVOUS_ESTABLISHED so the backward digest
      * is updated before the connection is shared with the async event loop.
@@ -1296,7 +1414,6 @@ verify_descriptor:
             LOG_ERROR("HS: timeout waiting for RENDEZVOUS_ESTABLISHED");
             moor_circuit_free(rp_circ);
             moor_connection_close(rp_conn);
-            moor_connection_free(rp_conn);
             return -1;
         }
     }
@@ -1306,7 +1423,6 @@ verify_descriptor:
         LOG_ERROR("HS has no intro points");
         moor_circuit_free(rp_circ);
         moor_connection_close(rp_conn);
-        moor_connection_free(rp_conn);
         return -1;
     }
 
@@ -1314,7 +1430,6 @@ verify_descriptor:
     if (!intro_circ) {
         moor_circuit_free(rp_circ);
         moor_connection_close(rp_conn);
-        moor_connection_free(rp_conn);
         return -1;
     }
 
@@ -1323,7 +1438,6 @@ verify_descriptor:
         moor_circuit_free(intro_circ);
         moor_circuit_free(rp_circ);
         moor_connection_close(rp_conn);
-        moor_connection_free(rp_conn);
         return -1;
     }
 
@@ -1394,10 +1508,8 @@ verify_descriptor:
         moor_crypto_wipe(eph_sk, 32);
         moor_circuit_free(intro_circ);
         moor_connection_close(intro_conn);
-        moor_connection_free(intro_conn);
         moor_circuit_free(rp_circ);
         moor_connection_close(rp_conn);
-        moor_connection_free(rp_conn);
         return -1;
     }
 
@@ -1414,10 +1526,8 @@ verify_descriptor:
             moor_crypto_wipe(eph_sk, 32);
             moor_circuit_free(intro_circ);
             moor_connection_close(intro_conn);
-            moor_connection_free(intro_conn);
             moor_circuit_free(rp_circ);
             moor_connection_close(rp_conn);
-            moor_connection_free(rp_conn);
             return -1;
         }
         LOG_INFO("HS: PoW solved (difficulty %u)", hs_desc.pow_difficulty);
@@ -1435,15 +1545,22 @@ verify_descriptor:
     moor_cell_t intro_cell;
     moor_cell_relay(&intro_cell, intro_circ->circuit_id, RELAY_INTRODUCE1, 0,
                    intro_payload, (uint16_t)intro_payload_len);
-    moor_circuit_encrypt_forward(intro_circ, &intro_cell);
-    moor_connection_send_cell(intro_circ->conn, &intro_cell);
+    if (moor_circuit_encrypt_forward(intro_circ, &intro_cell) != 0 ||
+        moor_connection_send_cell(intro_circ->conn, &intro_cell) != 0) {
+        LOG_ERROR("HS: failed to send INTRODUCE1");
+        moor_crypto_wipe(eph_sk, 32);
+        moor_circuit_destroy(intro_circ);
+        moor_connection_close(intro_conn);
+        moor_circuit_free(rp_circ);
+        moor_connection_close(rp_conn);
+        return -1;
+    }
 
     LOG_INFO("HS: sealed INTRODUCE1 sent (async, returning RP circuit)");
 
     /* Clean up intro circuit (no longer needed) */
     moor_circuit_destroy(intro_circ);
     moor_connection_close(intro_conn);
-    moor_connection_free(intro_conn);
 
     /* Store eph_sk on RP circuit for DH completion after RENDEZVOUS2 (#197) */
     memcpy(rp_circ->e2e_eph_sk, eph_sk, 32);
@@ -1482,7 +1599,10 @@ int moor_hs_client_connect(const char *moor_address,
             continue;
         }
 
-        moor_circuit_decrypt_backward(rp_circ, &rv2_cell);
+        if (moor_circuit_decrypt_backward(rp_circ, &rv2_cell) != 0) {
+            LOG_WARN("HS: backward decrypt failed waiting for RENDEZVOUS2");
+            continue;
+        }
 
         moor_relay_payload_t rv2_relay;
         moor_relay_unpack(&rv2_relay, rv2_cell.payload);
