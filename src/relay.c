@@ -2565,125 +2565,74 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                             return -1;
                         }
 
-                        /* Try to reuse existing connection to next hop */
-                        int conn_reused_pq = 0;
+                        /* Fast path / slow path — same pattern as fragmented EXTEND_PQ */
+                        uint32_t next_circ_id_uf = moor_circuit_gen_id();
                         moor_connection_t *existing_pq = moor_connection_find_by_identity(next_identity_pk);
-                        moor_connection_t *next_conn;
+
                         if (existing_pq && existing_pq->state == CONN_STATE_OPEN) {
-                            next_conn = existing_pq;
-                            next_conn->circuit_refcount++;
-                            conn_reused_pq = 1;
-                            LOG_DEBUG("EXTEND_PQ: reusing connection to next hop");
-                        } else {
-                            next_conn = moor_connection_alloc();
-                            if (!next_conn) { g_extend_pq_inflight--; return -1; }
-                            memcpy(next_conn->peer_identity, next_identity_pk, 32);
-                            if (moor_connection_connect(next_conn, next_addr,
-                                                        next_port,
-                                                        g_relay_config.identity_pk,
-                                                        g_relay_config.identity_sk,
-                                                        NULL, NULL) != 0) {
-                                moor_connection_free(next_conn);
+                            /* FAST PATH: reuse connection */
+                            moor_cell_t create_cell;
+                            moor_cell_create(&create_cell, next_circ_id_uf,
+                                             next_identity_pk, client_eph_pk_ext);
+                            create_cell.command = CELL_CREATE_PQ;
+                            if (moor_connection_send_cell(existing_pq, &create_cell) != 0) {
                                 g_extend_pq_inflight--;
                                 return -1;
                             }
-                        }
-                        circ->next_conn = next_conn;
-                        circ->next_circuit_id = moor_circuit_gen_id();
-
-                        /* Send CREATE_PQ to next hop (CKE format) */
-                        moor_cell_t create_cell;
-                        moor_cell_create(&create_cell, circ->next_circuit_id,
-                                         next_identity_pk, client_eph_pk_ext);
-                        create_cell.command = CELL_CREATE_PQ;
-                        if (moor_connection_send_cell(next_conn,
-                                                      &create_cell) != 0) {
-                            if (conn_reused_pq) next_conn->circuit_refcount--;
+                            circ->next_conn = existing_pq;
+                            circ->next_circuit_id = next_circ_id_uf;
+                            circ->extend_pending = 1;
+                            existing_pq->circuit_refcount++;
+                            moor_event_add(existing_pq->fd, MOOR_EVENT_READ,
+                                           relay_conn_read_cb, existing_pq);
+                            moor_circuit_register(circ);
                             g_extend_pq_inflight--;
-                            return -1;
-                        }
-
-                        LOG_WARN("EXTEND_PQ (frag): blocking connect+handshake on event loop — DoS risk");
-                        moor_cell_t created_resp = {0};
-                        int ret;
-                        uint64_t ext_pq_deadline = (uint64_t)time(NULL) + 2;
-                        for (;;) {
-                            ret = moor_connection_recv_cell(next_conn,
-                                                            &created_resp);
-                            if (ret > 0) {
-                                if (created_resp.circuit_id != circ->next_circuit_id) {
-                                    moor_relay_process_cell(next_conn, &created_resp);
-                                    continue;
-                                }
-                                break;
+                            LOG_INFO("EXTEND_PQ (unfrag): fast path to %s:%u", next_addr, next_port);
+                        } else {
+                            /* SLOW PATH: async worker */
+                            extend_work_t *w = calloc(1, sizeof(extend_work_t));
+                            if (!w) { g_extend_pq_inflight--; return -1; }
+                            memcpy(w->next_addr, next_addr, 64);
+                            w->next_port = next_port;
+                            memcpy(w->next_identity_pk, next_identity_pk, 32);
+                            memcpy(w->client_eph_pk, client_eph_pk_ext, 32);
+                            memcpy(w->relay_identity_pk, g_relay_config.identity_pk, 32);
+                            memcpy(w->relay_identity_sk, g_relay_config.identity_sk, 64);
+                            w->circuit_id = circ->circuit_id;
+                            w->prev_circuit_id = circ->prev_circuit_id;
+                            w->next_circuit_id = next_circ_id_uf;
+                            w->prev_conn = circ->prev_conn;
+                            w->prev_conn_generation = circ->prev_conn->generation;
+                            w->pq = 1;
+                            circ->extend_pending = 1;
+                            if (g_extend_threads >= EXTEND_MAX_THREADS) {
+                                circ->extend_pending = 0;
+                                extend_work_free(w);
+                                g_extend_pq_inflight--;
+                                return -1;
                             }
-                            if (ret < 0) break;
-                            if ((uint64_t)time(NULL) >= ext_pq_deadline) {
-                                LOG_ERROR("EXTEND_PQ: timeout (2s)");
-                                ret = -1;
-                                break;
+                            __sync_fetch_and_add(&g_extend_threads, 1);
+                            pthread_t tid;
+                            pthread_attr_t attr;
+                            pthread_attr_init(&attr);
+                            pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+                            if (pthread_create(&tid, &attr, extend_worker_func, w) != 0) {
+                                pthread_attr_destroy(&attr);
+                                __sync_fetch_and_sub(&g_extend_threads, 1);
+                                circ->extend_pending = 0;
+                                extend_work_free(w);
+                                g_extend_pq_inflight--;
+                                return -1;
                             }
-                            if (wait_for_readable(next_conn->fd, 1000) <= 0) {
-                                LOG_ERROR("EXTEND_PQ: timeout waiting for CREATED_PQ");
-                                ret = -1;
-                                break;
-                            }
-                        }
-                        if (ret < 0 ||
-                            created_resp.command != CELL_CREATED_PQ) {
-                            LOG_ERROR("EXTEND_PQ: next hop CREATE_PQ failed");
-                            if (conn_reused_pq) next_conn->circuit_refcount--;
-                            if (!conn_reused_pq) moor_connection_close(next_conn);
-                            circ->next_conn = NULL;
-                            circ->next_circuit_id = 0;
+                            pthread_attr_destroy(&attr);
                             g_extend_pq_inflight--;
-                            return -1;
+                            LOG_INFO("EXTEND_PQ (unfrag): async worker to %s:%u", next_addr, next_port);
                         }
 
-                        g_extend_pq_inflight--;
-                        if (!conn_reused_pq)
-                            moor_event_add(next_conn->fd, MOOR_EVENT_READ,
-                                           relay_conn_read_cb, next_conn);
-                        moor_circuit_register(circ);
-
-                        /* Forward buffered KEM CT to next hop as CELL_KEM_CT */
-                        if (circ->pq_kem_ct_len > 0) {
-                            size_t ct_off = 0;
-                            while (ct_off < MOOR_KEM_CT_LEN) {
-                                size_t chunk = MOOR_KEM_CT_LEN - ct_off;
-                                if (chunk > MOOR_CELL_PAYLOAD) chunk = MOOR_CELL_PAYLOAD;
-                                moor_cell_t kem_cell;
-                                kem_cell.circuit_id = circ->next_circuit_id;
-                                kem_cell.command = CELL_KEM_CT;
-                                memset(kem_cell.payload, 0, MOOR_CELL_PAYLOAD);
-                                memcpy(kem_cell.payload, circ->pq_kem_ct + ct_off, chunk);
-                                if (moor_connection_send_cell(next_conn, &kem_cell) != 0) {
-                                    LOG_ERROR("EXTEND_PQ (frag): failed to forward KEM CT cell");
-                                    return -1;
-                                }
-                                ct_off += chunk;
-                            }
-                            LOG_INFO("EXTEND_PQ (frag): forwarded %zu bytes KEM CT",
-                                     circ->pq_kem_ct_len);
-                            circ->pq_kem_ct_len = 0;
-                        }
-
-                        /* Send EXTENDED_PQ back (fragmented) */
-                        uint16_t frag_id = moor_fragment_gen_id();
-                        /* For now, send unfragmented if it fits */
-                        moor_cell_t ext_resp;
-                        moor_cell_relay(&ext_resp, circ->prev_circuit_id,
-                                       RELAY_EXTENDED_PQ, 0,
-                                       created_resp.payload, 64);
-                        moor_relay_set_digest(ext_resp.payload,
-                                              circ->relay_backward_digest);
-                        moor_circuit_relay_encrypt(circ, &ext_resp);
-                        if (moor_connection_send_cell(circ->prev_conn, &ext_resp) != 0)
-                            LOG_DEBUG("send_cell failed (line %d)", __LINE__);
-
-                        (void)frag_id;
-                        LOG_INFO("EXTEND_PQ: circuit %u extended to %s:%u",
-                                 circ->circuit_id, next_addr, next_port);
+                        /* KEM CT forwarding + RELAY_EXTENDED_PQ response handled by
+                         * extend completion (fast-path CREATED_PQ handler or async
+                         * worker callback) — both forward pq_kem_ct and send the
+                         * correct response type. */
                     }
                 } else if (fret < 0) {
                     LOG_WARN("fragment reassembly error");
