@@ -106,8 +106,8 @@ static const char *extract_domain(const char *addr);
  * moor_circuit_build_async() state machine.  Connections are naturally
  * shared via moor_connection_find_by_identity() (single-threaded). */
 
-#define PREBUILT_POOL_SIZE 8
-#define MAX_CONCURRENT_BUILDS 2
+#define PREBUILT_POOL_SIZE 14   /* Tor: MAX_UNUSED_OPEN_CIRCUITS = 14 */
+#define MAX_CONCURRENT_BUILDS 3
 
 typedef struct {
     moor_circuit_t  *circuit;

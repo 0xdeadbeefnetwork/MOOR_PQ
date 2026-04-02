@@ -1293,56 +1293,17 @@ static int relay_cke_derive(uint8_t key_seed[32], uint8_t auth_tag[32],
 #define CREATE_RATE_LIMIT    10   /* max CREATE cells per connection per window */
 #define CREATE_RATE_WINDOW   5    /* seconds */
 
-/* R10-ADV3: Per-IP circuit count cap to prevent Sybil circuit exhaustion.
- * Track active circuits per source IP (up to 256 unique IPs). */
-#define MAX_CIRCUITS_PER_IP  32
-#define IP_CIRC_TABLE_SIZE   256
-
-static struct {
-    uint32_t ip;        /* IPv4 in network byte order */
-    int      count;     /* active circuits from this IP */
-} g_ip_circ_table[IP_CIRC_TABLE_SIZE];
-static int g_ip_circ_table_init = 0;
-
-static int ip_circ_count_check(int fd) {
-    if (!g_ip_circ_table_init) {
-        memset(g_ip_circ_table, 0, sizeof(g_ip_circ_table));
-        g_ip_circ_table_init = 1;
-    }
-    struct sockaddr_in sa;
-    socklen_t sa_len = sizeof(sa);
-    if (getpeername(fd, (struct sockaddr *)&sa, &sa_len) != 0)
-        return 0; /* can't determine, allow */
-    if (sa.sin_family != AF_INET) return 0; /* IPv6: skip for now */
-    uint32_t ip = sa.sin_addr.s_addr;
-    /* Find existing entry or empty slot */
-    int empty_slot = -1;
-    for (int i = 0; i < IP_CIRC_TABLE_SIZE; i++) {
-        if (g_ip_circ_table[i].ip == ip && g_ip_circ_table[i].count > 0) {
-            if (g_ip_circ_table[i].count >= MAX_CIRCUITS_PER_IP)
-                return -1; /* over limit */
-            g_ip_circ_table[i].count++;
-            return 0;
-        }
-        if (empty_slot < 0 && g_ip_circ_table[i].count == 0)
-            empty_slot = i;
-    }
-    if (empty_slot >= 0) {
-        g_ip_circ_table[empty_slot].ip = ip;
-        g_ip_circ_table[empty_slot].count = 1;
-    }
-    return 0;
-}
+/* Tor-aligned: NO absolute per-IP circuit count.
+ * Absolute counters accumulate across client restarts (EPOLLHUP processing
+ * races with new connections) and break legitimate use behind NAT/VPN.
+ * Tor uses only rate-based limiting:
+ *   - Token bucket rate limiter (moor_ratelimit_check, MOOR_RL_CIRCUIT)
+ *   - Per-connection CREATE rate limit (CREATE_RATE_LIMIT / CREATE_RATE_WINDOW)
+ *   - Circuit pool OOM killer (1024 slots)
+ * These are sufficient without an absolute per-IP cap. */
 
 void moor_relay_ip_circ_release(uint32_t ipv4_net_order) {
-    if (ipv4_net_order == 0) return;
-    for (int i = 0; i < IP_CIRC_TABLE_SIZE; i++) {
-        if (g_ip_circ_table[i].ip == ipv4_net_order &&
-            g_ip_circ_table[i].count > 0) {
-            g_ip_circ_table[i].count--;
-            return;
-        }
-    }
+    (void)ipv4_net_order; /* No-op: absolute per-IP counting removed */
 }
 
 int moor_relay_handle_create(moor_connection_t *conn,
@@ -1356,13 +1317,6 @@ int moor_relay_handle_create(moor_connection_t *conn,
     if (++conn->create_window_count > CREATE_RATE_LIMIT) {
         LOG_WARN("CREATE rate limit exceeded on fd=%d (%u in %us)",
                  conn->fd, conn->create_window_count, CREATE_RATE_WINDOW);
-        return -1;
-    }
-
-    /* R10-ADV3: Per-IP circuit count cap */
-    if (ip_circ_count_check(conn->fd) != 0) {
-        LOG_WARN("CREATE: per-IP circuit limit (%d) exceeded on fd=%d",
-                 MAX_CIRCUITS_PER_IP, conn->fd);
         return -1;
     }
 
@@ -1428,15 +1382,6 @@ int moor_relay_handle_create(moor_connection_t *conn,
     circ->prev_conn = conn;
     circ->prev_circuit_id = cell->circuit_id;
     circ->is_client = 0;
-
-    /* Store peer IPv4 for ip_circ_count release on circuit free */
-    {
-        struct sockaddr_in peer_sa;
-        socklen_t peer_len = sizeof(peer_sa);
-        if (getpeername(conn->fd, (struct sockaddr *)&peer_sa, &peer_len) == 0
-            && peer_sa.sin_family == AF_INET)
-            circ->relay_peer_ipv4 = peer_sa.sin_addr.s_addr;
-    }
 
     /* Derive relay-side circuit keys from key_seed */
     moor_crypto_kdf(circ->relay_forward_key, 32, key_seed, 1, "moorFWD!");
