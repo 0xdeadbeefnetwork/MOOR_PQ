@@ -4,11 +4,11 @@ Post-quantum anonymous overlay network. Version 0.8.0.
 
 ## What is this?
 
-MOOR is a tool that makes your internet traffic anonymous. When you normally browse the web, every website you visit can see your IP address (your internet "home address"), and your internet provider can see every website you visit. MOOR fixes both problems.
+MOOR is an onion router. Your traffic is encrypted in three layers and routed through three relays. Each relay peels one layer, learns only the next hop, and forwards. No single relay knows both who you are and what you're accessing.
 
-It works using a technique called **onion routing**. Think of it like sending a letter inside multiple sealed envelopes. You give the letter to a chain of three couriers. Each courier can only open one envelope, which tells them who to hand it to next -- but none of them can read the actual letter, and none of them know the full route.
+Every key exchange — link, circuit, hidden service — uses hybrid post-quantum cryptography: X25519 + Kyber768. Traffic recorded today cannot be decrypted by a quantum computer tomorrow.
 
-In technical terms: your traffic is encrypted in three layers and passed through three relays. Each relay peels off one layer of encryption, learns only the next step, and forwards the data. No single relay ever knows both who you are and what you are accessing.
+~40,000 lines of C. Three dependencies (libsodium, zlib, pthreads). No OpenSSL.
 
 ### What each relay sees
 
@@ -22,123 +22,153 @@ You  --->  Guard  --->  Middle  --->  Exit  --->  Destination
                         data along.   on your behalf.
 ```
 
-- **Guard** (entry relay): Knows your IP address because you connect to it directly. Does NOT know what website you are visiting because that information is still encrypted under two more layers.
-- **Middle** relay: Knows nothing useful. It receives encrypted data from the guard and passes it to the exit. It cannot see your IP address or your destination.
-- **Exit** relay: Connects to the website on your behalf. It can see the destination (e.g., "example.com") but does NOT know your IP address -- it only knows the middle relay handed it the data.
+## Pluggable transports
 
-This split means an attacker would have to control all three relays at the same time to figure out both who you are and what you are doing.
+MOOR includes four pluggable transports for censorship circumvention, plus one in design:
 
-### Post-quantum cryptography
+### ShitStorm (recommended)
 
-Everything in MOOR uses **hybrid encryption**: every key exchange combines a classical algorithm (X25519) with a post-quantum algorithm (Kyber768). An attacker must break BOTH to decrypt anything. This means that even if a powerful quantum computer is built in the future, traffic recorded today stays protected.
+The most advanced transport. Combines every evasion technique into a single layer:
 
-## Quick start
+- **Chrome 130 JA4 fingerprint** — ClientHello matches real Chrome with ECH GREASE, 15 cipher suites, Fisher-Yates shuffled extensions
+- **Elligator2 key material** — x25519 key_share bytes are indistinguishable from random (no curve point structure)
+- **Double AEAD encryption** — Outer ChaCha20-Poly1305 (TLS records) + inner ChaCha20-Poly1305 (length-obfuscated payloads)
+- **HTTP/2 framing** — Post-handshake data wrapped in h2 connection preface + SETTINGS + DATA frames
+- **Fake session resumption** — PSK binder + 2 NewSessionTicket messages (no "always full handshake" fingerprint)
+- **Dynamic SNI discovery** — GeoIP + CDN seed resolution, ISP PTR filtering, per-country CDN intelligence
+- **Key rotation** — All keys ratcheted every 65,536 records via BLAKE2b
+- **Replay cache** — 4,096 entries with BLAKE2b hash-based slot placement, 600s TTL
+- **Cert chain realism** — Fake encrypted handshake records sized 3,500-5,500 bytes (matches Let's Encrypt RSA chains)
 
-### Run as a client (browse anonymously)
-
-```
-# Install dependencies (Debian/Ubuntu)
-sudo apt install build-essential libsodium-dev zlib1g-dev pkg-config
-
-# Build
-./configure
-make
-
-# Run (starts a SOCKS5 proxy on port 9050)
-./moor
-
-# Browse through MOOR
-curl -x socks5h://127.0.0.1:9050 http://example.com
-```
-
-Point any application that supports SOCKS5 proxies at `127.0.0.1:9050`. Use `socks5h://` (with the `h`) so that domain name lookups also go through the network -- without the `h`, your computer resolves DNS directly and your ISP can see which sites you visit.
-
-### Run a relay (help the network)
-
-The easiest way to set up a relay is the automated setup script. It installs dependencies, builds MOOR from source, creates a system service, and starts your relay:
+A DPI box sees Chrome 130 doing TLS 1.3 to a CDN. Blocking it means blocking Chrome.
 
 ```
-curl -sL https://raw.githubusercontent.com/0xdeadbeefnetwork/MOOR_PQ/main/setup.sh | sudo bash
+./moor --UseBridges 1 --Bridge "shitstorm 1.2.3.4:9001 <fingerprint>"
 ```
 
-The script will ask you to choose a role, pick a nickname, and confirm your public IP. You can also run it non-interactively:
+### Scramble
 
-```
-curl -sL https://raw.githubusercontent.com/0xdeadbeefnetwork/MOOR_PQ/main/setup.sh | \
-  sudo bash -s -- --role exit --nickname MYRELAY --ip 1.2.3.4
-```
+Entropy evasion. ASCII HTTP prefix followed by ChaCha20-encrypted payload. Defeats entropy-based filters (GFW's fully-encrypted-traffic detector).
 
-Or set up manually:
+### Shade
 
-```
-./moor --mode relay --advertise 1.2.3.4 --nickname MYRELAY -v         # general relay
-./moor --mode relay --exit --advertise 1.2.3.4 --nickname MYRELAY -v  # exit relay
-./moor --mode relay --guard --advertise 1.2.3.4 --nickname MYRELAY -v # guard relay
-```
+Statistical evasion. Elligator2 constant-time key generation with IAT obfuscation modes. Defeats statistical classifiers on key exchange bytes.
 
-See [docs/configuration.md](docs/configuration.md) for all options.
+### Mirage
 
-### Run a hidden service
+Protocol evasion. Full TLS 1.3 record framing with real x25519 key_share, configurable SNI, session_id HMAC for probe resistance.
 
-Host a service reachable only through the MOOR network at a `.moor` address:
+### WebWTF (in design)
 
-```
-# Start a hidden service that proxies to a local web server on port 8080
-./moor --mode hs --hs-dir ./hs_keys --hs-port 8080 -v
-
-# Your .moor address is printed on startup and saved to hs_keys/hostname
-```
-
-Clients connect via SOCKS5:
-
-```
-curl -x socks5h://127.0.0.1:9050 http://your-address-here.moor/
-```
-
-The hidden service uses a 6-hop tunnel (3 client + 3 service) with PQ hybrid end-to-end encryption (X25519 + Kyber768). The rendezvous relay that bridges both sides sees only ciphertext. Vanguard relays protect the service from guard discovery attacks. Proof-of-work prevents introduction flooding.
+UDP-based transport mimicking a WebRTC video call. STUN + DTLS + SRTP with Opus/VP8 payload types. MOOR cells hidden inside media packets. Blocking it means blocking Zoom, Meet, and Discord. See [docs/webwtf-design.md](docs/webwtf-design.md).
 
 ## Cryptography
 
 | Layer | Algorithm | What it protects |
 |-------|-----------|-----------------|
-| Link handshake | Noise_IK (X25519 + ChaCha20 + BLAKE2b) + Kyber768 | Connection between you and the first relay |
-| Circuit key exchange | X25519 + Kyber768 hybrid | Each hop of the 3-hop path |
-| HS e2e encryption | X25519 + Kyber768 hybrid (post-handshake KEM upgrade) | End-to-end between client and hidden service |
-| Onion encryption | ChaCha20 stream cipher (keys derived from PQ hybrid exchange) | Data in transit through the circuit |
-| Consensus signatures | Ed25519 + ML-DSA-65 (Dilithium3) | Integrity of the relay directory |
-| Hashing | BLAKE2b-256 | Internal integrity checks |
+| Link handshake | Noise_IK + Kyber768 | Connection to first relay |
+| Circuit key exchange | X25519 + Kyber768 hybrid CKE | Each hop of the 3-hop path |
+| HS end-to-end | X25519 + Kyber768 (post-handshake KEM) | Client to hidden service |
+| Onion encryption | ChaCha20 (PQ hybrid derived keys) | Data through the circuit |
+| Consensus signatures | Ed25519 + ML-DSA-65 (Dilithium3) | Relay directory integrity |
 | Identity keys | Ed25519 | Relay and service identity |
 | KEM | ML-KEM-768 (Kyber768) | Post-quantum key encapsulation (NIST Level 3) |
-| PQ Signatures | ML-DSA-65 (Dilithium3) | Post-quantum signature verification (NIST Level 3) |
+| PQ signatures | ML-DSA-65 (Dilithium3) | Post-quantum signature verification |
+| Exit DNS | DNSCrypt v2 (X25519 + XSalsa20-Poly1305) | Encrypted DNS at exit relay |
 
-Every layer -- link, circuit, and hidden service end-to-end -- uses hybrid PQ cryptography. An attacker must break both X25519 and Kyber768 to decrypt anything, at any layer. All classical crypto via libsodium (audited, constant-time). PQ crypto via vendored NIST reference implementations.
+Every layer uses hybrid PQ crypto. An attacker must break both X25519 and Kyber768 to decrypt anything.
+
+## Traffic analysis resistance
+
+- **Fixed-size cells** — 514 bytes. A 10-byte message and a 498-byte page look identical.
+- **WTF-PAD adaptive padding** — Randomized per-circuit padding machines (web, stream, generic presets).
+- **Poisson relay mixing** — Configurable random delay per relay before forwarding.
+- **Conflux multi-path** — Split traffic across multiple circuit paths simultaneously.
+- **Constant-rate padding** — Cover traffic when idle.
+
+## Hidden services
+
+Host a `.moor` service reachable only through the network:
+
+```
+./moor --mode hs --hs-dir ./hs_keys --hs-port 8080 -v
+```
+
+- 6-hop tunnel (3 client + 3 service) with PQ hybrid end-to-end encryption
+- DPF-PIR for anonymous descriptor lookups (neither storage relay learns which service you requested)
+- Vanguard relays protect against guard discovery
+- Proof-of-work prevents introduction flooding
+- OnionBalance for load balancing across backends
+
+## Network infrastructure
+
+- **Multi-DA consensus voting** — Multiple directory authorities with Ed25519 + ML-DSA-65 dual signatures
+- **Bridge relays** — Unlisted relays for censorship circumvention, excluded from public consensus
+- **GeoIP path diversity** — No two relays in a circuit share the same country or AS
+- **Bandwidth-weighted relay selection** — Tor-aligned flag assignment (Guard, Fast, Stable, Exit)
+- **Argon2id PoW** — Memory-hard proof-of-work prevents Sybil attacks
+- **Connection reaper** — Aggressive TCP keepalive + idle connection cleanup for long-running stability
+- **seccomp sandbox** — PR_SET_NO_NEW_PRIVS, rlimits, dumpable=0
+
+## Quick start
+
+### Client (browse anonymously)
+
+```bash
+sudo apt install build-essential libsodium-dev zlib1g-dev
+make
+./moor
+# SOCKS5 proxy on 127.0.0.1:9050
+curl -x socks5h://127.0.0.1:9050 http://example.com
+```
+
+### Client through a bridge (censorship circumvention)
+
+```bash
+./moor --UseBridges 1 --Bridge "shitstorm 1.2.3.4:9001 <fingerprint>" -v
+```
+
+### Relay
+
+```bash
+curl -sL https://raw.githubusercontent.com/0xdeadbeefnetwork/MOOR_PQ/main/setup.sh | sudo bash
+```
+
+Or manually:
+
+```bash
+./moor --mode relay --advertise 1.2.3.4 --nickname MYRELAY -v
+./moor --mode relay --exit --advertise 1.2.3.4 --nickname MYEXIT -v
+```
+
+### Bridge relay
+
+```bash
+./moor --mode relay --is-bridge --bridge-transport shitstorm --advertise 1.2.3.4 --nickname MYBRIDGE -v
+```
+
+Bridge line printed on startup. Give it to users who need censorship circumvention.
 
 ## Current network
 
-| Node | Role | IP | Location |
-|------|------|----|----------|
-| DA1 | Directory Authority | 107.174.70.38 | US |
-| DA2 | Directory Authority | 107.174.70.122 | US |
-| TURBINE | Middle relay | 104.129.51.133 | US |
-| DROPOUT | Guard relay | 86.54.28.132 | NL |
-| VALIDATOR | Exit relay | 86.54.28.49 | NL |
+| Node | Role | Location |
+|------|------|----------|
+| DA1 | Directory Authority | US |
+| DA2 | Directory Authority | US |
+| TURBINE | Guard relay | US |
+| DROPOUT | Guard relay | NL |
+| VALIDATOR | Exit relay | NL |
+| PIBRIDGE | ShitStorm bridge | US (residential) |
 
-The directory authorities maintain a signed list of all relays in the network. Clients download this list to choose their 3-hop paths.
+## Key persistence
 
-## Documentation
-
-- [Overview and docs index](docs/README.md)
-- [Philosophy](docs/philosophy.md) -- Why MOOR exists, design principles, the cypherpunk tradition
-- [Architecture](docs/architecture.md) -- System design, source layout, data flow
-- [Configuration](docs/configuration.md) -- All config options, CLI flags, relay types explained
-- [Building](docs/building.md) -- Build instructions, dependencies, setup script
-- [Protocol](docs/protocol.md) -- Wire formats, cell types, consensus document format
-- [Security](docs/security.md) -- Threat model, crypto analysis, known limitations
-- [OPSEC](docs/opsec.md) -- How to use MOOR without defeating the point of using MOOR
+Node keys are stored in `--data-dir <path>/keys/`. Back up this directory to preserve identity across restarts, upgrades, and server migrations. Keys are tied to nothing but the files — not the IP, hostname, or hardware.
 
 ## Source
 
 https://github.com/0xdeadbeefnetwork/MOOR_PQ
+
+~40,000 lines of C across 43 source files. ~3,600 lines of vendored NIST PQ reference implementations (Kyber768, Dilithium3).
 
 ## License
 

@@ -9,6 +9,10 @@ test_*
 coverage_report/
 obj_cov/
 dudect_crypto
+asan_test_*
+tsan_test_*
+.audit-snapshot
+audit/
 fuzz/afl_out/
 config.mk
 nodes.conf
