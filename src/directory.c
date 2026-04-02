@@ -1762,14 +1762,16 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
             }
             da_lock(config);
             da_add_relay_unlocked(config, &desc);
-            /* Propagate descriptor to peers BEFORE building consensus,
-             * so all DAs have the same relay set when signing. */
+            da_build_consensus_unlocked(config);
+            da_unlock(config);
+            /* Reply immediately — don't block the client on peer I/O */
+            send(client_fd, "OK\n", 3, MSG_NOSIGNAL);
+            /* Propagate + vote exchange AFTER releasing the lock so
+             * outbound TCP to peer DAs (2-5s timeouts each) doesn't
+             * block CONSENSUS/HS requests from other clients. */
             if (config->num_peers > 0)
                 moor_da_propagate_descriptor(config, desc_buf, (uint32_t)desc_len);
-            da_build_consensus_unlocked(config);
-            da_exchange_votes_unlocked(config);
-            da_unlock(config);
-            send(client_fd, "OK\n", 3, MSG_NOSIGNAL);
+            moor_da_exchange_votes(config);
         } else {
             send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
         }
@@ -2521,18 +2523,18 @@ int moor_da_exchange_votes(moor_da_config_t *config) {
 int moor_da_sync_relays(moor_da_config_t *config) {
     if (config->num_peers <= 0) return 0;
 
-    da_lock(config);
     int total_new = 0;
 
+    /* Fetch relay lists from peers WITHOUT holding the lock.
+     * Network I/O (encrypted channel open/send/recv, 5s timeout per peer)
+     * must not block CONSENSUS/PUBLISH/HS requests. */
     for (int p = 0; p < config->num_peers; p++) {
-        /* Skip peers with unknown identity (can't encrypt) */
         if (sodium_is_zero(config->peers[p].identity_pk, 32)) {
             LOG_DEBUG("DA sync: skipping peer %s:%u (unknown identity)",
                       config->peers[p].address, config->peers[p].port);
             continue;
         }
 
-        /* Open encrypted channel to peer DA */
         da_encrypted_channel_t ch;
         if (da_channel_open(&ch, config->peers[p].address, config->peers[p].port,
                             config->identity_pk, config->identity_sk,
@@ -2542,13 +2544,11 @@ int moor_da_sync_relays(moor_da_config_t *config) {
             continue;
         }
 
-        /* Send SYNC_RELAYS command over encrypted channel */
         if (da_channel_send(&ch, (const uint8_t *)"SYNC_RELAYS", 11) != 0) {
             da_channel_close(&ch);
             continue;
         }
 
-        /* Read response: encrypted relay list */
         uint8_t *resp_data = NULL;
         ssize_t resp_len = da_channel_recv(&ch, &resp_data);
         da_channel_close(&ch);
@@ -2560,7 +2560,6 @@ int moor_da_sync_relays(moor_da_config_t *config) {
             continue;
         }
 
-        /* Parse: count(4) + [len(2) + descriptor]... */
         uint32_t count = ((uint32_t)resp_data[0] << 24) |
                          ((uint32_t)resp_data[1] << 16) |
                          ((uint32_t)resp_data[2] << 8) | resp_data[3];
@@ -2571,8 +2570,10 @@ int moor_da_sync_relays(moor_da_config_t *config) {
             continue;
         }
 
+        /* Parse descriptors and merge under lock */
         int new_relays = 0;
         size_t off = 4;
+        da_lock(config);
         for (uint32_t i = 0; i < count; i++) {
             if (off + 2 > (size_t)resp_len) break;
             uint16_t dlen = ((uint16_t)resp_data[off] << 8) | resp_data[off + 1];
@@ -2581,7 +2582,6 @@ int moor_da_sync_relays(moor_da_config_t *config) {
 
             moor_node_descriptor_t desc;
             if (moor_node_descriptor_deserialize(&desc, resp_data + off, dlen) > 0) {
-                /* Always verify signature — peer DA could be compromised (#202) */
                 if (moor_node_verify_descriptor(&desc) != 0) {
                     LOG_WARN("DA sync: rejecting descriptor with invalid signature");
                     off += dlen;
@@ -2591,10 +2591,6 @@ int moor_da_sync_relays(moor_da_config_t *config) {
                 for (uint32_t j = 0; j < config->consensus.num_relays; j++) {
                     if (sodium_memcmp(config->consensus.relays[j].identity_pk,
                                      desc.identity_pk, 32) == 0) {
-                        /* Tor-aligned: median bandwidth from multiple DA measurements.
-                         * If both we and the peer measured this relay, use the median
-                         * (= min of 2 values, or average). This prevents any single
-                         * DA from inflating bandwidth. */
                         uint64_t our_vbw = config->consensus.relays[j].verified_bandwidth;
                         uint64_t peer_vbw = desc.verified_bandwidth;
                         if (desc.published > config->consensus.relays[j].published) {
@@ -2604,7 +2600,6 @@ int moor_da_sync_relays(moor_da_config_t *config) {
                             config->consensus.relays[j].first_seen = fs;
                             config->consensus.relays[j].probe_failures = pf;
                         }
-                        /* Apply median of our + peer BW measurements */
                         if (our_vbw > 0 && peer_vbw > 0) {
                             config->consensus.relays[j].verified_bandwidth =
                                 (our_vbw < peer_vbw) ? our_vbw : peer_vbw;
@@ -2622,6 +2617,7 @@ int moor_da_sync_relays(moor_da_config_t *config) {
             }
             off += dlen;
         }
+        da_unlock(config);
 
         free(resp_data);
         if (new_relays > 0) {
@@ -2634,14 +2630,14 @@ int moor_da_sync_relays(moor_da_config_t *config) {
         }
     }
 
-    /* Rebuild consensus if we learned anything new */
     if (total_new > 0) {
         LOG_INFO("DA sync: total %d new relay(s), rebuilding consensus", total_new);
+        da_lock(config);
         da_build_consensus_unlocked(config);
-        da_exchange_votes_unlocked(config);
+        da_unlock(config);
+        moor_da_exchange_votes(config);
     }
 
-    da_unlock(config);
     return total_new;
 }
 
@@ -2652,13 +2648,34 @@ int moor_da_sync_relays(moor_da_config_t *config) {
  * be evicted at the next consensus build.
  */
 int moor_da_probe_relays(moor_da_config_t *config) {
+    /* Snapshot relay addresses+ports under lock, then release so probing
+     * (3s timeout per relay) doesn't block the entire DA. */
     da_lock(config);
-    uint32_t probed = 0, dead = 0, measured = 0;
+    uint32_t num = config->consensus.num_relays;
+    if (num == 0) { da_unlock(config); return 0; }
+    if (num > MOOR_MAX_RELAYS) num = MOOR_MAX_RELAYS;
 
-    for (uint32_t i = 0; i < config->consensus.num_relays; i++) {
-        moor_node_descriptor_t *relay = &config->consensus.relays[i];
+    typedef struct { char addr[64]; uint16_t port; uint64_t bandwidth;
+                     uint8_t identity_pk[32]; } probe_target_t;
+    probe_target_t *targets = calloc(num, sizeof(probe_target_t));
+    if (!targets) { da_unlock(config); return 0; }
+    for (uint32_t i = 0; i < num; i++) {
+        snprintf(targets[i].addr, sizeof(targets[i].addr), "%s",
+                 config->consensus.relays[i].address);
+        targets[i].port = config->consensus.relays[i].or_port;
+        targets[i].bandwidth = config->consensus.relays[i].bandwidth;
+        memcpy(targets[i].identity_pk, config->consensus.relays[i].identity_pk, 32);
+    }
+    da_unlock(config);
 
-        int fd = moor_tcp_connect_simple(relay->address, relay->or_port);
+    /* Probe without holding the lock */
+    typedef struct { int alive; uint8_t failures; uint64_t measured_bw; } probe_result_t;
+    probe_result_t *results = calloc(num, sizeof(probe_result_t));
+    if (!results) { free(targets); return 0; }
+
+    uint32_t probed = 0, dead_count = 0, measured = 0;
+    for (uint32_t i = 0; i < num; i++) {
+        int fd = moor_tcp_connect_simple(targets[i].addr, targets[i].port);
         int alive = 0;
         if (fd >= 0) {
             moor_setsockopt_timeo(fd, SO_SNDTIMEO, 3);
@@ -2671,50 +2688,57 @@ int moor_da_probe_relays(moor_da_config_t *config) {
                 alive = 1;
         }
         probed++;
+        results[i].alive = alive;
         if (alive) {
-            relay->probe_failures = 0;
-
-            /* Bandwidth measurement: test relay throughput via BW_TEST.
-             * Like Tor's bandwidth authority (sbws/torflow), the DA actively
-             * measures each relay and stores the result as verified_bandwidth.
-             * 256 KB test (small enough to not disrupt, large enough to
-             * measure).  moor_bw_auth_measure() already derates raw TCP by
-             * 0.7x to approximate circuit throughput.  We still cap at 2x
-             * self-reported as a sanity bound against gaming. */
             moor_bw_measurement_t bw = {0};
-            bw.self_reported_bw = relay->bandwidth;
-            if (moor_bw_auth_measure(&bw, relay->address, relay->or_port,
+            bw.self_reported_bw = targets[i].bandwidth;
+            if (moor_bw_auth_measure(&bw, targets[i].addr, targets[i].port,
                                       256 * 1024) == 0 && bw.measured_bw > 0) {
-                uint64_t cap = relay->bandwidth * 2;
-                if (cap < 1000000) cap = 1000000; /* minimum 1 MB/s */
-                relay->verified_bandwidth = bw.measured_bw < cap ?
-                    bw.measured_bw : cap;
+                results[i].measured_bw = bw.measured_bw;
                 measured++;
-                LOG_DEBUG("DA bw-auth: %s:%u measured=%llu self=%llu effective=%llu",
+            }
+        }
+    }
+
+    /* Apply results under lock */
+    da_lock(config);
+    for (uint32_t i = 0; i < num && i < config->consensus.num_relays; i++) {
+        moor_node_descriptor_t *relay = &config->consensus.relays[i];
+        /* Match by identity to handle relay list changes during probe */
+        if (sodium_memcmp(relay->identity_pk, targets[i].identity_pk, 32) != 0)
+            continue;
+        if (results[i].alive) {
+            relay->probe_failures = 0;
+            if (results[i].measured_bw > 0) {
+                uint64_t cap = relay->bandwidth * 2;
+                if (cap < 1000000) cap = 1000000;
+                relay->verified_bandwidth = results[i].measured_bw < cap ?
+                    results[i].measured_bw : cap;
+                LOG_DEBUG("DA bw-auth: %s:%u measured=%llu effective=%llu",
                          relay->address, relay->or_port,
-                         (unsigned long long)bw.measured_bw,
-                         (unsigned long long)relay->bandwidth,
+                         (unsigned long long)results[i].measured_bw,
                          (unsigned long long)relay->verified_bandwidth);
             }
         } else {
             relay->probe_failures++;
-            /* Evict after 3 consecutive failures, not on first miss */
             if (relay->probe_failures >= 3) {
                 LOG_WARN("DA probe: relay %s:%u unreachable (%u consecutive failures), evicting",
                          relay->address, relay->or_port, relay->probe_failures);
                 relay->published = 0;
-                dead++;
+                dead_count++;
             } else {
                 LOG_INFO("DA probe: relay %s:%u missed probe (%u/3)",
                          relay->address, relay->or_port, relay->probe_failures);
             }
         }
     }
-
-    LOG_INFO("DA probe: %u/%u relays alive, %u dead, %u bw-measured",
-             probed - dead, probed, dead, measured);
     da_unlock(config);
-    return (int)dead;
+
+    free(targets);
+    free(results);
+    LOG_INFO("DA probe: %u/%u relays alive, %u dead, %u bw-measured",
+             probed - dead_count, probed, dead_count, measured);
+    return (int)dead_count;
 }
 
 int moor_da_run(moor_da_config_t *config) {
