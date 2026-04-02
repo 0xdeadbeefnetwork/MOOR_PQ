@@ -1763,6 +1763,7 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
             da_lock(config);
             da_add_relay_unlocked(config, &desc);
             da_build_consensus_unlocked(config);
+            da_update_published_snapshot_unlocked(config);
             da_unlock(config);
             /* Reply immediately — don't block the client on peer I/O */
             send(client_fd, "OK\n", 3, MSG_NOSIGNAL);
@@ -1772,6 +1773,8 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
             if (config->num_peers > 0)
                 moor_da_propagate_descriptor(config, desc_buf, (uint32_t)desc_len);
             moor_da_exchange_votes(config);
+            /* Update snapshot again after votes (now has peer sigs) */
+            moor_da_update_published_snapshot(config);
         } else {
             send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
         }
