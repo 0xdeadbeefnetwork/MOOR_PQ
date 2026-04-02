@@ -2333,6 +2333,42 @@ static void sighup_handler(int sig) {
 /* Tor-aligned: SIGHUP reload handler (like Tor's do_hup()).
  * Called from the event loop when SIGHUP is received.
  * Reloads config file, refreshes consensus, re-registers relay. */
+/* Tor-aligned: graceful shutdown.  Called from event loop epilogue before
+ * the process exits.  Sends DESTROY cells for relay circuits so peers
+ * clean up immediately instead of waiting for TCP timeout.
+ * Client circuits are NOT destroyed (same as Tor — client_mode doesn't
+ * send DESTROY, relies on TCP RST). */
+void moor_graceful_shutdown(void) {
+    LOG_INFO("graceful shutdown: closing relay circuits");
+
+    /* Send DESTROY for all relay-side circuits */
+    extern moor_circuit_t g_circuit_pool[];
+    for (int i = 0; i < MOOR_MAX_CIRCUITS; i++) {
+        moor_circuit_t *circ = &g_circuit_pool[i];
+        if (circ->circuit_id == 0) continue;
+        if (circ->is_client) continue; /* Tor: clients don't send DESTROY on exit */
+
+        moor_cell_t dcell;
+        memset(&dcell, 0, sizeof(dcell));
+        dcell.circuit_id = circ->circuit_id;
+        dcell.command = CELL_DESTROY;
+        dcell.payload[0] = 1; /* DESTROY_REASON_REQUESTED */
+
+        if (circ->prev_conn && circ->prev_conn->state == CONN_STATE_OPEN)
+            moor_connection_send_cell(circ->prev_conn, &dcell);
+        if (circ->next_conn && circ->next_conn->state == CONN_STATE_OPEN) {
+            dcell.circuit_id = circ->next_circuit_id;
+            moor_connection_send_cell(circ->next_conn, &dcell);
+        }
+    }
+
+    /* Flush output queues for a brief window */
+    extern void moor_connection_flush_all(void);
+    moor_connection_flush_all();
+
+    LOG_INFO("graceful shutdown complete");
+}
+
 void moor_handle_sighup(void) {
     LOG_INFO("SIGHUP received — reloading configuration");
 
@@ -2917,6 +2953,8 @@ int main(int argc, char **argv) {
     /* Remove PID file */
     if (g_pid_file_path[0])
         unlink(g_pid_file_path);
+
+    /* moor_graceful_shutdown() is called from event loop epilogue */
 
     /* Save guard state before shutdown (Tor-aligned: save on exit) */
     if (g_data_dir[0])

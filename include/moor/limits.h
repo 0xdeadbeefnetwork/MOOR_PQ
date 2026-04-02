@@ -85,4 +85,9 @@
 #define MOOR_OOM_HIGH_WATER     768     /* OOM killer threshold (75% of MAX_CIRCUITS) */
 #define MOOR_OOM_IDLE_SECS      60      /* OOM idle cleanup interval */
 
+/* Tor-aligned: per-circuit cell queue limit (relay-side DoS defense).
+ * Tor default: RELAY_CIRC_CELL_QUEUE_SIZE_DEFAULT = 2500 (~1.25 MB).
+ * If a circuit exceeds this, it's killed to prevent memory exhaustion. */
+#define MOOR_CIRC_CELL_QUEUE_MAX  2500
+
 #endif /* MOOR_LIMITS_H */

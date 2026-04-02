@@ -123,6 +123,7 @@ typedef struct moor_circuit {
     uint8_t  e2e_dh_shared[32];   /* Saved DH shared secret for hybrid KDF */
     /* DoS cell rate limiting (Prop 305) */
     uint64_t dos_cell_tokens;           /* token bucket for cell rate */
+    uint32_t relay_cells_queued;        /* Tor-aligned: per-circuit queue depth */
     uint64_t dos_cell_last_refill;      /* last refill timestamp (ms) */
     /* Bootstrap tracking */
     uint8_t  bootstrap_phase;           /* MOOR_BOOTSTRAP_* */

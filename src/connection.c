@@ -1331,6 +1331,18 @@ int moor_connection_recv_cell(moor_connection_t *conn, moor_cell_t *cell) {
     return 1;
 }
 
+/* Flush output queues on all open connections (graceful shutdown) */
+void moor_connection_flush_all(void) {
+    for (int i = 0; i < MOOR_MAX_CONNECTIONS; i++) {
+        if (g_conn_pool[i].fd >= 0 &&
+            g_conn_pool[i].state == CONN_STATE_OPEN &&
+            !moor_queue_is_empty(&g_conn_pool[i].outq)) {
+            moor_queue_flush(&g_conn_pool[i].outq, &g_conn_pool[i],
+                             &g_conn_pool[i].write_off);
+        }
+    }
+}
+
 void moor_connection_close(moor_connection_t *conn) {
     if (!conn) return;
     /* Purge any pending mix pool entries for this connection */

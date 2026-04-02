@@ -943,6 +943,10 @@ static int process_circuit_cell(moor_connection_t *conn, moor_cell_t *cell) {
         moor_socks5_client_t *client =
             find_client_by_stream(primary, relay.stream_id);
         if (client && client->state == SOCKS5_STATE_CONNECTED) {
+            /* Tor-aligned: path bias stream-use success */
+            if (primary->num_hops >= 3)
+                moor_pathbias_count_use_success(moor_pathbias_get_state(),
+                                                primary->hops[0].node_id);
             /* NOW send SOCKS5 success reply -- tunnel is actually ready */
             uint8_t resp[10] = { 0x05, 0x00, 0x00, 0x01, 0,0,0,0, 0,0 };
             if (send(client->client_fd, (char *)resp, sizeof(resp),
@@ -1679,6 +1683,10 @@ int moor_socks5_handle_request(moor_socks5_client_t *client,
     }
 
     /* Open stream via RELAY_BEGIN */
+    /* Tor-aligned: path bias stream-use tracking (Prop 271) */
+    if (client->circuit->num_hops >= 3)
+        moor_pathbias_count_use_attempt(moor_pathbias_get_state(),
+                                         client->circuit->hops[0].node_id);
     if (moor_circuit_open_stream(client->circuit, &client->stream_id,
                                   client->target_addr,
                                   client->target_port) != 0) {

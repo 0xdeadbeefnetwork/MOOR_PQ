@@ -272,6 +272,12 @@ int moor_event_loop(void) {
         }
     }
 
+    /* Tor-aligned: graceful shutdown — flush queues and close circuits */
+    {
+        extern void moor_graceful_shutdown(void);
+        moor_graceful_shutdown();
+    }
+
     LOG_INFO("event loop stopped");
     return 0;
 }
