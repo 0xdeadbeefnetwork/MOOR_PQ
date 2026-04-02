@@ -704,10 +704,12 @@ static void relay_consensus_retry_cb(void *arg) {
         moor_relay_set_consensus(&fresh);
         LOG_INFO("relay: refreshed consensus (%u relays)", fresh.num_relays);
 
-        /* If DA has 0 relays (just restarted), re-register immediately
-         * so we don't wait up to 30 min to reappear in consensus. */
-        if (fresh.num_relays == 0 && !g_is_bridge) {
-            LOG_INFO("relay: DA has empty consensus, re-registering");
+        /* Re-register with DAs on every consensus refresh.
+         * Tor re-publishes descriptors every 18h or when config changes.
+         * We re-register every consensus period (30 min) — this ensures
+         * relays reappear quickly after DA restarts and descriptor updates
+         * propagate without operator intervention. */
+        if (!g_is_bridge) {
             moor_relay_register(&g_relay_cfg);
         }
 

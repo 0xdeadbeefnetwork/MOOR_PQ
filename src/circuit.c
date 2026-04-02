@@ -3959,6 +3959,13 @@ int moor_circuit_build_async(moor_circuit_t *circ,
                               const uint8_t our_sk[64],
                               void (*on_complete)(moor_circuit_t *, int, void *),
                               void *arg) {
+    /* Tor-aligned: refuse to build circuits with stale consensus.
+     * Prevents routing through dead/offline relays after DA downtime. */
+    if (!moor_consensus_is_fresh(cons)) {
+        LOG_WARN("consensus too stale for circuit build");
+        return -1;
+    }
+
     moor_cbuild_ctx_t *ctx = calloc(1, sizeof(moor_cbuild_ctx_t));
     if (!ctx) return -1;
 
