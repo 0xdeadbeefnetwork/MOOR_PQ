@@ -105,6 +105,7 @@ static int install_seccomp_filter(void) {
         SC_ALLOW(__NR_clock_gettime),
         SC_ALLOW(__NR_gettimeofday),
         SC_ALLOW(__NR_nanosleep),
+        SC_ALLOW(__NR_clock_nanosleep),  /* glibc 2.34+ uses this for usleep() */
 
         /* Signals */
         SC_ALLOW(__NR_rt_sigaction),
