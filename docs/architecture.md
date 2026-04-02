@@ -4,7 +4,7 @@
 
 MOOR is a single C binary that operates in one of seven modes: **client**, **relay**, **directory authority (DA)**, **hidden service (HS)**, **OnionBalance (OB)**, **BridgeDB**, or **bridge authority**. All modes share the same crypto, cell, connection, and event loop infrastructure. The binary is portable across Linux (with epoll) and Windows (with select/WSAPoll).
 
-Version: 0.8.0
+~44,000 lines of C across 62 source files and 45 headers.
 
 ## Source layout
 
@@ -35,8 +35,8 @@ src/
                       (ephemeral DH + AEAD), relay registration, Ed25519 + ML-DSA-65
                       dual signing, GeoIP flag assignment
   socks5.c            SOCKS5 proxy server, stream management, circuit isolation
-                      (per-domain), prebuilt circuit pool (8 slots) + background builder
-                      thread, HS .moor address detection, conflux integration
+                      (per-domain), prebuilt circuit pool (8 slots) + async builder,
+                      queued BUILDING state for clearnet + HS, conflux integration
   hidden_service.c    HS keygen (Ed25519 + Curve25519), key blinding (time-period rotation),
                       intro point establishment (with vanguards), descriptor encryption
                       (AEAD with derived key), rendezvous protocol, .moor addresses
@@ -49,7 +49,8 @@ src/
   event.c             Event loop: epoll on Linux, select on Windows, with timer support
   transport.c         Pluggable transport registry (max 4 transports)
   transport_scramble.c Scramble: randomized obfuscation, DH + HMAC handshake, ChaCha20
-                      framed transport with random padding and header encryption
+                      framed transport with random padding, header encryption,
+                      poll-based send/recv timeouts
   transport_shade.c   Shade: Elligator2-inspired key obfuscation, mark/MAC handshake,
                       ChaCha20-Poly1305 AEAD framing, IAT modes (none/delay/fragment)
   transport_mirage.c  Mirage: TLS 1.3 camouflage, fake ClientHello/ServerHello with real
@@ -170,8 +171,7 @@ With the encrypted link to the guard established, the client builds a circuit th
 - **Middle**: Any relay with the Running flag, excluding the guard and same-family relays. Different country/AS from guard and exit.
 - **Exit**: A relay with the Exit flag whose exit policy allows the destination port.
 
-**Hop 1 (to guard):** The client sends a `CREATE_PQ` cell containing its X25519 ephemeral public key and the relay's identity key. The guard performs an X25519 DH, derives circuit keys via HKDF, and replies with `CREATED_PQ`. Then a Kyber768 KEM exchange follows (RELAY_KEM_OFFER + RELAY_KEM_ACCEPT), and the KEM shared secret is mixed into the circuit keys. The client now has forward/backward ChaCha20 stream cipher keys for hop 1.
-| CELL_KEM_CT    |   8 | KEM ciphertext fragment (PQ hybrid handshake) |
+**Hop 1 (to guard):** The client sends a `CREATE_PQ` cell containing its X25519 ephemeral public key and the relay's identity key. The guard performs an X25519 DH, derives circuit keys via HKDF, and replies with `CREATED_PQ`. Then a Kyber768 KEM exchange follows (CELL_KEM_CT fragments), and the KEM shared secret is mixed into the circuit keys. The client now has forward/backward ChaCha20 stream cipher keys for hop 1.
 
 **Hop 2 (to middle):** The client wraps an `EXTEND` command in a relay cell, encrypts it with hop 1's key, and sends it. The guard decrypts one layer, sees the EXTEND, and opens a TCP connection to the middle relay (reuses existing connection if available) (with its own Noise_IK + Kyber768 link handshake). The guard forwards the CREATE to the middle, receives CREATED, and sends RELAY_EXTENDED back to the client. The client now has circuit keys for hop 2. The guard cannot read hop 2's encrypted content.
 
@@ -250,7 +250,7 @@ Relay payload (inside the 509-byte payload):
 | NETINFO | 5 | Network information exchange |
 | CREATE_PQ | 6 | Create circuit hop (X25519 + Kyber768 hybrid) |
 | CREATED_PQ | 7 | PQ circuit hop created |
-| CELL_KEM_CT    |   8 | KEM ciphertext fragment (PQ hybrid handshake) |
+| KEM_CT | 8 | KEM ciphertext fragment (PQ hybrid handshake) |
 | RELAY_EARLY | 9 | Relay cell allowed to carry EXTEND (max 8 per circuit) |
 
 **Digest verification:** Each relay cell carries a 4-byte truncated BLAKE2b digest computed over a running hash of all cells on that circuit. The receiver checks `BLAKE2b(running_state || payload_with_zeroed_digest)` against the digest field. If the `recognized` field is zero and the digest matches, the cell is for this hop. Otherwise it is forwarded to the next hop.

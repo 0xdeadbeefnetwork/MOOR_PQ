@@ -134,6 +134,8 @@ typedef struct moor_circuit {
     uint8_t  extend_client_eph_pk[32];  /* client ephemeral pk for CKE completion */
     /* RELAY_EARLY enforcement (Tor-aligned anti-extend-injection) */
     uint8_t  relay_early_count;         /* RELAY_EARLY cells seen on this circuit */
+    /* Per-IP circuit accounting: stored on relay CREATE so we can decrement on free */
+    uint32_t relay_peer_ipv4;           /* peer IPv4 (network order), 0 = unset */
 } moor_circuit_t;
 
 /* Circuit build state machine for non-blocking async building.

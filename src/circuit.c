@@ -1,4 +1,5 @@
 #include "moor/moor.h"
+#include "moor/relay.h"
 #include "moor/conflux.h"
 #include "moor/mix.h"
 #include "moor/transport_shade.h"
@@ -332,6 +333,8 @@ static void circ_free_unlocked(moor_circuit_t *circ) {
     }
     moor_relay_invalidate_rp_cookies(circ);
     moor_relay_cleanup_exit_fds(circ);
+    /* Release per-IP circuit count so the slot can be reused */
+    moor_relay_ip_circ_release(circ->relay_peer_ipv4);
     if (circ->build_ctx) {
         moor_crypto_wipe(circ->build_ctx, sizeof(moor_cbuild_ctx_t));
         free(circ->build_ctx);
@@ -1860,6 +1863,16 @@ void moor_circuit_check_timeouts(void) {
                      circ->circuit_id, (unsigned long long)age);
             moor_crypto_wipe(circ->pq_key_seed, 32);
             circ->pq_kem_pending = 0;
+            moor_circuit_destroy(circ);
+            continue;
+        }
+
+        /* Relay-side: kill circuits stuck in EXTEND (waiting for CREATED
+         * from the next hop).  A dead or slow downstream relay would pin
+         * the pool slot indefinitely without this. */
+        if (!circ->is_client && circ->extend_pending && age > MOOR_CIRCUIT_TIMEOUT) {
+            LOG_WARN("circuit %u: EXTEND timeout (extend_pending, age=%llu s)",
+                     circ->circuit_id, (unsigned long long)age);
             moor_circuit_destroy(circ);
             continue;
         }

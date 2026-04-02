@@ -130,7 +130,7 @@ command: installs dependencies, builds from source, creates a system user,
 writes a config file, and starts a systemd service.
 
 ```
-curl -sL https://raw.githubusercontent.com/user/moor/main/setup.sh | sudo bash
+curl -sL https://raw.githubusercontent.com/0xdeadbeefnetwork/MOOR_PQ/main/setup.sh | sudo bash
 ```
 
 Or non-interactively:

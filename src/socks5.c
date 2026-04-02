@@ -661,14 +661,28 @@ static void circuit_cache_evict_oldest(void) {
  * Returns NULL if pool empty (caller should enter BUILDING state). */
 static circuit_cache_entry_t *get_circuit_for_domain(const char *domain,
                                                       const char *iso_key) {
-    /* Check cache: both domain and isolation_key must match */
+    /* Check cache: both domain and isolation_key must match.
+     * Evict dead entries (conn died/nullified) to prevent stale entries
+     * from permanently blocking a domain until NEWNYM. */
     for (int i = 0; i < g_circuit_cache_count; i++) {
-        if (strcmp(g_circuit_cache[i].domain, domain) == 0 &&
-            strcmp(g_circuit_cache[i].isolation_key, iso_key) == 0 &&
-            g_circuit_cache[i].circuit &&
-            g_circuit_cache[i].circuit->circuit_id != 0) {
-            return &g_circuit_cache[i];
+        if (strcmp(g_circuit_cache[i].domain, domain) != 0 ||
+            strcmp(g_circuit_cache[i].isolation_key, iso_key) != 0)
+            continue;
+        circuit_cache_entry_t *e = &g_circuit_cache[i];
+        if (e->circuit && e->circuit->circuit_id != 0 &&
+            e->circuit->conn && e->circuit->conn->state == CONN_STATE_OPEN) {
+            return e; /* live entry */
         }
+        /* Dead entry for this domain -- evict it so a fresh circuit can
+         * be assigned.  Without this, every request for this domain
+         * would hit the dead entry and fail immediately. */
+        LOG_DEBUG("evicting dead cache entry for %s", domain);
+        if (e->circuit) {
+            moor_socks5_invalidate_circuit(e->circuit);
+            moor_circuit_free(e->circuit);
+        }
+        g_circuit_cache[i] = g_circuit_cache[--g_circuit_cache_count];
+        i--; /* re-check swapped entry */
     }
 
     /* Evict if cache full */
@@ -1643,9 +1657,16 @@ int moor_socks5_handle_request(moor_socks5_client_t *client,
             entry->conn = entry->circuit->conn;
         if (!entry || !entry->conn || entry->conn->fd < 0 ||
             entry->conn->state != CONN_STATE_OPEN) {
-            uint8_t fail[] = { 0x05, 0x04, 0x00, 0x01, 0,0,0,0, 0,0 };
-            send(client->client_fd, (char *)fail, sizeof(fail), MSG_NOSIGNAL);
-            return -1;
+            /* No circuit available yet.  Instead of immediately failing
+             * (which makes the browser show an error page), enter BUILDING
+             * state and wait for a prebuilt circuit.  The async builder
+             * callback (assign_circuits_to_waiting_clients) will pick us
+             * up when a circuit becomes ready. */
+            client->state = SOCKS5_STATE_BUILDING;
+            client->begin_sent_at = (uint64_t)time(NULL);
+            LOG_DEBUG("SOCKS5: no circuit for %s, entering BUILDING state",
+                      client->target_addr);
+            return 0;
         }
 
         /* Register guard connection in event loop if not already */
@@ -1943,11 +1964,15 @@ void moor_socks5_check_stream_timeouts(void) {
         if (c->begin_sent_at == 0 || now < c->begin_sent_at)
             continue;
 
-        /* Idle timeout for pre-streaming states (GREETING/AUTH/REQUEST/BUILDING).
-         * Prevents slot exhaustion DoS from clients that connect and send nothing. */
+        /* Idle timeout for pre-streaming states.
+         * GREETING/AUTH/REQUEST: 15s (prevents slot exhaustion DoS).
+         * BUILDING: 30s (circuit builds take 3-10s, HS can take longer). */
         if (c->state != SOCKS5_STATE_CONNECTED &&
             c->state != SOCKS5_STATE_STREAMING) {
-            if (now - c->begin_sent_at >= MOOR_SOCKS5_IDLE_TIMEOUT) {
+            uint64_t timeout = (c->state == SOCKS5_STATE_BUILDING)
+                ? MOOR_STREAM_CONNECT_TIMEOUT
+                : MOOR_SOCKS5_IDLE_TIMEOUT;
+            if (now - c->begin_sent_at >= timeout) {
                 LOG_DEBUG("SOCKS5 idle timeout fd=%d state=%d", c->client_fd, c->state);
                 moor_event_remove(c->client_fd);
                 close(c->client_fd);

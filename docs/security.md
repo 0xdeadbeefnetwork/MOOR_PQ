@@ -6,6 +6,7 @@ MOOR protects against:
 - **Network observers** who can see traffic between any two points but cannot observe all links simultaneously
 - **Malicious relays** who control fewer than all 3 hops in a circuit
 - **Future quantum computers** performing harvest-now-decrypt-later attacks on recorded traffic
+- **Censors** using DPI, protocol fingerprinting, or entropy analysis (via pluggable transports)
 
 MOOR does NOT protect against:
 - **Global passive adversaries** who can observe all network links simultaneously and correlate timing
@@ -22,6 +23,7 @@ Every cryptographic key exchange in MOOR is a hybrid of classical X25519 and pos
 | Circuit hop 0 | X25519 DH | Kyber768 KEM | BLAKE2b(key_seed \|\| kem_ss) |
 | Circuit hop 1 | X25519 DH | Kyber768 KEM | BLAKE2b(key_seed \|\| kem_ss) |
 | Circuit hop 2 | X25519 DH | Kyber768 KEM | BLAKE2b(key_seed \|\| kem_ss) |
+| HS end-to-end | X25519 DH | Kyber768 KEM | BLAKE2b(dh_shared \|\| kem_ss) |
 | Consensus signing | Ed25519 | ML-DSA-65 | Both must verify |
 
 A quantum computer that breaks X25519 cannot decrypt any MOOR traffic without also breaking Kyber768 (NIST Level 3, 192-bit quantum security).
@@ -31,20 +33,22 @@ A quantum computer that breaks X25519 cannot decrypt any MOOR traffic without al
 - **Primitives**: All classical crypto via libsodium (audited, constant-time). Ed25519, X25519, ChaCha20-Poly1305, BLAKE2b.
 - **Protocol**: Noise_IK handshake is formally analyzed. Circuit key exchange follows proven patterns.
 - **PQ**: NIST-standardized ML-KEM-768 and ML-DSA-65. Reference implementations from NIST submission.
-- **Consensus**: Dual-signed (Ed25519 + ML-DSA-65) by 2 independent DAs. Both signatures must verify.
+- **Consensus**: Dual-signed (Ed25519 + ML-DSA-65) by independent DAs. Both signatures must verify.
 - **Path diversity**: GeoIP-aware relay selection avoids same country/AS/family in a circuit.
-- **Vanguards**: Hidden service circuits use vanguard relays to resist guard discovery.
-- **DoS protection**: Argon2id proof-of-work for relay registration. Per-IP and per-circuit rate limiting.
+- **Vanguards**: Hidden service circuits use L2/L3 vanguard relays to resist guard discovery.
+- **DoS protection**: Argon2id proof-of-work. Per-IP rate limiting. Per-connection CREATE rate limiting. Per-IP circuit count cap with proper cleanup on circuit teardown.
+- **Resource management**: Circuit pool OOM killer, extend-pending timeout, stale cache eviction, connection reaper with idle timeout.
+- **Transport hardening**: Replay cache with graceful eviction under load. Poll-based timeouts on all transport send/recv operations.
 
 ## Known limitations
 
 - **Audit**: No third-party security audit. Single-developer C codebase.
 - **Memory safety**: C with stack protector and FORTIFY_SOURCE, but still C.
 - **Vendored PQ code**: Kyber and Dilithium reference implementations have not been independently audited for this integration.
-- **Traffic analysis**: Padding machines exist but a global adversary can still correlate timing. This is a fundamental limitation shared with Tor.
+- **Traffic analysis**: Padding machines and mixing exist but a global adversary can still correlate timing. This is a fundamental limitation shared with Tor.
 - **2-DA network**: Only 2 directory authorities. A compromised majority (both) could forge consensus. Production needs 5-9 DAs.
 - **Flag voting**: Each DA independently computes relay flags from statistical medians rather than majority voting across DAs.
-- **Side channels**: libsodium primitives are constant-time, but surrounding C code reviewed for memory safety (March 2026 audit) but not formally audited for timing leaks.
+- **Side channels**: libsodium primitives are constant-time, but surrounding C code has not been formally audited for timing leaks.
 - **Forward secrecy**: Circuit keys are not rotated during a circuit's lifetime. Circuits rotate every 10 minutes.
 
 ## Responsible disclosure

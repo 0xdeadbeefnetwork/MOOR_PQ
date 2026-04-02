@@ -50,10 +50,15 @@ typedef struct {
 
 /* Client/server param types are declared in transport_scramble.h */
 
-/* Helper: reliable send */
+/* Helper: reliable send with 30s timeout per chunk */
 static int send_all(int fd, const uint8_t *data, size_t len) {
     size_t sent = 0;
     while (sent < len) {
+#ifndef _WIN32
+        struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+        int pr = poll(&pfd, 1, 30000);
+        if (pr <= 0) return -1;
+#endif
         ssize_t n = send(fd, (const char *)data + sent, len - sent, MSG_NOSIGNAL);
         if (n <= 0) return -1;
         sent += n;
@@ -61,10 +66,15 @@ static int send_all(int fd, const uint8_t *data, size_t len) {
     return 0;
 }
 
-/* Helper: reliable recv */
+/* Helper: reliable recv with 30s timeout per chunk */
 static int recv_all(int fd, uint8_t *buf, size_t len) {
     size_t total = 0;
     while (total < len) {
+#ifndef _WIN32
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        int pr = poll(&pfd, 1, 30000);
+        if (pr <= 0) return -1;
+#endif
         ssize_t n = recv(fd, (char *)buf + total, len - total, 0);
         if (n <= 0) return -1;
         total += n;

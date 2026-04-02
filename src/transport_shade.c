@@ -163,10 +163,15 @@ typedef struct moor_transport_state {
     size_t   recv_len;
 } moor_shade_state_t;
 
-/* Helper: reliable send */
+/* Helper: reliable send with 30s timeout per chunk */
 static int shade_send_all(int fd, const uint8_t *data, size_t len) {
     size_t sent = 0;
     while (sent < len) {
+#ifndef _WIN32
+        struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+        int pr = poll(&pfd, 1, 30000);
+        if (pr <= 0) return -1;
+#endif
         ssize_t n = send(fd, (const char *)data + sent, len - sent, MSG_NOSIGNAL);
         if (n <= 0) return -1;
         sent += (size_t)n;

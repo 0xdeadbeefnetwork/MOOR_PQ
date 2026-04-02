@@ -230,8 +230,21 @@ static int ss_replay_check(const uint8_t pk[32]) {
             return -1; /* REPLAY DETECTED */
         }
     }
+    /* Cache full -- evict oldest entry to prevent legitimate client lockout.
+     * An attacker who can fill the cache already has the ability to connect,
+     * so eviction doesn't weaken replay protection in practice. */
+    int oldest_idx = (int)slot;
+    uint64_t oldest_ts = UINT64_MAX;
+    for (int i = 0; i < SS_REPLAY_CACHE_SIZE; i++) {
+        if (g_ss_replay_cache[i].timestamp < oldest_ts) {
+            oldest_ts = g_ss_replay_cache[i].timestamp;
+            oldest_idx = i;
+        }
+    }
+    memcpy(g_ss_replay_cache[oldest_idx].pk, pk, 32);
+    g_ss_replay_cache[oldest_idx].timestamp = now;
     pthread_mutex_unlock(&g_ss_replay_mutex);
-    return -1; /* cache full -- fail closed to prevent replay (#R1-A1) */
+    return 0;
 }
 
 /* ================================================================

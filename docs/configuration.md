@@ -127,7 +127,7 @@ Verbose 1
 | `--nickname <name>` / `--Nickname <name>` | `Nickname` | | Human-readable relay name |
 | `--bandwidth <bw>` / `--BandwidthRate <bw>` | `Bandwidth` / `BandwidthRate` | 1000000 | Advertised bandwidth in bytes/s |
 | `--is-bridge` | `IsBridge` | 0 | Run as unlisted bridge relay |
-| `--bridge-transport <t>` | | scramble | Bridge pluggable transport: `scramble`, `shade`, `mirage` |
+| `--bridge-transport <t>` | | scramble | Bridge pluggable transport: `scramble`, `shade`, `mirage`, `shitstorm` |
 | `--pow-difficulty <n>` | `PowDifficulty` | 0 | Argon2id proof-of-work difficulty for DA registration (0-64) |
 | `--pow-memlimit <KB>` | `PowMemLimit` | 0 | Argon2id memory limit in KB (stored internally as bytes) |
 | `--mix-delay <ms>` | `MixDelay` | 0 | Poisson mixing delay in milliseconds (0 = disabled) |
@@ -318,7 +318,7 @@ Bridges are unlisted relays that help users in censored regions connect to the M
 | CLI Flag | Config Key | Default | Description |
 |----------|-----------|---------|-------------|
 | `--is-bridge` | `IsBridge` | 0 | Run as an unlisted bridge relay |
-| `--bridge-transport <t>` | | scramble | Pluggable transport: `scramble`, `shade`, `mirage` |
+| `--bridge-transport <t>` | | scramble | Pluggable transport: `scramble`, `shade`, `mirage`, `shitstorm` |
 
 ### Using Bridges (Client)
 

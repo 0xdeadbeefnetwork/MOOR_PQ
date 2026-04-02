@@ -69,6 +69,9 @@ int moor_relay_handle_relay(struct moor_connection *conn,
 int moor_relay_handle_destroy(struct moor_connection *conn,
                               const moor_cell_t *cell);
 
+/* Decrement per-IP circuit counter (called when relay circuit is freed) */
+void moor_relay_ip_circ_release(uint32_t ipv4_net_order);
+
 /* Exit relay: open TCP connection to target */
 int moor_relay_exit_connect(moor_circuit_t *circ, uint16_t stream_id,
                             const char *addr, uint16_t port);

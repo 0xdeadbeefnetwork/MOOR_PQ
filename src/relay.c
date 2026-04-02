@@ -1334,6 +1334,17 @@ static int ip_circ_count_check(int fd) {
     return 0;
 }
 
+void moor_relay_ip_circ_release(uint32_t ipv4_net_order) {
+    if (ipv4_net_order == 0) return;
+    for (int i = 0; i < IP_CIRC_TABLE_SIZE; i++) {
+        if (g_ip_circ_table[i].ip == ipv4_net_order &&
+            g_ip_circ_table[i].count > 0) {
+            g_ip_circ_table[i].count--;
+            return;
+        }
+    }
+}
+
 int moor_relay_handle_create(moor_connection_t *conn,
                              const moor_cell_t *cell) {
     /* Per-connection CREATE rate limit to prevent circuit pool exhaustion */
@@ -1417,6 +1428,15 @@ int moor_relay_handle_create(moor_connection_t *conn,
     circ->prev_conn = conn;
     circ->prev_circuit_id = cell->circuit_id;
     circ->is_client = 0;
+
+    /* Store peer IPv4 for ip_circ_count release on circuit free */
+    {
+        struct sockaddr_in peer_sa;
+        socklen_t peer_len = sizeof(peer_sa);
+        if (getpeername(conn->fd, (struct sockaddr *)&peer_sa, &peer_len) == 0
+            && peer_sa.sin_family == AF_INET)
+            circ->relay_peer_ipv4 = peer_sa.sin_addr.s_addr;
+    }
 
     /* Derive relay-side circuit keys from key_seed */
     moor_crypto_kdf(circ->relay_forward_key, 32, key_seed, 1, "moorFWD!");

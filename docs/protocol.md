@@ -21,7 +21,7 @@ payload     (509 bytes)
 | DESTROY | 4 | Both | Tear down circuit |
 | CREATE_PQ | 6 | Client->Relay | PQ hybrid circuit handshake |
 | CREATED_PQ | 7 | Relay->Client | PQ hybrid handshake response |
-| CELL_KEM_CT    |   8 | KEM ciphertext fragment (PQ hybrid handshake) |
+| KEM_CT | 8 | Both | KEM ciphertext fragment (PQ hybrid handshake) |
 
 ### Relay commands (inside RELAY cells)
 
