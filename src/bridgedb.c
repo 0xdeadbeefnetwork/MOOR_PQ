@@ -117,6 +117,14 @@ static void bridgedb_handle_request(int fd,
         return;
     }
 
+    /* Rate limit: max 3 requests per IP per 10 minutes (Tor-aligned) */
+    if (!moor_ratelimit_check(client_ip, MOOR_RL_CONN)) {
+        const char *ratelimit = "HTTP/1.0 429 Too Many Requests\r\n\r\n";
+        send(fd, ratelimit, strlen(ratelimit), MSG_NOSIGNAL);
+        close(fd);
+        return;
+    }
+
     /* Select bridges for this client IP */
     moor_bridge_entry_t selected[MOOR_BRIDGEDB_HAND_OUT];
     int count = moor_bridgedb_select(config, client_ip, selected,

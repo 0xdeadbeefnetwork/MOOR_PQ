@@ -38,6 +38,7 @@
 
 /* Global state */
 extern moor_config_t g_config;
+char g_config_path[256] = "";
 extern void moor_da_update_published_snapshot(moor_da_config_t *config);
 static moor_mode_t g_mode = MOOR_MODE_CLIENT;
 static char g_bind_addr[64] = "127.0.0.1";
@@ -1388,6 +1389,18 @@ static int run_client(void) {
             LOG_INFO("guard: loaded persisted state from %s", g_data_dir);
     }
 
+    /* Tor-aligned: populate sampled guard set from consensus.
+     * Fills any empty slots with GUARD+STABLE+RUNNING relays.
+     * On first run, samples fresh guards.  On restart, preserves
+     * existing guards and only fills gaps. */
+    {
+        const moor_consensus_t *cons = moor_socks5_get_consensus();
+        if (cons && cons->num_relays > 0) {
+            moor_guard_sample(moor_pathbias_get_state(), cons);
+            moor_guard_update_primary(moor_pathbias_get_state());
+        }
+    }
+
     /* Auto-discover local CDN domains for ShitStorm/Mirage SNI pool.
      * DPI happens on the CLIENT side -- the client's ISP sees the SNI in
      * the ClientHello.  We need CDNs with edge servers in the client's
@@ -2301,12 +2314,54 @@ static int run_bridgedb(void) {
 }
 
 extern volatile sig_atomic_t g_shutdown_requested;
+extern volatile sig_atomic_t g_sighup_requested;
 
 static char g_pid_file_path[256] = "";
 
 static void signal_handler(int sig) {
     (void)sig;
     g_shutdown_requested = 1;
+}
+
+#ifndef _WIN32
+static void sighup_handler(int sig) {
+    (void)sig;
+    g_sighup_requested = 1;
+}
+#endif
+
+/* Tor-aligned: SIGHUP reload handler (like Tor's do_hup()).
+ * Called from the event loop when SIGHUP is received.
+ * Reloads config file, refreshes consensus, re-registers relay. */
+void moor_handle_sighup(void) {
+    LOG_INFO("SIGHUP received — reloading configuration");
+
+    /* Reload config file if one was specified */
+    extern char g_config_path[256];
+    if (g_config_path[0]) {
+        moor_config_t new_config;
+        memset(&new_config, 0, sizeof(new_config));
+        moor_config_defaults(&new_config);
+        if (moor_config_load(&new_config, g_config_path) == 0) {
+            /* Apply non-destructive config changes */
+            g_config.verbose = new_config.verbose;
+            /* Exit policy can be reloaded */
+            if (new_config.exit_policy.num_rules > 0)
+                memcpy(&g_config.exit_policy, &new_config.exit_policy,
+                       sizeof(g_config.exit_policy));
+            LOG_INFO("SIGHUP: config reloaded from %s", g_config_path);
+        } else {
+            LOG_WARN("SIGHUP: config reload failed, keeping current config");
+        }
+    }
+
+    /* Re-register with DAs (relay mode) */
+    extern moor_relay_config_t g_relay_cfg;
+    extern int g_is_bridge;
+    if (g_config.mode == MOOR_MODE_RELAY && !g_is_bridge) {
+        moor_relay_register(&g_relay_cfg);
+        LOG_INFO("SIGHUP: re-registered with DAs");
+    }
 }
 
 /*
@@ -2519,6 +2574,7 @@ int main(int argc, char **argv) {
         if ((strcmp(argv[i], "--config") == 0 || strcmp(argv[i], "-f") == 0) &&
             i + 1 < argc) {
             have_explicit_config = 1;
+            snprintf(g_config_path, sizeof(g_config_path), "%s", argv[i + 1]);
             if (moor_config_load(&g_config, argv[i + 1]) != 0) {
                 fprintf(stderr, "FATAL: failed to load config file: %s\n",
                         argv[i + 1]);
@@ -2543,6 +2599,7 @@ int main(int argc, char **argv) {
             if (f) { found_config = *p; fclose(f); break; }
         }
         if (found_config) {
+            snprintf(g_config_path, sizeof(g_config_path), "%s", found_config);
             if (moor_config_load(&g_config, found_config) != 0) {
                 fprintf(stderr, "FATAL: failed to parse %s\n", found_config);
                 return 1;
@@ -2803,6 +2860,7 @@ int main(int argc, char **argv) {
     signal(SIGTERM, signal_handler);
 #ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGHUP, sighup_handler);
 
     /* Install crash handler for fatal signals -- wipes keys before core dump.
      * SA_RESETHAND prevents re-entry if the wipe itself faults. */
@@ -2859,6 +2917,10 @@ int main(int argc, char **argv) {
     /* Remove PID file */
     if (g_pid_file_path[0])
         unlink(g_pid_file_path);
+
+    /* Save guard state before shutdown (Tor-aligned: save on exit) */
+    if (g_data_dir[0])
+        moor_guard_save(moor_pathbias_get_state(), g_data_dir);
 
     /* Cleanup -- wipe all secret keys (globals + copies in sub-configs) */
     emergency_wipe_keys();

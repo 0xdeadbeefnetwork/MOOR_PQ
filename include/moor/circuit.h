@@ -102,7 +102,8 @@ typedef struct moor_circuit {
     char     isolation_key[256];
     /* SENDME authentication (Prop 289) */
 #define MOOR_SENDME_AUTH_MAX 10
-    uint8_t  sendme_auth_expected[MOOR_SENDME_AUTH_MAX][8]; /* FIFO: expected digests */
+#define MOOR_SENDME_AUTH_LEN 20  /* Tor-aligned: 20-byte truncated digest */
+    uint8_t  sendme_auth_expected[MOOR_SENDME_AUTH_MAX][MOOR_SENDME_AUTH_LEN];
     uint8_t  sendme_auth_head;          /* next write position in FIFO */
     uint8_t  sendme_auth_count;         /* pending expected digests */
     int32_t  sendme_auth_cells_sent;    /* backward cells sent since last record (relay) */

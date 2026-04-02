@@ -91,9 +91,18 @@ const char *moor_addressmap_reverse(const char *ip_str) {
     uint32_t ip = ntohl(ia.s_addr);
     if ((ip & VIRT_MASK) != VIRT_BASE) return NULL; /* Not in virtual range */
 
+    uint64_t now = (uint64_t)time(NULL);
     for (int i = 0; i < g_virt_count; i++) {
-        if (g_virt_map[i].virt_ip == ip)
+        if (g_virt_map[i].virt_ip == ip) {
+            /* Tor-aligned: expire mappings after 10 minutes */
+            if (now - g_virt_map[i].created_at > 600) {
+                memmove(&g_virt_map[i], &g_virt_map[i + 1],
+                        sizeof(virt_entry_t) * (g_virt_count - i - 1));
+                g_virt_count--;
+                return NULL;
+            }
             return g_virt_map[i].hostname;
+        }
     }
     return NULL;
 }

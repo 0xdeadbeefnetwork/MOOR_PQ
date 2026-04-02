@@ -930,7 +930,7 @@ void moor_exit_policy_set_defaults(moor_exit_policy_t *policy) {
      * Reject RFC 1918/loopback first, then Tor's standard blocked ports,
      * then accept everything else. */
     static const char *defaults[] = {
-        /* RFC 1918 + loopback + link-local */
+        /* RFC 1918 + loopback + link-local (IPv4) */
         "reject 0.0.0.0/8:*",
         "reject 10.0.0.0/8:*",
         "reject 100.64.0.0/10:*",
@@ -938,6 +938,11 @@ void moor_exit_policy_set_defaults(moor_exit_policy_t *policy) {
         "reject 169.254.0.0/16:*",
         "reject 172.16.0.0/12:*",
         "reject 192.168.0.0/16:*",
+        /* IPv6 private/reserved (Tor-aligned) */
+        "reject [::1]/128:*",
+        "reject [fc00::]/7:*",
+        "reject [fe80::]/10:*",
+        "reject [::ffff:0:0]/96:*",
         /* Tor's default rejects: SMTP, NNTP, RPC/DCOM, SMB, NNTPS,
          * Kazaa, eMule, Gnutella, BitTorrent */
         "reject *:25",

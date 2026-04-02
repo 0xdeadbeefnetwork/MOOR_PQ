@@ -24,6 +24,7 @@
 #include <time.h>
 
 volatile sig_atomic_t g_shutdown_requested = 0;
+volatile sig_atomic_t g_sighup_requested = 0;
 
 #define MAX_EVENTS  MOOR_MAX_FDS
 #define MAX_TIMERS  32
@@ -245,6 +246,13 @@ int moor_event_loop(void) {
                 continue;
             }
             break; /* Fatal: EFAULT, ENOMEM */
+        }
+
+        /* Tor-aligned: SIGHUP config reload (like do_hup()) */
+        if (g_sighup_requested) {
+            g_sighup_requested = 0;
+            extern void moor_handle_sighup(void);
+            moor_handle_sighup();
         }
 
         fire_timers();

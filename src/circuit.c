@@ -1547,7 +1547,8 @@ int moor_circuit_send_data(moor_circuit_t *circ, uint16_t stream_id,
             if (circ->num_hops > 0 &&
                 circ->sendme_auth_count < MOOR_SENDME_AUTH_MAX) {
                 memcpy(circ->sendme_auth_expected[circ->sendme_auth_head],
-                       circ->hops[circ->num_hops - 1].forward_digest, 8);
+                       circ->hops[circ->num_hops - 1].forward_digest,
+                       MOOR_SENDME_AUTH_LEN);
                 circ->sendme_auth_head =
                     (circ->sendme_auth_head + 1) % MOOR_SENDME_AUTH_MAX;
                 circ->sendme_auth_count++;
@@ -1583,7 +1584,7 @@ int moor_circuit_handle_sendme(moor_circuit_t *circ, uint16_t stream_id,
                             MOOR_SENDME_AUTH_MAX -
                             circ->sendme_auth_count) % MOOR_SENDME_AUTH_MAX;
             if (sodium_memcmp(sendme_data,
-                              circ->sendme_auth_expected[tail], 8) != 0) {
+                              circ->sendme_auth_expected[tail], MOOR_SENDME_AUTH_LEN) != 0) {
                 LOG_WARN("circuit %u: SENDME auth digest mismatch",
                          circ->circuit_id);
                 return -1;
@@ -2159,9 +2160,11 @@ int moor_circuit_build(moor_circuit_t *circ,
         if (moor_circuit_extend(circ, exit_relay) != 0) return -1;
     }
 
-    /* Path bias: record build success */
+    /* Path bias: record build success + update guard reachability */
     moor_pathbias_count_build_success(&g_pathbias_guard_state,
                                        circ->hops[0].node_id);
+    moor_guard_mark_reachable(&g_pathbias_guard_state,
+                               circ->hops[0].node_id);
 
     /* CBT: record build time for adaptive timeout (Tor-aligned Pareto MLE) */
     if (circ->build_started_ms > 0) {
@@ -3519,6 +3522,10 @@ static void cbuild_finish(moor_circuit_t *circ, int status) {
     void *arg = ctx->on_complete_arg;
 
     if (status != 0) {
+        /* Tor-aligned: mark guard as unreachable on build failure */
+        if (circ->hops[0].node_id[0] != 0)
+            moor_guard_mark_unreachable(&g_pathbias_guard_state,
+                                         circ->hops[0].node_id);
         /* Failure: clean up connection refcount safely */
         moor_connection_t *conn = circ->conn;
         moor_circuit_unregister(circ);
@@ -3990,9 +3997,26 @@ int moor_circuit_build_async(moor_circuit_t *circ,
     uint8_t exclude[96];
     memcpy(exclude, our_pk, 32);
 
-    const moor_node_descriptor_t *guard =
-        moor_node_select_relay(cons, NODE_FLAG_GUARD | NODE_FLAG_RUNNING,
-                               exclude, 1);
+    /* Tor-aligned: use Prop 271 guard selection (sampled → primary → confirmed)
+     * instead of random relay selection.  Falls back to random if guard state
+     * is empty (first run before guard_sample populates it). */
+    const moor_node_descriptor_t *guard = NULL;
+    const moor_guard_entry_t *ge = moor_guard_select(&g_pathbias_guard_state);
+    if (ge) {
+        /* Find the full descriptor in consensus by identity_pk */
+        for (uint32_t ri = 0; ri < cons->num_relays; ri++) {
+            if (sodium_memcmp(cons->relays[ri].identity_pk, ge->identity_pk, 32) == 0 &&
+                (cons->relays[ri].flags & NODE_FLAG_RUNNING)) {
+                guard = &cons->relays[ri];
+                break;
+            }
+        }
+    }
+    if (!guard) {
+        /* Fallback: random guard selection (first boot, or guard not in consensus) */
+        guard = moor_node_select_relay(cons, NODE_FLAG_GUARD | NODE_FLAG_RUNNING,
+                                       exclude, 1);
+    }
     if (!guard) { moor_crypto_wipe(ctx, sizeof(*ctx)); free(ctx); circ->build_ctx = NULL; return -1; }
     memcpy(&ctx->path[0], guard, sizeof(moor_node_descriptor_t));
 
