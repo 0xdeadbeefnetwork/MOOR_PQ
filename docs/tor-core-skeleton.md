@@ -780,3 +780,376 @@ bwhist.c: Bandwidth history
 15. **Hibernation as graduated defense**: AWAKE → SOFT_LIMIT (no new circuits) → HARD_LIMIT (close all) → DORMANT (no network). Bandwidth accounting per period with scheduled wakeup.
 
 16. **DNS hijack detection**: Exit relays test known-good and known-bad hostnames. If bad hostnames resolve, DNS is compromised — refuse to serve as exit.
+
+---
+
+# Tor Library Infrastructure (src/lib/) — 54K lines
+
+## Crypto Primitives (lib/crypt_ops/)
+
+```
+SYMMETRIC:
+  AES-128/192/256 CTR mode (aes_openssl.c / aes_nss.c)
+  AES ECB raw block cipher (for CGO tweakable cipher)
+  Dual backend: OpenSSL or NSS, compile-time selected
+
+HASHING:
+  SHA-1 (20 bytes), SHA-256 (32 bytes), SHA-512 (64 bytes)
+  SHA3-256, SHA3-512 (Keccak)
+  SHAKE-256 XOF (extendable output)
+  HMAC-SHA256
+  SipHash-2-4 (non-crypto, hash tables)
+
+ASYMMETRIC:
+  Curve25519 ECDH (crypto_curve25519.c)
+    - keypair generate, DH handshake, file I/O
+  Ed25519 EdDSA (crypto_ed25519.c)
+    - sign, verify, batch verify, blind/unblind
+    - Two implementations: ref10 (reference) and donna (optimized)
+  RSA (crypto_rsa.c)
+    - Hybrid RSA+AES encryption (legacy)
+    - Key generation, import/export PEM
+
+KEY DERIVATION:
+  HKDF-SHA256 (RFC 5869) — modern circuits
+  TAP KDF (SHA1 hash chain) — legacy CREATE_FAST
+  S2K: RFC2440, PBKDF2, Scrypt — password-based
+
+RANDOM:
+  crypto_rand() — OS entropy (getrandom/urandom)
+  crypto_rand_fast — AES-CTR-256 stream for high volume
+  crypto_strongest_rand() — extra entropy sources
+
+CONSTANT-TIME (lib/ctime/):
+  tor_memeq() / tor_memneq() — timing-safe comparison
+  safe_mem_is_zero() — constant-time zero check
+  di_digest256_map_t — constant-time map operations
+
+UTILITIES:
+  memwipe() — secure memory clearing (OPENSSL_cleanse / explicit_bzero)
+  OPE (order-preserving encryption) — for HS descriptor revision
+  Bloom filter (digestset) — probabilistic set membership
+  Password box (pwbox) — encrypt secrets with passphrase
+```
+
+## TLS Abstraction (lib/tls/)
+
+```
+DUAL BACKEND: OpenSSL (tortls_openssl.c) or NSS (tortls_nss.c)
+
+CERTIFICATE MANAGEMENT:
+  tor_tls_create_certificate() — self-signed X.509
+  tor_tls_cert_is_valid() — chain validation
+  tor_x509_cert_get_id_digests() — extract key digests
+  tor_tls_pick_certificate_lifetime() — configurable validity
+
+CONNECTION:
+  tor_tls_new() — create TLS connection over socket
+  tor_tls_handshake() — perform TLS handshake
+  tor_tls_read() / tor_tls_write() — encrypted I/O
+  tor_tls_get_peer_cert() — extract peer certificate
+
+BUFFER I/O:
+  buf_read_from_tls() — read into buf_t
+  buf_flush_to_tls() — write from buf_t
+```
+
+## Sandbox (lib/sandbox/)
+
+```
+SECCOMP-BPF SYSCALL FILTER:
+  ~60 allowed syscalls (read, write, close, mmap, socket, etc.)
+  Dynamic whitelists for: file paths, socket types, mprotect regions
+  Protected string memory: mmap + mprotect(PROT_READ)
+  Kill-on-tamper: seccomp kills process if mremap/munmap of protected region
+
+PARAMETER VALIDATION:
+  open/openat: exact path matching against whitelist
+  socket: restricted to TCP/UDP/UNIX/NETLINK
+  mmap: restricted prot/flags combinations
+  fcntl: only F_GETFL and F_SETFL with O_NONBLOCK
+  setsockopt: only SO_REUSEADDR, IP_TRANSPARENT, IPV6_V6ONLY, etc.
+
+ARCHITECTURE SUPPORT: x86, x86-64, ARM, ARM64, RISC-V
+```
+
+## Event Loop (lib/evloop/)
+
+```
+compat_libevent.c — libevent wrapper
+  mainloop_event_new/activate/schedule/free
+  tor_libevent_run_event_loop()
+
+timers.c — hierarchical timing wheel (William Ahern's timeout.c)
+  O(log n) insert, O(1) expire
+  Microsecond precision
+
+token_bucket.c — rate limiting
+  token_bucket_cfg_t: rate + burst configuration
+  token_bucket_rw_t: combined read/write bucket
+  Refill per step, decrement per operation
+
+workqueue.c — thread pool
+  threadpool_new/start_threads/queue_work
+  replyqueue for async results via pipe notification
+  Priority work items
+```
+
+## Data Structures (lib/container/)
+
+```
+smartlist_t — dynamic array (most-used structure in Tor)
+  sort, bsearch, heap/priority queue, set operations
+  join, split, uniq, intersect, subtract
+
+strmap_t / digestmap_t / digest256map_t — hash tables
+  String, 20-byte digest, and 32-byte digest keys
+  Iterator with remove support
+
+bloomfilt_t — bloom filter (SipHash-based)
+namemap_t — bidirectional string ↔ uint16_t mapping
+order statistics — find nth element in array
+```
+
+## Network (lib/net/)
+
+```
+tor_addr_t — unified IPv4/IPv6/Unix address type
+  Parse, format, compare, hash, classify (loopback/internal/multicast)
+  CIDR masking, PTR name generation
+
+Socket operations:
+  tor_open_socket() with CLOEXEC
+  tor_connect_socket(), tor_accept_socket()
+  set_socket_nonblocking/nodelay/reuseaddr/linger
+
+Buffer I/O:
+  buf_read_from_socket() / buf_flush_to_socket()
+  buf_read_from_fd() / buf_flush_to_fd()
+```
+
+## Buffers (lib/buf/)
+
+```
+buf_t — chunk-based FIFO byte buffer
+  Chunks allocated from pool, linked list
+  buf_add() / buf_get_bytes() / buf_peek()
+  buf_find_string_offset() — search for substring
+  buf_pullup() — consolidate into contiguous block
+  Timestamp tracking per chunk for age measurement
+```
+
+## Compression (lib/compress/)
+
+```
+Unified interface over 4 backends:
+  ZLIB (deflate/inflate)
+  ZSTD (Facebook Zstandard)
+  LZMA (xz)
+  NONE (passthrough)
+
+tor_compress() / tor_uncompress() — one-shot
+tor_compress_new() + tor_compress_process() — streaming
+detect_compression_method() — auto-detect from header bytes
+```
+
+## Configuration Framework (lib/confmgt/)
+
+```
+config_format_t — describes config file format
+  Maps torrc keys to struct fields via offset
+  Type system: INT, UINT64, BOOL, STRING, DOUBLE, CSV, LINELIST, etc.
+  Unit parsing: "10 MB", "2 hours", "500 msec"
+
+config_var_t — single option descriptor
+  Name, type, struct offset, flags (IMMUTABLE, INVISIBLE, etc.)
+
+Validation callbacks for option transitions
+State persistence (or_state_t) separate from options (or_options_t)
+```
+
+## Other Infrastructure
+
+```
+lib/log/ — Multi-level logging (DEBUG/INFO/NOTICE/WARN/ERR)
+  Per-domain severity, rate limiting, signal-safe emergency output
+
+lib/fs/ — File operations with CLOEXEC, lockfiles, storage directories
+lib/process/ — Fork, exec, signal handling, waitpid
+lib/thread/ — Portable mutex (pthread/Windows CRITICAL_SECTION)
+lib/encoding/ — Base16/32/64, PEM, C-string escape, config line parsing
+lib/geoip/ — IP-to-country binary search on sorted range lists
+lib/malloc/ — tor_malloc (die on NULL), overflow-safe size_mul_check
+lib/memarea/ — Bulk arena allocator (many small allocs, one free)
+lib/math/ — Probability distributions (uniform, geometric, logistic, Pareto, Weibull, Laplace)
+lib/err/ — Signal-safe emergency logging, backtrace support
+lib/intmath/ — Overflow-safe add/mul/gcd, bit counting
+lib/subsys/ — Subsystem registration framework (ordered init/shutdown)
+lib/metrics/ — Counter/gauge/histogram store for Prometheus export
+```
+
+---
+
+# Application Layer (src/app/) — 12K lines
+
+## Configuration (app/config/)
+
+```
+config.c — THE torrc parser
+  options_init_from_torrc() — load + validate
+  options_validate_cb() — check all constraints
+  options_act() — apply changes (open listeners, start relays, etc.)
+  options_transition_allowed() — safe runtime reconfig
+
+or_options_t — every torrc option as a struct field
+or_state_t — persistent state (guard state, bandwidth history, etc.)
+
+resolve_addr.c — external IP discovery
+statefile.c — state file I/O (or_state.json)
+```
+
+## Main Entry (app/main/)
+
+```
+tor_main.c — entry point
+main.c — startup orchestration
+  do_hup() — SIGHUP handler (reload config, retry connections)
+  process_signal() — signal dispatcher
+
+shutdown.c — cleanup sequence:
+  1. tor_cleanup() — remove pidfile, save state, record bandwidth
+  2. tor_free_all() — free circuits, channels, connections, crypto
+  3. Subsystem shutdown in reverse initialization order
+
+subsysmgr.c — subsystem lifecycle manager
+  Initialize all subsystems in order (crypto → network → event loop → protocols)
+  Shutdown all in reverse order
+
+Subsystem initialization order (40+ subsystems):
+  1. Error handling, logging, threads
+  2. Crypto (OpenSSL/NSS), compression, network, TLS
+  3. Event loop, process management
+  4. Main loop, conflux, OR core, DoS
+  5. Relay, hidden services, directory authority
+  6. Metrics
+```
+
+---
+
+# External Libraries (src/ext/) — 15K lines
+
+## Vendored Crypto
+
+```
+Ed25519:
+  ref10/ — SUPERCOP reference (41 files, field+group+scalar ops)
+  donna/ — Optimized variant (ed25519_tor.c wrapper)
+
+Curve25519:
+  curve25519-donna.c — 32-bit portable
+  curve25519-donna-c64.c — 64-bit optimized
+
+SHA-3/Keccak:
+  keccak-tiny-unrolled.c — Keccak-f[1600] permutation
+
+POLYVAL:
+  polyval.c + ctmul.c + ctmul64.c + pclmul.c
+  GF(2^128) multiplication for CGO AEAD
+  Platform variants: CLMUL (x86), constant-time 64/32-bit
+
+SipHash:
+  csiphash.c — SipHash-2-4 for hash tables
+
+Equix/HashX (Proof-of-Work):
+  equix/ — Equix verifier + solver (Merkle-tree XOR)
+  hashx/ — JIT-compiled hash function (x86/ARM64 backends)
+  blake2.c — BLAKE2b for HashX input
+```
+
+## Vendored Utilities
+
+```
+trunnel.c — serialization runtime (byte-order, memory)
+tinytest.c — unit test framework
+timeout.c — tickless hierarchical timing wheel
+strlcpy.c / strlcat.c — safe string ops (OpenBSD)
+readpassphrase.c — terminal password input (OpenBSD)
+getdelim.c — line reading (NetBSD)
+mulodi4.c — 64-bit overflow multiply (LLVM compiler-rt)
+OpenBSD_malloc_Linux.c — hardened malloc (optional)
+```
+
+---
+
+# Protocol Parsers (src/trunnel/) — Auto-Generated
+
+```
+16 auto-generated files from .trunnel specs:
+  ed25519_cert.c — Ed25519 certificate format
+  link_handshake.c — TLS link handshake cells
+  netinfo.c — NETINFO cell
+  extension.c — cell extensions
+  socks5.c — SOCKS protocol
+  sendme_cell.c — SENDME flow control
+  subproto_request.c — protocol version negotiation
+  congestion_control.c — CC cells
+  flow_control_cells.c — advanced flow control
+  circpad_negotiation.c — circuit padding setup
+  channelpadding_negotiation.c — channel padding setup
+  conflux.c — multi-path cells
+  pwbox.c — password-encrypted storage
+
+  hs/cell_establish_intro.c — ESTABLISH_INTRO
+  hs/cell_introduce1.c — INTRODUCE1
+  hs/cell_rendezvous.c — RENDEZVOUS1
+
+All follow pattern: *_new(), *_free(), *_parse(), *_encode(), *_encoded_len()
+```
+
+---
+
+# Tools (src/tools/)
+
+```
+tor-gencert — Generate DA identity certificates (RSA 3072-bit + 2048-bit signing)
+tor-print-ed-signing-cert — Display Ed25519 cert expiration
+tor-resolve — SOCKS4a DNS resolution test client
+tor_runner — Experimental fork+exec wrapper for embedding
+```
+
+---
+
+# Complete Tor Source Map
+
+```
+src/core/     69K lines — Protocol engine (cells, circuits, channels, relay, CC, scheduling)
+src/feature/ 110K lines — Features (guards, HS, dirauth, relay, control, nodelist, stats)
+src/lib/      54K lines — Infrastructure (crypto, TLS, sandbox, containers, network, event loop)
+src/app/      12K lines — Application (config, main, shutdown, subsystem management)
+src/ext/      15K lines — Vendored libraries (Ed25519, Curve25519, SHA-3, POLYVAL, Equix)
+src/trunnel/   5K lines — Auto-generated protocol parsers
+src/tools/     1K lines — CLI utilities
+src/test/      ???       — Test suite (not analyzed)
+─────────────────────────
+TOTAL:       ~266K lines of C (excluding tests)
+```
+
+## Summary: 17 Design Patterns for MOOR
+
+1. Deferred circuit close (mark then free in epilogue)
+2. Channel death = immediate circuit cleanup
+3. Rate-based DoS limits only (no absolute counters)
+4. Layer separation (channel / circuit / stream)
+5. Consensus-driven parameters
+6. CPU crypto offloaded to threadpool
+7. Graceful degradation (OOS → OOM → hibernation)
+8. Path bias tracking (build + stream)
+9. 5-phase Byzantine voting with consensus methods
+10. Dual-layer HS descriptor encryption
+11. Managed PT protocol (external process)
+12. Exponential backoff on all retries
+13. ED-style consensus diffing with worker threads
+14. Reputation tracking (MTBF, WFU)
+15. Graduated hibernation (soft → hard → dormant)
+16. DNS hijack detection at exit
+17. Subsystem framework with ordered init/shutdown
