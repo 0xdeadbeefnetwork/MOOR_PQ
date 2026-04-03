@@ -376,3 +376,407 @@ Isolation: IsolateSOCKSAuth uses username:password for circuit isolation
 7. **Graceful degradation**: Out-of-sockets handler kills connections by priority. OOM handler kills circuits by queue depth. Hibernation stops accepting new circuits before killing existing ones.
 
 8. **Path bias as defense**: Track build success rate AND stream-use success rate per guard. Disable guards that fail too often.
+
+---
+
+# Tor Feature Modules (src/feature/) — 110K lines
+
+## Guard Selection (feature/client/entrynodes.c — 4353 lines)
+
+```
+SAMPLED SET (persisted, max 60 or 20% of network)
+  |-- Expanded from consensus as guards appear
+  |-- Expired after 120 days (unconfirmed) or 20 days (unlisted)
+  |
+  v
+FILTERED SET (runtime, config-dependent)
+  |-- Passes ExcludeNodes, firewall, path-bias checks
+  |
+  v
+USABLE FILTERED SET
+  |-- Filtered AND recently reachable
+  |
+  v
+CONFIRMED GUARDS (persisted, ordered by sampled_idx)
+  |-- Promoted from sampled on first successful circuit
+  |-- Sorted by Prop 310 sampling order
+  |
+  v
+PRIMARY GUARDS (runtime, max 3)
+  |-- Top 3 from confirmed (filtered, reachable)
+  |-- Fallback to unconfirmed sampled if needed
+
+Circuit guard selection:
+  1. Try primary guards (immediate)
+  2. If all primary down: try confirmed (with retry schedule)
+  3. If all confirmed down: try first sampled filtered
+  4. Pending circuits upgraded if primary recovers
+
+Retry schedule (time since first failure):
+  0-6h:   primary 10min, non-primary 60min
+  6h-4d:  primary 90min, non-primary 4h
+  4d-7d:  primary 4h, non-primary 18h
+  7d+:    primary 9h, non-primary 36h
+
+State persisted to disk (text key=value):
+  in, rsa_id, sampled_on, sampled_idx, confirmed_on, confirmed_idx,
+  pb_circ_attempts, pb_circ_successes, pb_use_attempts, pb_use_successes
+```
+
+## Path Bias Detection (feature/client/circpathbias.c — 1669 lines)
+
+```
+BUILD TRACKING:
+  pathbias_count_build_attempt() — after 2nd hop AWAITING_KEYS
+  pathbias_count_build_success() — circuit fully built
+  
+  Thresholds (configurable):
+    Notice: 70% build rate
+    Warn:   50% build rate  
+    Disable: 30% build rate (guard dropped)
+    Min circuits before judging: 150
+
+STREAM TRACKING:
+  pathbias_count_use_attempt() — stream opened on circuit
+  pathbias_mark_use_success() — RELAY_CONNECTED received
+  pathbias_send_usable_probe() — probe with RELAY_PADDING if suspicious
+  
+  Thresholds:
+    Disable: 60% stream success rate
+    
+States: NEW_CIRC → BUILD_ATTEMPTED → BUILD_SUCCEEDED →
+        USE_ATTEMPTED → USE_SUCCEEDED → ALREADY_COUNTED
+```
+
+## Pluggable Transports (feature/client/transports.c — 2291 lines)
+
+```
+Managed PT Protocol (Prop 180):
+  1. Tor spawns external process with TOR_PT_* environment
+  2. PT outputs: VERSION, CMETHOD/SMETHOD lines, METHODS DONE
+  3. Tor registers transports for circuit building
+  4. On SIGHUP: mark-and-sweep (re-read config, destroy obsolete)
+
+Transport lifecycle:
+  transport_new() → transport_add() → mark → sweep → transport_free()
+
+PT process I/O:
+  stdout → parse VERSION/METHOD/STATUS lines
+  stderr → log messages
+  exit → cleanup and re-launch if needed
+```
+
+## Hidden Service Server (feature/hs/hs_service.c — 4743 lines)
+
+```
+DESCRIPTOR PUBLISH FLOW:
+  1. build_service_desc_plaintext() — version, lifetime, signing cert
+  2. build_service_desc_superencrypted() — blinded key, auth clients
+  3. build_service_desc_encrypted() — intro points, PoW params
+  4. service_encode_descriptor() — base64 + sign
+  5. upload_descriptor_to_all() — 2 replicas × 2 time periods → HSDirs
+
+INTRO POINT MANAGEMENT:
+  pick_needed_intro_points() — select relay nodes
+  launch_intro_point_circuits() — 3-hop with vanguards
+  service_intro_circ_has_opened() — send ESTABLISH_INTRO
+  cleanup_intro_points() — expire after ~24h
+
+RENDEZVOUS HANDLING:
+  service_handle_introduce2() — decrypt client intro, extract RP
+  service_rendezvous_circ_has_opened() — complete e2e handshake
+
+DESCRIPTOR ENCRYPTION (two layers):
+  Superencrypted: AES-256-CTR + SHA3 MAC, key from blinded_pk
+  Encrypted: AES-256-CTR + SHA3 MAC, key from client auth
+  Per-client auth: X25519 DH → per-client descriptor cookie
+
+ROTATION:
+  run_housekeeping_event() — every 10 seconds
+  rotate_service_descriptors() — current → next at time period boundary
+  rotate_pow_seeds() — PoW seed rotation for DoS defense
+```
+
+## Hidden Service Client (feature/hs/hs_client.c — 2803 lines)
+
+```
+CONNECTION FLOW:
+  1. hs_client_launch_v3_desc_fetch() — fetch from HSDir (PIR optional)
+  2. client_desc_has_arrived() — decrypt descriptor
+  3. client_get_random_intro() — pick usable intro point
+  4. hs_client_send_introduce1() — encrypted intro to intro relay
+  5. handle_introduce_ack() — ACK from intro relay
+  6. client_rendezvous_circ_has_opened() — RP ready
+  7. handle_rendezvous2() — e2e key exchange complete, stream ready
+
+CLIENT AUTHORIZATION:
+  hs_client_register_auth_credentials() — store per-service key
+  find_client_auth() — lookup auth key for service
+  Credentials: X25519 keypair → decrypt descriptor cookie
+```
+
+## Directory Authority Voting (feature/dirauth/dirvote.c — 4936 lines)
+
+```
+5-PHASE VOTING PROTOCOL:
+
+Phase 1 — VOTING_STARTS:
+  Each DA generates vote (relay list + flags + bandwidth)
+  POST vote to all other DAs
+
+Phase 2 — FETCH_MISSING_VOTES:
+  Request any missing votes from other DAs
+
+Phase 3 — VOTING_ENDS:
+  networkstatus_compute_consensus():
+    - Select consensus method (highest supported by quorum)
+    - Compute median times (valid-after, fresh-until, valid-until)
+    - For each relay in ANY vote:
+        compute_routerstatus_consensus() — aggregate flags, bandwidth
+        get_all_possible_sybil() — detect IP-based sybil
+    - Compute bandwidth weights (Wgg, Wee, Wmg, etc.)
+    - Sign with identity key
+
+Phase 4 — FETCH_MISSING_SIGNATURES:
+  Request signatures from other DAs until threshold met
+
+Phase 5 — INTERVAL_STARTS:
+  Publish consensus to directory mirrors + clients
+
+SYBIL DETECTION:
+  get_sybil_list_by_ip_version() — group relays by /16 subnet
+  get_all_possible_sybil() — union IPv4 + IPv6 sybil sets
+  Sybil relays get BadExit flag
+```
+
+## Shared Random Value (feature/dirauth/shared_random.c — 1294 lines)
+
+```
+COMMIT-REVEAL PROTOCOL (Prop 250):
+
+COMMIT PHASE:
+  Each DA: generate random RN, publish H(H(RN) || TIMESTAMP)
+  
+REVEAL PHASE:
+  Each DA: publish (RN, TIMESTAMP)
+  Verify: H(revealed) matches committed hash
+
+SRV COMPUTATION:
+  SRV = SHA3("shared-random" || num_reveals || version || prev_srv ||
+              sorted(all_revealed_RNs))
+
+Used for: HSDir index randomization, relay ordering
+Disaster SRV: deterministic fallback if consensus unavailable
+```
+
+## Relay Descriptor Generation (feature/relay/router.c — 3729 lines)
+
+```
+DESCRIPTOR FIELDS:
+  router <nickname> <address> <or_port> <dir_port>
+  identity-ed25519 <cert>
+  or-address [ipv6]:port
+  platform <version>
+  proto <protocol-list>
+  published <ISO_TIME>
+  fingerprint <RSA_FP>
+  uptime <seconds>
+  bandwidth <rate> <burst> <capacity>
+  onion-key <RSA_KEY>
+  signing-key <RSA_KEY>
+  ntor-onion-key <CURVE25519_KEY>
+  ntor-onion-key-crosscert <CROSSCERT>
+  family <relay_list>
+  exit-policy accept/reject <rules>
+  router-sig-ed25519 <ED25519_SIG>
+  router-signature <RSA_SIG>
+
+REGENERATION TRIGGERS:
+  - Config change
+  - Bandwidth change (>= 50% or significant)
+  - IP address change
+  - Onion key rotation (every 7 days)
+  - 18-hour forced republish
+```
+
+## Exit DNS (feature/relay/dns.c — 2326 lines)
+
+```
+DNS HIJACK DETECTION:
+  dns_launch_correctness_checks():
+    1. Query known-good hostnames (should resolve)
+    2. Query known-bad hostnames (should NOT resolve)
+    3. If bad hostnames resolve → DNS hijacking detected
+    4. Set dns_is_completely_invalid flag
+    5. Refuse to serve as exit until DNS clean
+
+DNS CACHE:
+  cached_resolve_t: address → IPv4/IPv6 result + TTL
+  RESOLVED_CLIPPED_TTL = 60s (prevent DNS oracle attacks)
+  Negative caching (NXDOMAIN results cached)
+```
+
+## Relay Metrics (feature/relay/relay_metrics.c — 1338 lines)
+
+```
+PROMETHEUS-COMPATIBLE METRICS:
+  OOM bytes, onionskins processed, socket count,
+  DNS queries/errors, TCP exhaustion, connections,
+  streams, congestion control, DoS counters,
+  traffic bytes, relay flags, circuits,
+  signing cert expiry, EST_REND/EST_INTRO/INTRO1/REND1 actions
+
+Per-action tracking with enums:
+  EST_INTRO: success, malformed, unsuitable_circuit, dead
+  EST_REND: success, unsuitable, single_hop, malformed, dup_cookie, dead
+  INTRO1: success, dead, malformed, unknown_service, rate_limited, reused, single_hop
+  REND1: success, unsuitable, malformed, unknown_cookie, dead
+```
+
+## Flag Computation (feature/dirauth/voteflags.c — 690 lines)
+
+```
+FLAG ASSIGNMENT ALGORITHM:
+  Fast:   bandwidth >= 12.5th percentile (floor: 4 KB/s)
+  Stable: uptime >= median
+  Guard:  Fast + Stable + bw >= median non-exit + known >= 8 days
+  HSDir:  Fast + Stable + uptime >= 96 hours
+  Exit:   self-declared (DA always preserves)
+  BadExit: manually flagged or detected sybil
+```
+
+## Hibernation (feature/hibernate/hibernate.c — 1277 lines)
+
+```
+STATES: AWAKE → SOFT_LIMIT → HARD_LIMIT → DORMANT
+
+SOFT_LIMIT: Stop accepting new circuits, allow existing
+HARD_LIMIT: Close all connections
+DORMANT: No network activity, wait for accounting period reset
+
+Accounting: track bytes read/written per period
+Wake scheduling: calculate when bandwidth allowance resets
+```
+
+## Consensus Diffing (feature/dircommon/consdiff.c — 1420 lines)
+
+```
+ED-STYLE LINE DIFFS:
+  consdiff_gen_diff() — generate diff between two consensus docs
+  consdiff_apply_diff() — apply diff to produce new consensus
+  
+  Optimized: sorts by router identity for near-linear time
+  Format: standard ed commands (a=append, d=delete, c=change)
+  
+  consdiffmgr.c manages cached diffs with:
+    - Worker thread for background diff generation
+    - Worker thread for background compression
+    - Multiple compression methods (zlib, zstd, lzma)
+    - Cache eviction by staleness
+```
+
+## Control Port (feature/control/ — 10K lines)
+
+```
+COMMANDS (control_cmd.c):
+  AUTHENTICATE, AUTHCHALLENGE, PROTOCOLINFO
+  GETINFO, GETCONF, SETCONF, RESETCONF, LOADCONF, SAVECONF
+  SIGNAL (RELOAD, SHUTDOWN, DUMP, DEBUG, HALT, NEWNYM, CLEARDNSCACHE, HEARTBEAT)
+  EXTENDCIRCUIT, SETCIRCUITPURPOSE, ATTACHSTREAM, REDIRECTSTREAM
+  CLOSESTREAM, CLOSECIRCUIT
+  MAPADDRESS, RESOLVE
+  USEFEATURE, DROPGUARDS, DROPTIMEOUTS
+  HSFETCH, HSPOST, ADD_ONION, DEL_ONION
+  ONION_CLIENT_AUTH_ADD/REMOVE/VIEW
+  TAKEOWNERSHIP, DROPOWNERSHIP
+
+EVENTS (control_events.c):
+  CIRC, STREAM, ORCONN, BW, DEBUG, INFO, NOTICE, WARN, ERR
+  NEWDESC, ADDRMAP, DESCCHANGED, NS, STATUS_GENERAL/CLIENT/SERVER
+  GUARD, NETWORK_LIVENESS, CIRC_MINOR, TRANSPORT_LAUNCHED
+  HS_DESC, HS_DESC_CONTENT, CONN_BW, CIRC_BW, CELL_STATS, CONF_CHANGED
+
+AUTH METHODS (control_auth.c):
+  Cookie: 32-byte file, hex-encoded in AUTHENTICATE
+  HashedControlPassword: S2K hashed password
+  SafeCookie: HMAC-SHA256 challenge-response (prevents eavesdropping)
+
+GETINFO KEYS (control_getinfo.c — 100+ handlers):
+  version, config-text, config-file, exit-policy/*
+  circuit-status, stream-status, orconn-status
+  address, traffic/read, traffic/written
+  process/pid, uptime, network-liveness
+  consensus/*, ns/*, md/*, desc/*
+  ip-to-country/*, accounting/*
+  sr/current, sr/previous
+  downloads/*, status/bootstrap-phase
+```
+
+## Node List (feature/nodelist/ — 15K lines)
+
+```
+nodelist.c: "Live" network view combining routerinfo + routerstatus + microdesc
+  node_t = { routerinfo_t, routerstatus_t, microdesc_t }
+  
+  Indexed by: RSA digest, Ed25519 key
+  Filtered by: flags, protocols, address family, exit policy
+  
+networkstatus.c: Consensus management
+  Download, parse, validate, cache consensus
+  Track freshness (valid-after, fresh-until, valid-until)
+  Compute path fraction needed for circuits
+
+routerlist.c: Router descriptor storage
+  Add/remove/replace descriptors
+  Download scheduling with retry
+  Old descriptor cleanup
+  
+node_select.c: Bandwidth-weighted node selection
+  smartlist_choose_node_by_bandwidth_weights()
+  Wgg/Wee/Wmg/Wme weight application
+  ExcludeNodes/EntryNodes/ExitNodes enforcement
+```
+
+## Statistics (feature/stats/ — 6K lines)
+
+```
+rephist.c: Reputation history
+  MTBF tracking per relay (mean time between failures)
+  Weighted fractional uptime
+  Exit stream/bandwidth statistics
+  DNS error tracking
+  Overload/TCP exhaustion counters
+
+geoip_stats.c: Geographic statistics
+  Per-country client counts (for bridge stats)
+  Directory request tracking by country
+  Transport usage statistics
+
+predict_ports.c: Port prediction
+  Track which ports client uses
+  Preemptively build exit circuits for predicted ports
+  Decay old predictions
+
+bwhist.c: Bandwidth history
+  15-minute interval bandwidth tracking
+  Read/written/dir-read/dir-written
+  Persisted across restarts
+```
+
+## Key Design Patterns from Feature Modules
+
+9. **5-phase voting with consensus methods**: DAs don't just collect signatures — they run a full Byzantine protocol with method versioning for forward compatibility.
+
+10. **Dual-layer HS descriptor encryption**: Superencrypted (anyone with address can fetch) + encrypted (only authorized clients can read). Per-client auth via X25519 DH.
+
+11. **Managed PT protocol**: External process communication via stdout/stderr with environment-based configuration. Mark-and-sweep lifecycle on config reload.
+
+12. **Download retry with exponential backoff**: dlstatus.c implements randomized exponential backoff for all directory downloads. Separate schedules for consensus vs descriptors vs bridges.
+
+13. **Consensus diffing**: ED-style line diffs with background worker threads for generation and compression. Multiple compression methods. Reduces bandwidth by 90%+.
+
+14. **Reputation tracking**: MTBF, weighted fractional uptime, exit stream stats, DNS error rates. Used for flag assignment and relay selection.
+
+15. **Hibernation as graduated defense**: AWAKE → SOFT_LIMIT (no new circuits) → HARD_LIMIT (close all) → DORMANT (no network). Bandwidth accounting per period with scheduled wakeup.
+
+16. **DNS hijack detection**: Exit relays test known-good and known-bad hostnames. If bad hostnames resolve, DNS is compromised — refuse to serve as exit.
