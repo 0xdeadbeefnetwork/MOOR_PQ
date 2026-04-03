@@ -1580,3 +1580,402 @@ TOTAL TOR SOURCE (excluding tests):
   Data structures documented: 200+
   Constants documented: 300+
 ```
+
+---
+---
+
+# PQOR Design Plan — Post-Quantum Onion Router
+
+Formerly MOOR. Redesigned from the ground up using the Tor skeleton above,
+with post-quantum cryptography mandatory at every layer. No classical-only
+fallback anywhere. If either the classical or PQ algorithm holds, traffic
+stays sealed.
+
+## Design Philosophy
+
+Tor bolted PQ onto an architecture designed around RSA and Curve25519.
+PQOR is PQ-native. Every key exchange, every signature, every handshake
+uses hybrid classical+PQ from day one. The architecture follows Tor's
+proven patterns (documented above) but replaces the crypto foundation.
+
+## Cryptographic Libraries
+
+```
+DEPENDENCY          PURPOSE                         WHY THIS ONE
+─────────────────────────────────────────────────────────────────
+libsodium ≥1.0.18   Classical crypto primitives      Audited, constant-time, minimal API.
+                     Ed25519, X25519, ChaCha20-Poly1305,
+                     BLAKE2b, Argon2id, AEAD, KDF, RNG.
+                     No OpenSSL. No NSS.
+
+liboqs (Open         PQ algorithms:                   NIST-standardized implementations.
+ Quantum Safe)       ML-KEM-768 (Kyber768) — KEM      MIT license. C. Maintained by
+                     ML-DSA-65 (Dilithium3) — signatures  academics+industry. Constant-time.
+                     Includes: keygen, encaps, decaps,
+                     sign, verify.
+
+                     Alternative: vendored NIST reference
+                     implementations (current MOOR approach,
+                     ~3K lines kyber/ + dilithium/). Keep
+                     this as fallback if liboqs is too heavy.
+
+zlib                 Consensus compression             Already a dependency. Tiny.
+
+pthreads             Threading (worker pool, async)    Already a dependency. POSIX standard.
+```
+
+**No OpenSSL. No NSS. No GnuTLS.** Three dependencies total (four if liboqs
+replaces vendored PQ). This is deliberate — every dependency is an attack
+surface. libsodium gives us everything classical. liboqs gives us everything PQ.
+
+## Hybrid Construction
+
+Every key exchange produces two shared secrets: one classical, one PQ.
+The final key is: `BLAKE2b(classical_shared || pq_shared)`. An attacker
+must break BOTH to recover any key material.
+
+```
+LAYER              CLASSICAL              PQ                    HYBRID KDF
+──────────────────────────────────────────────────────────────────────────
+Link handshake     Noise_IK (X25519)      ML-KEM-768 KEM        HKDF(noise_key, kem_ss)
+Circuit hop 0      X25519 DH              ML-KEM-768 KEM        BLAKE2b(dh_seed || kem_ss)
+Circuit hop 1      X25519 DH              ML-KEM-768 KEM        BLAKE2b(dh_seed || kem_ss)
+Circuit hop 2      X25519 DH              ML-KEM-768 KEM        BLAKE2b(dh_seed || kem_ss)
+HS end-to-end      X25519 DH              ML-KEM-768 KEM        BLAKE2b(dh_shared || kem_ss)
+Consensus sigs     Ed25519                ML-DSA-65             Both must verify
+Relay identity     Ed25519                ML-DSA-65             Both keys in descriptor
+HS descriptor      X25519 seal            ML-KEM-768 seal       Hybrid decryption key
+```
+
+## Architecture — Following Tor's Skeleton
+
+### Layer Stack
+
+```
+┌─────────────────────────────────────────────────┐
+│  APPLICATION                                     │
+│  socks5.c — SOCKS5 proxy (greeting/auth/request) │
+│  transparent.c — TransPort + DNSPort             │
+│  monitor.c — control port (Tor-compatible)       │
+├─────────────────────────────────────────────────┤
+│  STREAM LAYER                                    │
+│  Stream management, isolation (domain+auth+addr) │
+│  XON/XOFF flow control per stream                │
+│  Half-edge tracking for clean shutdown           │
+├─────────────────────────────────────────────────┤
+│  CIRCUIT LAYER                                   │
+│  circuit.c — pool, build state machine, CBT      │
+│  Path selection (Prop 271 guards, BW-weighted)   │
+│  Congestion control (Vegas, Prop 324)            │
+│  SENDME auth (20-byte BLAKE2b digest)            │
+│  Circuit padding (WTF-PAD state machines)        │
+│  Conflux multi-path (optional)                   │
+├─────────────────────────────────────────────────┤
+│  CHANNEL LAYER                                   │
+│  channel.c — abstract channel state machine      │
+│  Noise_IK + ML-KEM-768 hybrid link handshake    │
+│  ChaCha20-Poly1305 AEAD cell encryption         │
+│  Channel padding (netflow resistance)            │
+│  circuitmux — EWMA-weighted circuit scheduling   │
+├─────────────────────────────────────────────────┤
+│  RELAY LAYER                                     │
+│  relay.c — cell forwarding + command dispatch    │
+│  Async EXTEND worker threads (PQ CREATE)         │
+│  Exit connections + DNS (with hijack detection)  │
+│  Per-circuit cell queue limits (2500 cells)      │
+│  DoS: rate-based token buckets (no abs counters) │
+├─────────────────────────────────────────────────┤
+│  CRYPTO LAYER                                    │
+│  Hybrid CKE: X25519 + ML-KEM-768 per hop       │
+│  Relay crypto: ChaCha20 stream cipher           │
+│  Cell format: 514-byte fixed (5 hdr + 509 data) │
+│  Digest: BLAKE2b (running, per-hop)             │
+│  Signatures: Ed25519 + ML-DSA-65 everywhere     │
+├─────────────────────────────────────────────────┤
+│  DIRECTORY LAYER                                 │
+│  5-phase Byzantine voting (Tor-aligned)          │
+│  Dual-signed consensus (Ed25519 + ML-DSA-65)    │
+│  Shared random commit-reveal (SHA3)             │
+│  Consensus diffing (ED-style, background worker) │
+│  Relay descriptors: Ed25519 + ML-DSA-65 signed  │
+├─────────────────────────────────────────────────┤
+│  HIDDEN SERVICE LAYER                            │
+│  Dual-layer descriptor encryption               │
+│    Superencrypted: AES-256-CTR + BLAKE2b MAC    │
+│    Encrypted: per-client X25519+KEM auth        │
+│  Intro points with vanguards (L2/L3)            │
+│  Rendezvous: hybrid X25519+KEM e2e             │
+│  PoW: Argon2id (anti-DoS)                       │
+│  DHT: BLAKE2b ring, PIR fetch                   │
+├─────────────────────────────────────────────────┤
+│  TRANSPORT LAYER (pluggable)                     │
+│  ShitStorm — Chrome 130 TLS 1.3 camouflage     │
+│  Scramble — entropy evasion                      │
+│  Shade — Elligator2 statistical evasion          │
+│  Mirage — TLS 1.3 protocol evasion              │
+│  WebWTF — WebRTC UDP camouflage (planned)       │
+└─────────────────────────────────────────────────┘
+```
+
+### Key Sizes
+
+```
+KEY                         CLASSICAL    PQ              WIRE TOTAL
+────────────────────────────────────────────────────────────────────
+Identity public key         32 (Ed25519) 1952 (ML-DSA)   1984 bytes
+Identity secret key         64 (Ed25519) 4032 (ML-DSA)   4096 bytes
+Identity signature          64 (Ed25519) 3309 (ML-DSA)   3373 bytes
+Onion public key            32 (X25519)  1184 (ML-KEM)   1216 bytes
+KEM ciphertext              —            1088 (ML-KEM)   1088 bytes
+KEM shared secret           —            32 (ML-KEM)     32 bytes
+Link handshake msg1         80 (Noise)   —               80 bytes
+Link handshake msg2         48 (Noise)   —               48 bytes
+Link PQ exchange            1184 (pk)    1088 (ct)       2272 bytes
+Circuit CREATE              64 (CKE)     —               64 bytes
+Circuit CREATED             64 (CKE)     —               64 bytes
+Circuit KEM CT              —            1088 (3 cells)  1088 bytes
+Cell (plaintext)            514          —               514 bytes
+Cell (wire, AEAD)           532          —               532 bytes
+HS descriptor (encrypted)   ~2-4 KB      —               ~4 KB padded
+Consensus (3 relays)        ~15 KB       —               ~15 KB
+```
+
+### Circuit Build — PQ Hybrid (Non-Blocking)
+
+```
+                    CLIENT                GUARD               MIDDLE              EXIT
+                      |                    |                    |                   |
+  1. Noise_IK ───────>|                    |                    |                   |
+     (X25519 DH)      |<──── Noise_IK ────|                    |                   |
+                      |                    |                    |                   |
+  2. KEM_PK ─────────>|                    |                    |                   |
+     (ML-KEM-768)     |<──── KEM_CT ──────|                    |                   |
+                      |                    |                    |                   |
+     Link keys = HKDF(noise_shared, kem_shared)                |                   |
+                      |                    |                    |                   |
+  3. CREATE_PQ ──────>|                    |                    |                   |
+     (eph_pk + id)    |<── CREATED_PQ ────|                    |                   |
+                      |                    |                    |                   |
+  4. KEM_CT cells ───>|                    |                    |                   |
+     (1088 bytes)     |                    |                    |                   |
+                      |                    |                    |                   |
+     Hop 0 keys = BLAKE2b(cke_seed || kem_ss)                  |                   |
+                      |                    |                    |                   |
+  5. EXTEND_PQ ──────>|── async worker ──>|                    |                   |
+     (via RELAY_EARLY) |   (connect+CKE)   |<── CREATED_PQ ───|                   |
+                      |<── EXTENDED_PQ ───|                    |                   |
+                      |                    |                    |                   |
+  6. KEM_OFFER ──────>|────── forward ───>|                    |                   |
+     (via relay cells) |                   |── KEM_CT cells ──>|                   |
+                      |                    |                    |                   |
+     Hop 1 keys = BLAKE2b(cke_seed || kem_ss)                  |                   |
+                      |                    |                    |                   |
+  7. EXTEND_PQ ──────>|────── forward ───>|────── forward ───>|                   |
+                      |                    |                    |<── CREATED_PQ ───|
+                      |<── EXTENDED_PQ ───|<── EXTENDED_PQ ───|                   |
+                      |                    |                    |                   |
+  8. KEM_OFFER ──────>|────── forward ───>|────── forward ───>|                   |
+                      |                    |                    |── KEM_CT cells ──>|
+                      |                    |                    |                   |
+     Hop 2 keys = BLAKE2b(cke_seed || kem_ss)                  |                   |
+                      |                    |                    |                   |
+     CIRCUIT READY: 3 hops, all PQ hybrid                      |                   |
+
+  All EXTENDs use async worker threads (never block event loop).
+  Fast path: reuse existing channel, send CREATE_PQ, set extend_pending.
+  Slow path: worker thread does blocking connect + Noise_IK + CREATE_PQ.
+```
+
+### Hidden Service — PQ End-to-End
+
+```
+DESCRIPTOR ENCRYPTION (two layers, both PQ):
+
+  Layer 1 (Superencrypted):
+    key = SHAKE-256(blinded_pk || subcredential || revision || salt || "pqor-desc-super")
+    AES-256-CTR encrypt + BLAKE2b MAC
+    Contains: auth client entries (per-client ML-KEM sealed cookies)
+
+  Layer 2 (Encrypted):
+    key = SHAKE-256(blinded_pk || descriptor_cookie || salt || "pqor-desc-inner")
+    AES-256-CTR encrypt + BLAKE2b MAC
+    Contains: intro points (with ML-KEM public keys), PoW params
+
+  Per-Client Authorization:
+    Service generates ephemeral X25519 + ML-KEM keypair per descriptor
+    Per client: cookie = AES(DH(client_pk, eph_sk) + KEM(client_kem_pk, eph_kem_sk))
+    Client decrypts: DH(client_sk, eph_pk) + KEM_Decaps(ct, client_kem_sk) → cookie
+    Cookie unlocks inner layer
+
+RENDEZVOUS (PQ e2e):
+  1. Client builds RP circuit (3 PQ hybrid hops)
+  2. Client sends INTRODUCE1 to intro point:
+     - Encrypted with: DH(client_eph, intro_onion_pk) + KEM(intro_kem_pk)
+     - Contains: RP address, cookie, client_eph_pk, client_kem_pk
+  3. Service builds circuit to RP (3 PQ hybrid hops)
+  4. Service sends RENDEZVOUS1:
+     - DH(service_eph, client_eph_pk) → classical shared
+     - KEM_Encaps(client_kem_pk) → PQ shared
+     - e2e_key = BLAKE2b(classical || pq)
+  5. 6-hop tunnel: client(3) + service(3), all PQ at every hop
+```
+
+### Consensus — PQ Signed
+
+```
+DUAL SIGNATURES ON EVERY CONSENSUS:
+
+  directory-signature <b64(da_ed25519_pk)> <b64(ed25519_sig)>
+  pq-directory-signature <b64(da_ed25519_pk)>
+  <b64(mldsa_pk)>     (1952 bytes, ML-DSA-65)
+  <b64(mldsa_sig)>    (3309 bytes, ML-DSA-65)
+
+  Verification: BOTH signatures must verify.
+  Threshold: >50% of DAs (same as Tor).
+
+RELAY DESCRIPTORS:
+  Signed with Ed25519 (classical) + ML-DSA-65 (PQ).
+  Include: ML-KEM-768 public key for PQ circuit creation.
+  Cross-certification: Ed25519 identity → ML-DSA identity binding.
+
+5-PHASE VOTING (Tor-aligned):
+  Phase 1: Each DA generates vote, signs with Ed25519 + ML-DSA-65
+  Phase 2: Fetch missing votes
+  Phase 3: Compute consensus (aggregate flags, bandwidth, SRV)
+  Phase 4: Exchange signatures (both classical + PQ)
+  Phase 5: Publish when threshold met for BOTH signature types
+```
+
+### Design Decisions from Tor Analysis
+
+```
+DECISION                              TOR PATTERN                 PQOR IMPLEMENTATION
+──────────────────────────────────────────────────────────────────────────────────────
+Circuit cleanup                       Deferred (mark then free)   Same. Never free inline.
+Connection death                      Immediate circuit cleanup   Same. channel_close → unlink all.
+DoS limiting                          Rate-based token buckets    Same. No absolute per-IP counters.
+Guard selection                       Prop 271 sampled/primary    Same. Persisted, 120-day rotation.
+Path bias                             Build + stream tracking     Same. Disable guard at 30% build rate.
+Circuit pool                          14 prebuilt                 Same. Async non-blocking builder.
+EXTEND                                Async worker thread         Same. Never block event loop.
+Consensus params                      All tuning via consensus    Same. No hardcoded magic numbers.
+Crypto offload                        Worker threadpool           Same. CKE + KEM in worker.
+OOM handling                          Kill by queue depth         Same. Per-circuit queue limit 2500.
+Hibernation                           Soft → hard → dormant      Same. Graduated shutdown.
+Scheduler                             EWMA-weighted per circuit   Implement. Currently FIFO.
+Cell format                           Fixed 514 bytes             Same. Prevents length fingerprinting.
+SENDME auth                           20-byte digest              Same. BLAKE2b truncated.
+Padding                               WTF-PAD state machines      Same. Consensus-configurable.
+HS descriptor                         Two encryption layers       Same. Both layers PQ-sealed.
+DNS at exit                           Hijack detection            Implement. Test known-good/bad hosts.
+Config reload                         SIGHUP → do_hup()          Same. Reload config, re-register.
+Graceful shutdown                     DESTROY cells for relays    Same. Client relies on TCP RST.
+```
+
+### What PQOR Adds Beyond Tor
+
+```
+1. PQ-NATIVE: Every key exchange hybrid from day one. No classical-only mode.
+   Tor is retrofitting PQ (ntor_v3 + CGO). PQOR was born PQ.
+
+2. PLUGGABLE TRANSPORTS BUILT-IN: ShitStorm, Scramble, Shade, Mirage, WebWTF.
+   Tor uses external PT processes (Prop 180). PQOR embeds transports in the binary.
+   Pro: no external process management. Con: larger binary, harder to update.
+
+3. NOISE_IK LINK HANDSHAKE: Tor uses TLS with X.509 certificates.
+   PQOR uses Noise_IK (formally analyzed) + ML-KEM-768 post-handshake.
+   Smaller handshake (128 bytes vs TLS multi-RTT). No certificate chains.
+   Trade-off: no revocation mechanism (identity keys are permanent).
+
+4. SINGLE BINARY: Client, relay, DA, HS, bridge, BridgeDB all in one.
+   Tor separates BridgeDB (Python), sbws (Python), OnionBalance (Python).
+   PQOR implements everything in C. Simpler deployment.
+
+5. BLAKE2b EVERYWHERE: Tor uses SHA-1 (legacy), SHA-256, SHA3-256, SHAKE-256
+   depending on context. PQOR uses BLAKE2b for all hashing (via libsodium).
+   Exception: SHAKE-256 XOF for key expansion where variable output needed.
+
+6. NO RSA: Tor still supports RSA-1024 (TAP), RSA-2048 (TLS certs), RSA
+   identity keys. PQOR has zero RSA. Ed25519 + ML-DSA-65 only.
+
+7. ELLIGATOR2: Key material in transports is indistinguishable from random.
+   Tor relies on external PTs for this. PQOR builds it into Shade + ShitStorm.
+```
+
+### File Layout (Target)
+
+```
+src/
+  main.c              — Entry point, CLI, mode dispatch, event loop setup
+  log.c               — Leveled logging (DEBUG/INFO/WARN/ERROR)
+  crypto.c            — Ed25519, X25519, ChaCha20-Poly1305, BLAKE2b, HKDF
+  kem.c               — ML-KEM-768 wrapper (keygen, encaps, decaps)
+  sig.c               — ML-DSA-65 wrapper (keygen, sign, verify)
+  cell.c              — 514-byte cell pack/unpack, relay payload, digest
+  connection.c        — TCP, Noise_IK+KEM handshake, AEAD cell I/O, pool
+  channel.c           — Channel state machine, identity lookup, mux dispatch
+  circuit.c           — Pool, async builder, CKE+KEM, path select, guards,
+                        CBT, path bias, CC (Vegas), padding, conflux
+  relay.c             — Cell forwarding, async EXTEND, exit, DoS, queue limits
+  directory.c         — DA voting, consensus build, SRV, relay registration
+  socks5.c            — SOCKS5 proxy, stream isolation, prebuilt pool
+  hidden_service.c    — HS server+client, descriptor encrypt, intro, rendezvous
+  dht.c               — DHT for HS descriptors, PIR
+  node.c              — Descriptor serialize/parse/sign/verify
+  config.c            — Config file parser, exit policy
+  event.c             — epoll/select event loop, timers
+  transport.c         — PT registry
+  transport_scramble.c — Scramble transport
+  transport_shade.c   — Shade transport
+  transport_mirage.c  — Mirage transport
+  transport_shitstorm.c — ShitStorm transport
+  geoip.c             — IP-to-country, path diversity
+  fragment.c          — Cell fragmentation (KEM data)
+  pow.c               — Argon2id proof-of-work
+  padding_adv.c       — Constant-rate + adaptive padding
+  wfpad.c             — WTF-PAD state machines
+  mix.c               — Poisson mixing
+  conflux.c           — Multi-path circuit bonding
+  bw_auth.c           — Bandwidth authority measurement
+  ratelimit.c         — Token bucket rate limiting
+  scheduler.c         — Cell output scheduling (implement EWMA)
+  monitor.c           — Control port (Tor-compatible protocol)
+  dns_cache.c         — Exit DNS cache with TTL
+  bootstrap.c         — Progress reporting
+  transparent.c       — TransPort + DNSPort
+  addressmap.c        — Virtual IP mapping for .pqor addresses
+  onionbalance.c      — HS load balancing
+  bridgedb.c          — Bridge distribution
+  bridge_auth.c       — Bridge authority
+  exit_sla.c          — Exit relay SLA monitoring
+  crypto_worker.c     — Threadpool for CKE+KEM offload
+  sandbox.c           — seccomp-bpf syscall whitelist
+
+  kyber/              — Vendored ML-KEM-768 reference
+  dilithium/          — Vendored ML-DSA-65 reference
+
+include/pqor/
+  pqor.h              — Version, constants, mode enum, flags
+  limits.h            — All capacity/timing/protocol limits
+  cell.h              — Cell commands, relay commands, structs
+  [module].h          — Per-module public API
+
+tests/
+  test_*.c            — Per-module tests
+  fuzz/               — libFuzzer harnesses
+```
+
+### Migration from MOOR
+
+```
+1. Rename: MOOR → PQOR everywhere (binary, config, addresses: .pqor)
+2. Keep all current code — it already implements hybrid PQ
+3. Fix the DA snapshot bug (published_snapshot not updated after PUBLISH)
+4. Implement deferred circuit close (THE #1 Tor pattern we're missing)
+5. Implement EWMA circuit scheduling (replace FIFO)
+6. Add DNS hijack detection at exit
+7. Add soft hibernation state
+8. Make all consensus parameters configurable (not hardcoded)
+9. Add Prometheus metrics endpoint
+10. Formal security audit of hybrid constructions
+```
