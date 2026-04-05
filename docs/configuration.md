@@ -561,4 +561,26 @@ Every key accepted in a config file, listed alphabetically:
 | `TransPort` | port | 0 | `--TransPort` |
 | `UseBridges` | 0/1 | 0 | `--use-bridges` / `--UseBridges` |
 | `UseMicrodescriptors` | 0/1 | 0 | |
+| `Enclave` | path | | `--enclave` |
 | `Verbose` | 0/1 | 0 | `-v` |
+
+## Enclaves
+
+An enclave is an independent MOOR network with its own directory authorities. The `--enclave <file>` flag replaces the hardcoded DA list entirely.
+
+**Enclave file format** (one DA per line):
+
+```
+# mynetwork.enclave
+1.2.3.4:9030 <hex_ed25519_pk>
+5.6.7.8:9030 <hex_ed25519_pk>
+[2001:db8::1]:9030 <hex_ed25519_pk>     # IPv6 with bracket notation
+```
+
+**Generate DA keys:**
+
+```bash
+moor --keygen-enclave --advertise 1.2.3.4 --data-dir /var/lib/moor
+```
+
+Generates Ed25519 + ML-DSA-65 + Curve25519 keys, prints the enclave file line.

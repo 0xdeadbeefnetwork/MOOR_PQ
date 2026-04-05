@@ -26,9 +26,9 @@ Five pluggable transports for censorship circumvention:
 
 ### ShitStorm (recommended)
 
-Makes MOOR traffic look like Chrome 130 doing TLS 1.3 to a CDN. A DPI box cannot block it without blocking Chrome.
+Makes MOOR traffic look like Chrome 146 doing TLS 1.3 to a CDN. A DPI box cannot block it without blocking Chrome.
 
-- Chrome 130 JA4 fingerprint — real ECH GREASE, 15 cipher suites, Fisher-Yates shuffled extensions
+- Chrome 146 JA4 fingerprint — real ECH GREASE, 15 cipher suites, Fisher-Yates shuffled extensions
 - Elligator2 key material — x25519 key_share indistinguishable from random
 - Double AEAD — outer ChaCha20-Poly1305 (TLS records) + inner ChaCha20-Poly1305 (length obfuscation)
 - HTTP/2 framing — h2 connection preface + SETTINGS + DATA frames
@@ -53,6 +53,10 @@ Statistical evasion. Elligator2 constant-time key generation with IAT obfuscatio
 
 Protocol evasion. Full TLS 1.3 record framing with real x25519 key_share, configurable SNI, session_id HMAC for probe resistance.
 
+### Speakeasy
+
+SSH camouflage. MOOR traffic inside an SSH session with real banner exchange, KEX, and encrypted channel framing. Blocking it means blocking SSH.
+
 ### WebWTF (in design)
 
 UDP-based WebRTC video call camouflage. STUN + DTLS + SRTP with Opus/VP8 payload types. MOOR cells hidden inside media packets. Blocking it means blocking Zoom, Meet, and Discord. See [docs/webwtf-design.md](docs/webwtf-design.md).
@@ -66,6 +70,7 @@ UDP-based WebRTC video call camouflage. STUN + DTLS + SRTP with Opus/VP8 payload
 | HS end-to-end | X25519 + Kyber768 (post-handshake KEM) | Client to hidden service |
 | Onion encryption | ChaCha20 (PQ hybrid derived keys) | Data through the circuit |
 | Consensus signatures | Ed25519 + ML-DSA-65 (Dilithium3) | Relay directory integrity |
+| Onion keys | Curve25519 + Kyber768 hybrid | Circuit static DH (28-day rotation) + KEM |
 | Identity keys | Ed25519 | Relay and service identity |
 | KEM | ML-KEM-768 (Kyber768) | Post-quantum key encapsulation (NIST Level 3) |
 | PQ signatures | ML-DSA-65 (Dilithium3) | Post-quantum signature verification |
@@ -89,6 +94,7 @@ Host a `.moor` service reachable only through the network:
 ./moor --mode hs --hs-dir ./hs_keys --hs-port 8080 -v
 ```
 
+- **PQ-committed .moor addresses** — Kyber768 public key hash baked into the address. Even if Ed25519 is broken, the service cannot be impersonated.
 - 6-hop tunnel (3 client + 3 service) with PQ hybrid end-to-end encryption
 - PIR for anonymous descriptor lookups (storage relay cannot learn which service you requested)
 - Vanguard relays protect against guard discovery
@@ -106,6 +112,29 @@ Host a `.moor` service reachable only through the network:
 - **Argon2id PoW** — memory-hard proof-of-work for DoS protection
 - **Connection reaper** — TCP keepalive + idle connection cleanup
 - **seccomp sandbox** — PR_SET_NO_NEW_PRIVS, rlimits, dumpable=0
+
+## Enclaves (independent networks)
+
+Anyone can spin up a fully independent MOOR network. No recompile. Just a text file.
+
+```bash
+# Generate DA keys on each host
+host1$ moor --keygen-enclave --advertise 1.2.3.4 --data-dir /var/lib/moor
+host2$ moor --keygen-enclave --advertise 5.6.7.8 --data-dir /var/lib/moor
+
+# Combine into an enclave file
+cat > mynet.enclave <<EOF
+1.2.3.4:9030 <hex_pk_from_host1>
+5.6.7.8:9030 <hex_pk_from_host2>
+EOF
+
+# All nodes use the same file
+moor --mode da --enclave mynet.enclave --advertise 1.2.3.4
+moor --mode relay --enclave mynet.enclave
+moor --enclave mynet.enclave  # client
+```
+
+Separate DAs, separate consensus, separate relays. Your own island.
 
 ## Quick start
 

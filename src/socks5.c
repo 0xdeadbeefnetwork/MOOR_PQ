@@ -101,13 +101,14 @@ static void extend_dispatch_cell(moor_connection_t *conn, moor_cell_t *cell);
 static const char *extract_domain(const char *addr);
 
 /* ---- Prebuilt circuit pool (non-blocking, main-thread) ----
- * Replaces the builder thread with a timer-driven async builder.
+ * Timer-driven async builder using channel-based multiplexing.
  * All circuit building happens on the main event loop thread via
- * moor_circuit_build_async() state machine.  Connections are naturally
- * shared via moor_connection_find_by_identity() (single-threaded). */
+ * moor_circuit_build_async() which routes through channels:
+ * multiple circuits share one channel (= one encrypted connection)
+ * to the guard, with EWMA fair scheduling via circuitmux. */
 
-#define PREBUILT_POOL_SIZE 14   /* Tor: MAX_UNUSED_OPEN_CIRCUITS = 14 */
-#define MAX_CONCURRENT_BUILDS 3
+#define PREBUILT_POOL_SIZE 128  /* No artificial limit — circuits are cheap with channels */
+#define MAX_CONCURRENT_BUILDS 8 /* More concurrent builds since they share one connection */
 
 typedef struct {
     moor_circuit_t  *circuit;
@@ -255,7 +256,11 @@ static void prebuilt_timer_cb(void *arg) {
 
     if (g_client_consensus.num_relays < 3) return;
     if (g_inflight_builds >= MAX_CONCURRENT_BUILDS) return;
-    if (g_prebuilt_pool_count + g_inflight_builds >= PREBUILT_POOL_SIZE) return;
+    /* Tor-aligned: keep PREEMPTIVE_MIN clean circuits, not a hard max.
+     * The pool CAN grow beyond this if on-demand builds push into it,
+     * but the timer only proactively builds to maintain the minimum. */
+    if (g_prebuilt_pool_count + g_inflight_builds >= MOOR_PREEMPTIVE_MIN) return;
+    if (g_prebuilt_pool_count >= PREBUILT_POOL_SIZE) return; /* OOM safety */
 
     moor_connection_t *conn = moor_connection_alloc();
     moor_circuit_t *circ = moor_circuit_alloc();
@@ -330,6 +335,15 @@ static prebuilt_entry_t *prebuilt_pop(void) {
 
 /* Complete a pending HS connect after RENDEZVOUS2 received */
 static void hs_pending_complete(hs_pending_connect_t *pending) {
+    /* Validate circuit and connection are still alive — they could have
+     * been destroyed by a timer or teardown since RENDEZVOUS2 arrived. */
+    if (!pending->rp_circ || pending->rp_circ->circuit_id == 0 ||
+        !pending->rp_conn || pending->rp_conn->state != CONN_STATE_OPEN) {
+        LOG_WARN("HS: rp circuit/conn died before complete (addr=%s)",
+                 pending->address);
+        hs_pending_fail(pending);
+        return;
+    }
     /* Cache the circuit */
     if (g_circuit_cache_count < MAX_CIRCUIT_CACHE) {
         circuit_cache_entry_t *ce = &g_circuit_cache[g_circuit_cache_count++];
@@ -568,7 +582,13 @@ static void hs_check_timeouts(void) {
 
 int moor_is_moor_address(const char *addr) {
     size_t len = strlen(addr);
-    return (len > 5 && strcmp(addr + len - 5, ".moor") == 0);
+    if (len > 5 && strcmp(addr + len - 5, ".moor") == 0)
+        return 1;
+    /* Tor .onion addresses: route through HS path, NEVER to exit relays.
+     * Sending .onion to an exit leaks the address and always fails. */
+    if (len > 6 && strcmp(addr + len - 6, ".onion") == 0)
+        return 1;
+    return 0;
 }
 
 /* Extract base domain (eTLD+1) from hostname for circuit isolation.
@@ -635,22 +655,19 @@ static void circuit_cache_evict_oldest(void) {
         moor_connection_send_cell(oldest->circuit->conn, &dcell);
     }
 
-    /* Invalidate SOCKS clients, then destroy circuits.
-     * moor_circuit_destroy handles connection closure via refcount. */
+    /* Destroy circuits directly — do NOT call moor_socks5_invalidate_circuit
+     * here because it does swap-with-last compaction on g_circuit_cache,
+     * and the memmove below would then double-compact (cache corruption). */
     for (int j = 0; j < oldest->num_extra; j++) {
-        if (oldest->extra_circuits[j]) {
-            moor_socks5_invalidate_circuit(oldest->extra_circuits[j]);
+        if (oldest->extra_circuits[j])
             moor_circuit_destroy(oldest->extra_circuits[j]);
-        }
     }
     if (oldest->conflux) {
         moor_conflux_free(oldest->conflux);
         oldest->conflux = NULL;
     }
-    if (oldest->circuit) {
-        moor_socks5_invalidate_circuit(oldest->circuit);
+    if (oldest->circuit)
         moor_circuit_destroy(oldest->circuit);
-    }
     memmove(&g_circuit_cache[0], &g_circuit_cache[1],
             sizeof(circuit_cache_entry_t) * (MAX_CIRCUIT_CACHE - 1));
     g_circuit_cache_count--;
@@ -831,12 +848,11 @@ static int process_circuit_cell(moor_connection_t *conn, moor_cell_t *cell) {
                 cell->circuit_id == g_prebuilt_pool[pi].circuit->circuit_id) {
                 LOG_WARN("CELL_DESTROY for prebuilt circuit %u, "
                          "removing from pool", cell->circuit_id);
-                int was_last = (conn->circuit_refcount <= 1);
                 moor_circuit_destroy(g_prebuilt_pool[pi].circuit);
-                /* Swap with last entry to keep pool contiguous */
                 g_prebuilt_pool[pi] =
                     g_prebuilt_pool[--g_prebuilt_pool_count];
-                if (was_last) return 1;
+                /* Don't return 1 — destroy is deferred, connection stays alive.
+                 * Other circuits on this connection can still receive cells. */
                 break;
             }
         }
@@ -1104,10 +1120,12 @@ static int process_circuit_cell(moor_connection_t *conn, moor_cell_t *cell) {
  * lost DESTROY cells that cause stale circuits and cascading failures. */
 static void extend_dispatch_cell(moor_connection_t *conn, moor_cell_t *cell) {
     if (process_circuit_cell(conn, cell) == 1) {
-        /* Should never happen: building circuit holds a refcount.
-         * Log for diagnostics but don't propagate — caller's recv loop
-         * will detect the dead connection on next recv_cell. */
-        LOG_ERROR("CRITICAL: inline dispatch freed connection during build");
+        /* Building circuit holds a refcount so this should never happen.
+         * If it does, the conn is freed and continuing is UAF — crash now
+         * with full diagnostics instead of corrupting memory silently. */
+        MOOR_ASSERT_MSG(0,
+            "inline dispatch freed connection during build (conn=%p fd=%d)",
+            (void*)conn, conn->fd);
     }
 }
 
@@ -1122,14 +1140,19 @@ static void circuit_read_cb(int fd, int events, void *arg) {
      * Without this, queued cells accumulate until the 256-cell limit
      * and all subsequent sends are dropped. */
     if (events & MOOR_EVENT_WRITE) {
+        /* Flush connection output queue (both KIST and direct cells share it) */
         moor_queue_flush(&conn->outq, conn, &conn->write_off);
-        if (moor_queue_is_empty(&conn->outq))
-            moor_event_modify(conn->fd, MOOR_EVENT_READ);
 
-        /* Resume any SOCKS5 clients that were paused due to backpressure.
-         * Now that the queue has space, re-enable reading from their fds
-         * so the kernel can deliver buffered TCP data. No bytes are lost. */
-        if (moor_queue_count(&conn->outq) < (MOOR_CELL_QUEUE_SIZE / 2)) {
+        if (moor_queue_is_empty(&conn->outq)) {
+            moor_event_modify(conn->fd, MOOR_EVENT_READ);
+            /* Re-schedule channel if circuits still have queued cells */
+            moor_channel_t *flush_chan = moor_channel_find_by_conn(conn);
+            if (flush_chan && moor_circuitmux_total_queued(flush_chan) > 0)
+                moor_kist_channel_wants_writes(flush_chan);
+        }
+
+        /* Resume any SOCKS5 clients that were paused due to backpressure */
+        if (moor_queue_count(&conn->outq) < (256)) {
             for (int ci = 0; ci < MAX_SOCKS5_CLIENTS; ci++) {
                 moor_socks5_client_t *sc = &g_socks5_clients[ci];
                 if (sc->client_fd < 0) continue;
@@ -1153,6 +1176,8 @@ static void circuit_read_cb(int fd, int events, void *arg) {
     while (count < 64 && (ret = moor_connection_recv_cell(conn, &cell)) == 1) {
         if (process_circuit_cell(conn, &cell))
             return; /* connection was freed (last circuit destroyed) */
+        /* Bail if conn died mid-batch (destroy cascade) */
+        if (conn->state != CONN_STATE_OPEN) return;
         count++;
     }
 
@@ -1160,17 +1185,15 @@ static void circuit_read_cb(int fd, int events, void *arg) {
         LOG_ERROR("guard connection lost (fd=%d)", conn->fd);
 
         /* Connection is dead -- clean up all circuits and SOCKS5 clients
-         * using it.  Use moor_circuit_free (not destroy) because:
-         * 1. The connection is already dead, no point sending DESTROY cells
-         * 2. moor_circuit_destroy could close the conn (refcount→0),
-         *    causing double-free when we close it below */
-        for (int i = 0; i < g_circuit_cache_count; i++) {
+         * using it.  Do NOT call moor_socks5_invalidate_circuit here —
+         * it does swap-with-last compaction on g_circuit_cache which
+         * corrupts our iteration.  Clean up inline instead. */
+        for (int i = g_circuit_cache_count - 1; i >= 0; i--) {
             circuit_cache_entry_t *e = &g_circuit_cache[i];
             int affected = 0;
 
             if (e->conn == conn) {
                 if (e->circuit) {
-                    moor_socks5_invalidate_circuit(e->circuit);
                     moor_circuit_free(e->circuit);
                     e->circuit = NULL;
                 }
@@ -1181,7 +1204,6 @@ static void circuit_read_cb(int fd, int events, void *arg) {
             for (int j = 0; j < e->num_extra; j++) {
                 if (e->extra_conns[j] == conn) {
                     if (e->extra_circuits[j]) {
-                        moor_socks5_invalidate_circuit(e->extra_circuits[j]);
                         moor_circuit_free(e->extra_circuits[j]);
                         e->extra_circuits[j] = NULL;
                     }
@@ -1193,6 +1215,28 @@ static void circuit_read_cb(int fd, int events, void *arg) {
             if (affected && e->conflux) {
                 moor_conflux_free(e->conflux);
                 e->conflux = NULL;
+            }
+
+            /* Remove dead entries (no primary circuit and no live extras) */
+            if (affected && !e->circuit) {
+                int has_live = 0;
+                for (int j = 0; j < e->num_extra; j++)
+                    if (e->extra_circuits[j]) { has_live = 1; break; }
+                if (!has_live) {
+                    g_circuit_cache[i] = g_circuit_cache[--g_circuit_cache_count];
+                }
+            }
+        }
+        /* Clean up SOCKS5 clients bound to circuits on this connection */
+        for (int s = 0; s < MAX_SOCKS5_CLIENTS; s++) {
+            if (g_socks5_clients[s].client_fd >= 0 &&
+                g_socks5_clients[s].circuit &&
+                g_socks5_clients[s].circuit->conn == conn) {
+                moor_event_remove(g_socks5_clients[s].client_fd);
+                close(g_socks5_clients[s].client_fd);
+                g_socks5_clients[s].client_fd = -1;
+                g_socks5_clients[s].circuit = NULL;
+                g_socks5_clients[s].stream_id = 0;
             }
         }
 
@@ -1278,7 +1322,7 @@ int moor_socks5_start(const moor_socks5_config_t *config) {
     int have_cons = 0;
     if (g_config.data_dir[0] &&
         moor_consensus_cache_load(&g_client_consensus, g_config.data_dir) == 0 &&
-        moor_consensus_is_fresh(&g_client_consensus)) {
+        moor_consensus_is_valid(&g_client_consensus)) {
         LOG_INFO("using cached consensus");
         have_cons = 1;
     }
@@ -1711,11 +1755,12 @@ int moor_socks5_handle_client(moor_socks5_client_t *client) {
     if ((client->state == SOCKS5_STATE_CONNECTED ||
          client->state == SOCKS5_STATE_STREAMING) &&
         client->circuit && client->circuit->conn &&
+        client->circuit->conn->state == CONN_STATE_OPEN &&
         moor_queue_count(&client->circuit->conn->outq) >
-            (MOOR_CELL_QUEUE_SIZE * 3 / 4)) {
+            (384)) {
         LOG_DEBUG("backpressure: output queue %d/%d, pausing client fd=%d (pre-recv)",
                   moor_queue_count(&client->circuit->conn->outq),
-                  MOOR_CELL_QUEUE_SIZE, client->client_fd);
+                  384, client->client_fd);
         moor_event_remove(client->client_fd);
         client->paused = 1;
         return 0; /* data stays in kernel buffer, read when resumed */
@@ -1774,11 +1819,13 @@ int moor_socks5_forward_to_circuit(moor_socks5_client_t *client,
      * buffer fills up, the sender's TCP window closes, and the
      * application naturally slows down.  NO DATA IS DROPPED.
      * The queue flush callback re-enables reading when space opens up. */
-    if (moor_queue_count(&client->circuit->conn->outq) >
-        (MOOR_CELL_QUEUE_SIZE * 3 / 4)) {
+    if (client->circuit->conn &&
+        client->circuit->conn->state == CONN_STATE_OPEN &&
+        moor_queue_count(&client->circuit->conn->outq) >
+        (384)) {
         LOG_DEBUG("backpressure: output queue %d/%d, pausing client fd=%d",
                   moor_queue_count(&client->circuit->conn->outq),
-                  MOOR_CELL_QUEUE_SIZE, client->client_fd);
+                  384, client->client_fd);
         moor_event_remove(client->client_fd);
         client->paused = 1;
         return 0; /* data already in kernel buffer, will be read when resumed */
@@ -1908,6 +1955,14 @@ void moor_socks5_resume_reads(moor_circuit_t *circ) {
 void moor_socks5_invalidate_circuit(moor_circuit_t *circ) {
     if (!circ) return;
 
+    /* Prebuilt pool: NULL matching circuit entries */
+    for (int i = 0; i < g_prebuilt_pool_count; i++) {
+        if (g_prebuilt_pool[i].circuit == circ) {
+            g_prebuilt_pool[i].circuit = NULL;
+            g_prebuilt_pool[i].conn = NULL;
+        }
+    }
+
     /* Clean up SOCKS5 clients bound to this circuit */
     for (int s = 0; s < MAX_SOCKS5_CLIENTS; s++) {
         if (g_socks5_clients[s].client_fd >= 0 &&
@@ -1917,6 +1972,14 @@ void moor_socks5_invalidate_circuit(moor_circuit_t *circ) {
             g_socks5_clients[s].client_fd = -1;
             g_socks5_clients[s].circuit = NULL;
             g_socks5_clients[s].stream_id = 0;
+        }
+    }
+
+    /* NULL out HS pending entries so freed circuits aren't dereferenced
+     * when hs_pending_complete fires. */
+    for (int i = 0; i < MAX_HS_PENDING; i++) {
+        if (g_hs_pending[i].active && g_hs_pending[i].rp_circ == circ) {
+            g_hs_pending[i].rp_circ = NULL;
         }
     }
 
@@ -1955,6 +2018,34 @@ void moor_socks5_invalidate_circuit(moor_circuit_t *circ) {
                 i--; /* re-check swapped entry */
             }
         }
+    }
+}
+
+/* NULL out connection pointers in prebuilt pool, circuit cache, and
+ * HS pending entries.  Called from moor_connection_free() before poisoning. */
+void moor_socks5_nullify_conn(moor_connection_t *conn) {
+    if (!conn) return;
+
+    /* Prebuilt pool: NULL conn so prebuilt_pop() discards dead entries */
+    for (int i = 0; i < g_prebuilt_pool_count; i++) {
+        if (g_prebuilt_pool[i].conn == conn)
+            g_prebuilt_pool[i].conn = NULL;
+    }
+
+    /* Circuit cache: NULL conn and extra_conns */
+    for (int i = 0; i < g_circuit_cache_count; i++) {
+        circuit_cache_entry_t *e = &g_circuit_cache[i];
+        if (e->conn == conn) e->conn = NULL;
+        for (int j = 0; j < e->num_extra; j++) {
+            if (e->extra_conns[j] == conn)
+                e->extra_conns[j] = NULL;
+        }
+    }
+
+    /* HS pending: NULL rp_conn so hs_pending_complete validates */
+    for (int i = 0; i < MAX_HS_PENDING; i++) {
+        if (g_hs_pending[i].active && g_hs_pending[i].rp_conn == conn)
+            g_hs_pending[i].rp_conn = NULL;
     }
 }
 

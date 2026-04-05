@@ -208,6 +208,7 @@ int moor_consensus_cache_save(const moor_consensus_t *cons,
 int moor_consensus_cache_load(moor_consensus_t *cons,
                                const char *data_dir);
 int moor_consensus_is_fresh(const moor_consensus_t *cons);
+int moor_consensus_is_valid(const moor_consensus_t *cons);
 
 /* Client-side: fetch consensus with fallback directory servers */
 int moor_client_fetch_consensus_fallback(moor_consensus_t *cons,

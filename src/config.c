@@ -416,7 +416,7 @@ int moor_config_set(moor_config_t *cfg, const char *key, const char *value) {
         cfg->exit_policy.rules[cfg->exit_policy.num_rules++] = rule;
     }
     else if (strcmp(key, "HiddenServiceDir") == 0) {
-        if (cfg->num_hidden_services >= MOOR_MAX_HIDDEN_SERVICES) return -1;
+        if (cfg->num_hidden_services >= 64) return -1;
         int idx = cfg->num_hidden_services;
         snprintf(cfg->hidden_services[idx].hs_dir,
                  sizeof(cfg->hidden_services[idx].hs_dir), "%s", value);
@@ -694,6 +694,9 @@ int moor_config_set(moor_config_t *cfg, const char *key, const char *value) {
     else if (strcmp(key, "ContactInfo") == 0) {
         snprintf(cfg->contact_info, sizeof(cfg->contact_info), "%s", value);
     }
+    else if (strcmp(key, "Enclave") == 0) {
+        snprintf(cfg->enclave_file, sizeof(cfg->enclave_file), "%s", value);
+    }
     else {
         return -1;
     }
@@ -770,6 +773,110 @@ int moor_config_load(moor_config_t *cfg, const char *path) {
 
     fclose(f);
     LOG_INFO("config: loaded %s (%d lines)", path, lineno);
+    return 0;
+}
+
+/*
+ * Load an enclave file: independent MOOR network with its own DAs.
+ * Format (one DA per line):
+ *   address:port hex_identity_pk
+ * Lines starting with # are comments. Empty lines ignored.
+ * Returns 0 on success, -1 on error.
+ */
+int moor_enclave_load(moor_config_t *cfg, const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        LOG_ERROR("enclave: cannot open %s", path);
+        return -1;
+    }
+
+    /* Clear hardcoded DA list — enclave replaces it entirely */
+    memset(cfg->da_list, 0, sizeof(cfg->da_list));
+    cfg->num_das = 0;
+
+    char line[256];
+    int lineno = 0;
+    while (fgets(line, sizeof(line), f)) {
+        lineno++;
+        /* Strip trailing whitespace */
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r' ||
+                           line[len - 1] == ' '))
+            line[--len] = '\0';
+
+        /* Skip comments and blank lines */
+        if (line[0] == '#' || line[0] == '\0') continue;
+
+        if (cfg->num_das >= 9) {
+            LOG_WARN("enclave: max 9 DAs, ignoring line %d", lineno);
+            continue;
+        }
+
+        /* Parse: address:port hex_pk */
+        char addr_port[80] = {0};
+        char hex_pk[128] = {0};
+        if (sscanf(line, "%79s %127s", addr_port, hex_pk) < 1) continue;
+
+        /* Split address:port.  IPv6 uses bracket notation: [::1]:9030 */
+        char *port_str = NULL;
+        if (addr_port[0] == '[') {
+            /* IPv6: [addr]:port */
+            char *bracket = strchr(addr_port, ']');
+            if (!bracket) {
+                LOG_ERROR("enclave: line %d: unterminated IPv6 bracket", lineno);
+                fclose(f);
+                return -1;
+            }
+            if (bracket[1] == ':')
+                port_str = bracket + 2;
+            *bracket = '\0';
+            /* Skip leading '[' */
+            memmove(addr_port, addr_port + 1, strlen(addr_port + 1) + 1);
+        } else {
+            /* IPv4: addr:port */
+            char *colon = strrchr(addr_port, ':');
+            if (colon) {
+                *colon = '\0';
+                port_str = colon + 1;
+            }
+        }
+        if (!addr_port[0]) {
+            LOG_ERROR("enclave: line %d: empty address", lineno);
+            fclose(f);
+            return -1;
+        }
+        uint16_t port = port_str ? (uint16_t)atoi(port_str) : 0;
+        if (port == 0) port = MOOR_DEFAULT_DIR_PORT;
+
+        moor_da_entry_t *da = &cfg->da_list[cfg->num_das];
+        snprintf(da->address, sizeof(da->address), "%s", addr_port);
+        da->port = port;
+
+        /* Parse hex public key (optional — zero if not provided) */
+        if (hex_pk[0] && strlen(hex_pk) == 64) {
+            for (int i = 0; i < 32; i++) {
+                unsigned int b;
+                sscanf(hex_pk + i * 2, "%02x", &b);
+                da->identity_pk[i] = (uint8_t)b;
+            }
+        }
+
+        cfg->num_das++;
+    }
+
+    fclose(f);
+
+    if (cfg->num_das == 0) {
+        LOG_ERROR("enclave: no DAs found in %s", path);
+        return -1;
+    }
+
+    /* Update legacy single-DA fields for compat */
+    snprintf(cfg->da_address, sizeof(cfg->da_address), "%s",
+             cfg->da_list[0].address);
+    cfg->da_port = cfg->da_list[0].port;
+
+    LOG_INFO("enclave: loaded %d DAs from %s", cfg->num_das, path);
     return 0;
 }
 

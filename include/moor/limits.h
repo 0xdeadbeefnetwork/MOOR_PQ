@@ -27,14 +27,14 @@
 
 /* ===== INTERNAL -- Pools & Capacity ===== */
 #define MOOR_MAX_RELAYS         8192    /* Max relays in consensus */
-#define MOOR_MAX_CIRCUITS       1024    /* Max active circuits */
+/* Circuits: dynamically allocated, no hard cap (see circuit.c) */
 #define MOOR_MAX_CONNECTIONS    1024    /* Max TCP connections */
 #define MOOR_MAX_STREAMS        64      /* Max streams per circuit */
 #define MOOR_MAX_INTRO_POINTS   10      /* Max intro points per HS (Tor: 3-10) */
 #define MOOR_DEFAULT_INTRO_POINTS 6    /* Default intro points per HS (Tor default: 6) */
 #define MOOR_MAX_DA_AUTHORITIES 9       /* Max directory authorities */
 #define MOOR_MAX_EXIT_RULES     64      /* Max exit policy rules */
-#define MOOR_MAX_HIDDEN_SERVICES 8      /* Max HS instances per relay */
+/* No hard limit on hidden services — dynamically allocated (Tor-aligned) */
 #define MOOR_MAX_BRIDGES        8       /* Max bridges for client */
 #define MOOR_MAX_FALLBACKS      16      /* Max fallback DA servers */
 #define MOOR_MAX_TRANSPORTS     8       /* Max pluggable transports */
@@ -81,8 +81,8 @@
 #define MOOR_POW_MEMLIMIT_MAX           (64U * 1024U * 1024U)  /* 64 MB */
 #define MOOR_POW_OPSLIMIT              1       /* Argon2id ops (1 pass) */
 
-/* ===== INTERNAL -- OOM ===== */
-#define MOOR_OOM_HIGH_WATER     768     /* OOM killer threshold (75% of MAX_CIRCUITS) */
+/* ===== INTERNAL -- OOM (soft threshold, never blocks allocation) ===== */
+#define MOOR_OOM_HIGH_WATER     8192    /* Soft: triggers idle circuit cleanup */
 #define MOOR_OOM_IDLE_SECS      60      /* OOM idle cleanup interval */
 
 /* Tor-aligned: per-circuit cell queue limit (relay-side DoS defense).

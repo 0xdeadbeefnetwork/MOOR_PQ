@@ -14,12 +14,13 @@ ZLIB_LIBS ?= -lz
 EXTRA_CFLAGS ?=
 EXTRA_LDFLAGS ?=
 
-CFLAGS = -Wall -Wextra -O2 -g -fno-strict-aliasing -fstack-protector-strong \
+CFLAGS = -Wall -Wextra -O2 -g3 -fno-strict-aliasing -fstack-protector-strong \
+         -fno-omit-frame-pointer \
          -D_FORTIFY_SOURCE=2 -Iinclude -Isrc/kyber -Isrc/dilithium \
          -fPIE -Wformat -Wformat-security \
          -DMOOR_SYSCONFDIR='"$(SYSCONFDIR)/moor"' \
          $(SODIUM_CFLAGS) $(ZLIB_CFLAGS) $(EXTRA_CFLAGS)
-LDFLAGS = -pie -Wl,-z,relro,-z,now \
+LDFLAGS = -pie -Wl,-z,relro,-z,now -rdynamic \
           $(SODIUM_LIBS) -lm -lpthread $(ZLIB_LIBS) $(EXTRA_LDFLAGS)
 
 # Windows/MSYS2 needs winsock
@@ -40,6 +41,7 @@ SOURCES = $(SRCDIR)/log.c \
           $(SRCDIR)/cell.c \
           $(SRCDIR)/event.c \
           $(SRCDIR)/connection.c \
+          $(SRCDIR)/channel.c \
           $(SRCDIR)/node.c \
           $(SRCDIR)/circuit.c \
           $(SRCDIR)/relay.c \
@@ -68,9 +70,9 @@ SOURCES = $(SRCDIR)/log.c \
           $(SRCDIR)/transport_shade.c \
           $(SRCDIR)/bridge_auth.c \
           $(SRCDIR)/exit_sla.c \
-          $(SRCDIR)/crypto_worker.c \
           $(SRCDIR)/transport_mirage.c \
           $(SRCDIR)/transport_shitstorm.c \
+          $(SRCDIR)/transport_speakeasy.c \
           $(SRCDIR)/dht.c \
           $(SRCDIR)/sig.c \
           $(SRCDIR)/mix.c \
@@ -540,6 +542,73 @@ tsan-test: $(TSAN_OBJDIR) $(TSAN_OBJDIR)/kyber $(TSAN_OBJDIR)/dilithium $(TSAN_A
 		echo "=== $$FAILED test(s) failed under TSan ==="; \
 		exit 1; \
 	fi
+
+# =============================================================================
+# Debug build: full ASAN+UBSan main binary for crash diagnosis
+# =============================================================================
+# Builds ./moor_debug — run it exactly like ./moor but with full sanitizer
+# coverage, zero optimization, and maximum debug info.
+#
+# Usage:
+#   make debug
+#   ASAN_OPTIONS=detect_leaks=0:print_stacktrace=1:abort_on_error=1 ./moor_debug [args...]
+#
+# On crash: ASAN prints the exact line + full backtrace, no core dump needed.
+
+DEBUG_CC = clang
+DEBUG_CFLAGS = -Wall -Wextra -O0 -g3 -ggdb -fno-strict-aliasing \
+               -fno-omit-frame-pointer -fno-optimize-sibling-calls \
+               -fsanitize=address,undefined \
+               -fsanitize-recover=undefined \
+               -fno-sanitize=vptr \
+               -DMOOR_DEBUG=1 \
+               -Iinclude -Isrc/kyber -Isrc/dilithium \
+               -fPIE -DMOOR_SYSCONFDIR='"$(SYSCONFDIR)/moor"' \
+               $(shell pkg-config --cflags libsodium 2>/dev/null)
+DEBUG_LDFLAGS = -fsanitize=address,undefined \
+                -rdynamic \
+                $(shell pkg-config --libs libsodium 2>/dev/null || echo -lsodium) \
+                -lm -lpthread -lz
+
+DEBUG_OBJDIR = obj_debug
+DEBUG_OBJECTS = $(patsubst $(SRCDIR)/%.c,$(DEBUG_OBJDIR)/%.o,$(SOURCES))
+DEBUG_KYBER_OBJECTS = $(patsubst $(SRCDIR)/kyber/%.c,$(DEBUG_OBJDIR)/kyber/%.o,$(KYBER_SOURCES))
+DEBUG_DILITHIUM_OBJECTS = $(patsubst $(SRCDIR)/dilithium/%.c,$(DEBUG_OBJDIR)/dilithium/%.o,$(DILITHIUM_SOURCES))
+DEBUG_MAIN_OBJ = $(DEBUG_OBJDIR)/main.o
+DEBUG_ALL_OBJECTS = $(DEBUG_OBJECTS) $(DEBUG_KYBER_OBJECTS) $(DEBUG_DILITHIUM_OBJECTS)
+
+$(DEBUG_OBJDIR):
+	mkdir -p $(DEBUG_OBJDIR)
+
+$(DEBUG_OBJDIR)/kyber:
+	mkdir -p $(DEBUG_OBJDIR)/kyber
+
+$(DEBUG_OBJDIR)/dilithium:
+	mkdir -p $(DEBUG_OBJDIR)/dilithium
+
+$(DEBUG_OBJDIR)/%.o: $(SRCDIR)/%.c | $(DEBUG_OBJDIR)
+	$(DEBUG_CC) $(DEBUG_CFLAGS) -c $< -o $@
+
+$(DEBUG_OBJDIR)/kyber/%.o: $(SRCDIR)/kyber/%.c | $(DEBUG_OBJDIR)/kyber
+	$(DEBUG_CC) $(DEBUG_CFLAGS) -c $< -o $@
+
+$(DEBUG_OBJDIR)/dilithium/%.o: $(SRCDIR)/dilithium/%.c | $(DEBUG_OBJDIR)/dilithium
+	$(DEBUG_CC) $(DEBUG_CFLAGS) -c $< -o $@
+
+$(DEBUG_MAIN_OBJ): $(MAIN_SRC) | $(DEBUG_OBJDIR)
+	$(DEBUG_CC) $(DEBUG_CFLAGS) -c $< -o $@
+
+moor_debug: $(DEBUG_OBJDIR) $(DEBUG_OBJDIR)/kyber $(DEBUG_OBJDIR)/dilithium $(DEBUG_ALL_OBJECTS) $(DEBUG_MAIN_OBJ)
+	$(DEBUG_CC) $(DEBUG_ALL_OBJECTS) $(DEBUG_MAIN_OBJ) -o $@ $(DEBUG_LDFLAGS)
+	@echo ""
+	@echo "=== Built: ./moor_debug (ASAN+UBSan, -O0, -g3) ==="
+	@echo "Run with:"
+	@echo "  ASAN_OPTIONS=detect_leaks=0:print_stacktrace=1:abort_on_error=1 ./moor_debug [args...]"
+	@echo ""
+
+debug: moor_debug
+
+.PHONY: debug
 
 # =============================================================================
 # LibFuzzer Harnesses

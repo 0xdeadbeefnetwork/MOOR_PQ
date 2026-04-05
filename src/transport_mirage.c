@@ -21,6 +21,7 @@
 #include <sodium.h>
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -265,14 +266,26 @@ static int extract_key_share_from_ch(const uint8_t *body, size_t body_len,
         pos += 4;
         /* R10-INT4: Bounds check extension length against body size */
         if (pos + ext_len > body_len) return -1;
-        if (ext_type == 0x0033 && ext_len >= 38 && pos + 38 <= ext_end) {
-            /* key_share: shares_len(2) + group(2) + key_len(2) + key(32) */
-            uint16_t group = ((uint16_t)body[pos + 2] << 8) | body[pos + 3];
-            uint16_t key_len = ((uint16_t)body[pos + 4] << 8) | body[pos + 5];
-            /* R10-INT3: Reject non-x25519 groups to match ShitStorm validation */
-            if (group == 0x001d && key_len == 32) {
-                memcpy(pk_out, body + pos + 6, 32);
-                return 0;
+        if (ext_type == 0x0033 && ext_len >= 6) {
+            /* key_share: shares_len(2) + [group(2) + key_len(2) + key(N)]...
+             * Scan all entries to find the x25519 share (may be after GREASE
+             * and ML-KEM entries). */
+            uint16_t shares_len = ((uint16_t)body[pos] << 8) | body[pos + 1];
+            size_t sp = pos + 2;
+            size_t sp_end = pos + 2 + shares_len;
+            if (sp_end > pos + ext_len) sp_end = pos + ext_len;
+            LOG_DEBUG("mirage: key_share ext found, shares_len=%u, scanning entries", shares_len);
+            while (sp + 4 <= sp_end) {
+                uint16_t group = ((uint16_t)body[sp] << 8) | body[sp + 1];
+                uint16_t key_len = ((uint16_t)body[sp + 2] << 8) | body[sp + 3];
+                LOG_DEBUG("mirage: key_share entry group=0x%04x key_len=%u", group, key_len);
+                sp += 4;
+                if (sp + key_len > sp_end) break;
+                if (group == 0x001d && key_len == 32) {
+                    memcpy(pk_out, body + sp, 32);
+                    return 0;
+                }
+                sp += key_len;
             }
         }
         pos += ext_len;
@@ -377,90 +390,206 @@ static int extract_key_share_from_sh(const uint8_t *body, size_t body_len,
 }
 
 /*
- * Build a TLS 1.3 ClientHello message with a real x25519 key share.
+ * Build a TLS 1.3 ClientHello matching Chrome 131+ fingerprint.
+ * Full cipher suite list, all Chrome extensions, GREASE, ML-KEM key share.
  * The eph_sk_out receives the ephemeral secret key for DH.
  */
+static void mirage_put16(uint8_t *p, uint16_t v) { p[0] = v >> 8; p[1] = v; }
+
+static uint16_t mirage_grease(void) {
+    uint8_t r; moor_crypto_random(&r, 1);
+    r = (r & 0xF0) | 0x0A; /* 0x?a?a pattern */
+    return ((uint16_t)r << 8) | r;
+}
+
 static int build_client_hello(uint8_t *buf, size_t buf_len, const char *sni,
                                size_t *out_len, uint8_t eph_sk_out[32],
                                const uint8_t node_id[32]) {
-    if (buf_len < 512) return -1;
+    if (buf_len < 2048) return -1;
 
     size_t sni_len = strlen(sni);
     if (sni_len > 253) sni_len = 253;
 
-    /* ClientHello handshake body — Fix #179: 384 overflows with max SNI (253) */
-    uint8_t body[512];
+    uint8_t body[2048];
     size_t pos = 0;
 
-    /* client_version = TLS 1.2 (TLS 1.3 uses supported_versions ext) */
-    body[pos++] = 0x03;
-    body[pos++] = 0x03;
+    /* GREASE values for this connection */
+    uint16_t grease_cs = mirage_grease();
+    uint16_t grease_group = mirage_grease();
+    uint16_t grease_ext1 = mirage_grease();
+    uint16_t grease_ver = mirage_grease();
 
-    /* random (32 bytes) */
+    /* client_version = TLS 1.2 on wire (TLS 1.3 via supported_versions) */
+    body[pos++] = 0x03; body[pos++] = 0x03;
+
+    /* client_random (32 bytes) */
     moor_crypto_random(body + pos, 32);
     uint8_t *client_random = body + pos;
     pos += 32;
 
-    /* session_id = HMAC-BLAKE2b(node_id, client_random)[:32]
-     * Proves to server that client knows the relay's identity,
-     * preventing active probing by censors (#7). */
-    body[pos++] = 32;  /* length */
-    if (node_id && !sodium_is_zero(node_id, 32)) {
+    /* session_id = HMAC(node_id, client_random) for probe resistance */
+    body[pos++] = 32;
+    if (node_id && !sodium_is_zero(node_id, 32))
         moor_crypto_hash_keyed(body + pos, client_random, 32, node_id);
-    } else {
+    else
         moor_crypto_random(body + pos, 32);
-    }
     pos += 32;
 
-    /* cipher_suites */
-    body[pos++] = 0x00;
-    body[pos++] = 0x06;  /* 6 bytes = 3 suites */
-    body[pos++] = (uint8_t)(TLS_AES_128_GCM_SHA256 >> 8);
-    body[pos++] = (uint8_t)(TLS_AES_128_GCM_SHA256);
-    body[pos++] = (uint8_t)(TLS_AES_256_GCM_SHA384 >> 8);
-    body[pos++] = (uint8_t)(TLS_AES_256_GCM_SHA384);
-    body[pos++] = (uint8_t)(TLS_CHACHA20_POLY1305_SHA256 >> 8);
-    body[pos++] = (uint8_t)(TLS_CHACHA20_POLY1305_SHA256);
+    /* cipher_suites: 1 GREASE + 15 Chrome suites = 32 bytes */
+    mirage_put16(body + pos, 32); pos += 2;
+    static const uint16_t chrome_cs[] = {
+        0x1301, 0x1302, 0x1303,         /* TLS 1.3 */
+        0xc02b, 0xc02f, 0xc02c, 0xc030, /* ECDHE GCM */
+        0xcca9, 0xcca8,                  /* ECDHE ChaCha20 */
+        0xc013, 0xc014,                  /* ECDHE CBC */
+        0x009c, 0x009d, 0x002f, 0x0035,  /* RSA */
+    };
+    mirage_put16(body + pos, grease_cs); pos += 2;
+    for (int i = 0; i < 15; i++) { mirage_put16(body + pos, chrome_cs[i]); pos += 2; }
 
     /* compression_methods */
-    body[pos++] = 0x01;  /* 1 method */
-    body[pos++] = 0x00;  /* null compression */
+    body[pos++] = 0x01; body[pos++] = 0x00;
 
-    /* Extensions */
+    /* ---- Extensions ---- */
     size_t ext_start = pos;
-    pos += 2;  /* placeholder for extensions length */
+    pos += 2; /* placeholder for extensions length */
 
-    /* SNI extension (type 0x0000) */
-    body[pos++] = 0x00; body[pos++] = 0x00;  /* ext type */
-    uint16_t sni_ext_len = (uint16_t)(sni_len + 5);
-    body[pos++] = (uint8_t)(sni_ext_len >> 8);
-    body[pos++] = (uint8_t)(sni_ext_len);
-    uint16_t sni_list_len = (uint16_t)(sni_len + 3);
-    body[pos++] = (uint8_t)(sni_list_len >> 8);
-    body[pos++] = (uint8_t)(sni_list_len);
-    body[pos++] = 0x00;  /* host_name type */
-    body[pos++] = (uint8_t)(sni_len >> 8);
-    body[pos++] = (uint8_t)(sni_len);
-    memcpy(body + pos, sni, sni_len);
-    pos += sni_len;
+    /* GREASE extension */
+    mirage_put16(body + pos, grease_ext1); pos += 2;
+    mirage_put16(body + pos, 1); pos += 2;
+    body[pos++] = 0x00;
 
-    /* supported_versions extension (type 0x002b) -- required for TLS 1.3 */
-    body[pos++] = 0x00; body[pos++] = 0x2b;
-    body[pos++] = 0x00; body[pos++] = 0x03;  /* ext data len */
-    body[pos++] = 0x02;                      /* versions len */
-    body[pos++] = 0x03; body[pos++] = 0x04;  /* TLS 1.3 */
+    /* SNI (0x0000) */
+    mirage_put16(body + pos, 0x0000); pos += 2;
+    mirage_put16(body + pos, (uint16_t)(sni_len + 5)); pos += 2;
+    mirage_put16(body + pos, (uint16_t)(sni_len + 3)); pos += 2;
+    body[pos++] = 0x00;
+    mirage_put16(body + pos, (uint16_t)sni_len); pos += 2;
+    memcpy(body + pos, sni, sni_len); pos += sni_len;
 
-    /* key_share extension (type 0x0033) -- real x25519 share for DH */
-    body[pos++] = 0x00; body[pos++] = 0x33;
-    body[pos++] = 0x00; body[pos++] = 0x26;  /* ext data len = 38 */
-    body[pos++] = 0x00; body[pos++] = 0x24;  /* client shares len = 36 */
-    body[pos++] = 0x00; body[pos++] = 0x1d;  /* x25519 group */
-    body[pos++] = 0x00; body[pos++] = 0x20;  /* key len = 32 */
-    /* Generate real x25519 ephemeral keypair */
-    uint8_t eph_pk[32];
-    crypto_box_keypair(eph_pk, eph_sk_out);
-    memcpy(body + pos, eph_pk, 32);
-    pos += 32;
+    /* extended_master_secret (0x0017) - empty */
+    mirage_put16(body + pos, 0x0017); pos += 2;
+    mirage_put16(body + pos, 0); pos += 2;
+
+    /* renegotiation_info (0xff01) */
+    mirage_put16(body + pos, 0xff01); pos += 2;
+    mirage_put16(body + pos, 1); pos += 2;
+    body[pos++] = 0x00;
+
+    /* supported_groups (0x000a): GREASE + X25519MLKEM768 + x25519 + P-256 + P-384 */
+    mirage_put16(body + pos, 0x000a); pos += 2;
+    mirage_put16(body + pos, 10); pos += 2; /* data len */
+    mirage_put16(body + pos, 8); pos += 2;  /* list len */
+    mirage_put16(body + pos, grease_group); pos += 2;
+    mirage_put16(body + pos, 0x11ec); pos += 2; /* X25519MLKEM768 */
+    mirage_put16(body + pos, 0x001d); pos += 2; /* x25519 */
+    mirage_put16(body + pos, 0x0017); pos += 2; /* P-256 */
+
+    /* ec_point_formats (0x000b) */
+    mirage_put16(body + pos, 0x000b); pos += 2;
+    mirage_put16(body + pos, 2); pos += 2;
+    body[pos++] = 0x01; body[pos++] = 0x00; /* uncompressed */
+
+    /* session_ticket (0x0023) - empty */
+    mirage_put16(body + pos, 0x0023); pos += 2;
+    mirage_put16(body + pos, 0); pos += 2;
+
+    /* ALPN (0x0010): h2, http/1.1 */
+    mirage_put16(body + pos, 0x0010); pos += 2;
+    mirage_put16(body + pos, 14); pos += 2; /* ext data len: 2 + 3 + 9 = 14 */
+    mirage_put16(body + pos, 12); pos += 2; /* list len: 3 + 9 = 12 */
+    body[pos++] = 2; body[pos++] = 'h'; body[pos++] = '2';
+    body[pos++] = 8; memcpy(body + pos, "http/1.1", 8); pos += 8;
+    /* NOTE: extension ordering intentionally wrong here -- we don't shuffle
+     * because the actual extension ORDER doesn't matter for JA4 (it sorts).
+     * What matters is the SET of extensions present. */
+
+    /* status_request (0x0005) - OCSP stapling */
+    mirage_put16(body + pos, 0x0005); pos += 2;
+    mirage_put16(body + pos, 5); pos += 2;
+    body[pos++] = 0x01; /* type: ocsp */
+    mirage_put16(body + pos, 0); pos += 2; /* responder_id_list empty */
+    mirage_put16(body + pos, 0); pos += 2; /* request_extensions empty */
+
+    /* signature_algorithms (0x000d): 8 Chrome algorithms */
+    mirage_put16(body + pos, 0x000d); pos += 2;
+    mirage_put16(body + pos, 18); pos += 2; /* ext data len */
+    mirage_put16(body + pos, 16); pos += 2; /* list len */
+    static const uint16_t chrome_sigalgs[] = {
+        0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601
+    };
+    for (int i = 0; i < 8; i++) { mirage_put16(body + pos, chrome_sigalgs[i]); pos += 2; }
+
+    /* signed_certificate_timestamp (0x0012) - empty */
+    mirage_put16(body + pos, 0x0012); pos += 2;
+    mirage_put16(body + pos, 0); pos += 2;
+
+    /* psk_key_exchange_modes (0x002d) */
+    mirage_put16(body + pos, 0x002d); pos += 2;
+    mirage_put16(body + pos, 2); pos += 2;
+    body[pos++] = 0x01; body[pos++] = 0x01; /* psk_dhe_ke */
+
+    /* supported_versions (0x002b): GREASE + TLS 1.3 + TLS 1.2 */
+    mirage_put16(body + pos, 0x002b); pos += 2;
+    mirage_put16(body + pos, 7); pos += 2;
+    body[pos++] = 6; /* versions list len */
+    mirage_put16(body + pos, grease_ver); pos += 2;
+    mirage_put16(body + pos, 0x0304); pos += 2; /* TLS 1.3 */
+    mirage_put16(body + pos, 0x0303); pos += 2; /* TLS 1.2 */
+
+    /* compress_certificate (0x001b): brotli */
+    mirage_put16(body + pos, 0x001b); pos += 2;
+    mirage_put16(body + pos, 3); pos += 2;
+    body[pos++] = 0x02; /* algorithms list len */
+    mirage_put16(body + pos, 0x0002); pos += 2; /* brotli */
+
+    /* application_settings / ALPS (0x44cd): Chrome 134+ new code point */
+    mirage_put16(body + pos, 0x44cd); pos += 2;
+    mirage_put16(body + pos, 5); pos += 2;
+    mirage_put16(body + pos, 3); pos += 2; /* protocols list len */
+    body[pos++] = 2; body[pos++] = 'h'; body[pos++] = '2';
+
+    /* key_share (0x0033): GREASE + X25519MLKEM768(1216) + x25519(32) */
+    {
+        uint16_t shares_len = 5 + 1220 + 36; /* GREASE(5) + MLKEM(1220) + x25519(36) */
+        mirage_put16(body + pos, 0x0033); pos += 2;
+        mirage_put16(body + pos, shares_len + 2); pos += 2; /* ext data len */
+        mirage_put16(body + pos, shares_len); pos += 2;     /* shares len */
+
+        /* GREASE share */
+        mirage_put16(body + pos, grease_group); pos += 2;
+        mirage_put16(body + pos, 1); pos += 2;
+        body[pos++] = 0x00;
+
+        /* X25519MLKEM768 (decorative — 1216 bytes random) */
+        mirage_put16(body + pos, 0x11ec); pos += 2;
+        mirage_put16(body + pos, 1216); pos += 2;
+        moor_crypto_random(body + pos, 1216); pos += 1216;
+
+        /* x25519 (real key for DH) */
+        mirage_put16(body + pos, 0x001d); pos += 2;
+        mirage_put16(body + pos, 32); pos += 2;
+        uint8_t eph_pk[32];
+        crypto_box_keypair(eph_pk, eph_sk_out);
+        memcpy(body + pos, eph_pk, 32); pos += 32;
+    }
+
+    /* ECH GREASE (0xfe0d) */
+    {
+        mirage_put16(body + pos, 0xfe0d); pos += 2;
+        uint8_t ech_rand; moor_crypto_random(&ech_rand, 1);
+        uint16_t ech_payload_len = 200 + (ech_rand % 56);
+        uint16_t ech_ext_len = 1 + 2 + 2 + 1 + 2 + 32 + 2 + ech_payload_len;
+        mirage_put16(body + pos, ech_ext_len); pos += 2;
+        body[pos++] = 0x00; /* outer */
+        mirage_put16(body + pos, 0x0001); pos += 2; /* HKDF-SHA256 */
+        mirage_put16(body + pos, 0x0001); pos += 2; /* AES-128-GCM */
+        moor_crypto_random(body + pos, 1); pos += 1; /* config_id */
+        mirage_put16(body + pos, 32); pos += 2;
+        moor_crypto_random(body + pos, 32); pos += 32;
+        mirage_put16(body + pos, ech_payload_len); pos += 2;
+        moor_crypto_random(body + pos, ech_payload_len); pos += ech_payload_len;
+    }
 
     /* Write extensions length */
     uint16_t ext_len = (uint16_t)(pos - ext_start - 2);
@@ -468,16 +597,15 @@ static int build_client_hello(uint8_t *buf, size_t buf_len, const char *sni,
     body[ext_start + 1] = (uint8_t)(ext_len);
 
     /* Wrap in handshake message: type(1) + length(3) + body */
-    size_t hs_len = 1 + 3 + pos;
-    uint8_t hs_msg[512];
+    uint8_t hs_msg[2048];
     hs_msg[0] = TLS_HS_CLIENT_HELLO;
-    hs_msg[1] = 0;
+    hs_msg[1] = (uint8_t)(pos >> 16);
     hs_msg[2] = (uint8_t)(pos >> 8);
     hs_msg[3] = (uint8_t)(pos);
     memcpy(hs_msg + 4, body, pos);
 
     /* Wrap in TLS record */
-    tls_record_header(buf, TLS_HANDSHAKE, (uint16_t)(hs_len));
+    tls_record_header(buf, TLS_HANDSHAKE, (uint16_t)(4 + pos));
     memcpy(buf + TLS_RECORD_HEADER, hs_msg, 4 + pos);
     *out_len = TLS_RECORD_HEADER + 4 + pos;
     return 0;
@@ -567,7 +695,7 @@ static int mirage_client_handshake(int fd, const void *params,
         generate_random_sni(sni, sizeof(sni));
 
     /* Send ClientHello with real x25519 ephemeral key */
-    uint8_t ch_buf[512];
+    uint8_t ch_buf[2048];
     size_t ch_len;
     uint8_t our_eph_sk[32];
     if (build_client_hello(ch_buf, sizeof(ch_buf), sni, &ch_len, our_eph_sk,
@@ -689,16 +817,31 @@ static int mirage_server_handshake(int fd, const void *params,
 
     /* Receive ClientHello */
     uint8_t ch_hdr[TLS_RECORD_HEADER];
-    if (recv_all(fd, ch_hdr, TLS_RECORD_HEADER) != 0) return -1;
-    if (ch_hdr[0] != TLS_HANDSHAKE) return -1;
+    if (recv_all(fd, ch_hdr, TLS_RECORD_HEADER) != 0) {
+        LOG_ERROR("mirage server: recv TLS record header failed");
+        return -1;
+    }
+    if (ch_hdr[0] != TLS_HANDSHAKE) {
+        LOG_ERROR("mirage server: not a handshake record (got 0x%02x)", ch_hdr[0]);
+        return -1;
+    }
     uint16_t ch_len = ((uint16_t)ch_hdr[3] << 8) | ch_hdr[4];
-    if (ch_len > 512 || ch_len < 40) return -1;
+    if (ch_len > 2048 || ch_len < 40) {
+        LOG_ERROR("mirage server: bad CH length %u", ch_len);
+        return -1;
+    }
 
     /* Read ClientHello body and extract client's x25519 key */
-    uint8_t ch_body[512];
-    if (recv_all(fd, ch_body, ch_len) != 0) return -1;
+    uint8_t ch_body[2048];
+    if (recv_all(fd, ch_body, ch_len) != 0) {
+        LOG_ERROR("mirage server: recv CH body failed (len=%u)", ch_len);
+        return -1;
+    }
     /* Verify handshake type is ClientHello */
-    if (ch_body[0] != TLS_HS_CLIENT_HELLO) return -1;
+    if (ch_body[0] != TLS_HS_CLIENT_HELLO) {
+        LOG_ERROR("mirage server: not ClientHello (got 0x%02x)", ch_body[0]);
+        return -1;
+    }
 
     /* Active probing defense (#7): verify session_id = HMAC(identity_pk, client_random).
      * Only MOOR clients who know our identity can produce a valid session_id.
@@ -724,7 +867,33 @@ static int mirage_server_handshake(int fd, const void *params,
     /* Body starts at offset 4 past handshake type+length */
     if (extract_key_share_from_ch(ch_body + 4, ch_len - 4,
                                    client_eph_pk) != 0) {
+        LOG_ERROR("mirage server: x25519 key share not found in CH (len=%u)", ch_len);
         return -1;
+    }
+    LOG_DEBUG("mirage server: CH parsed OK (len=%u), key share extracted", ch_len);
+
+    /* Replay cache: reject replayed ClientHello ephemeral keys (CWE-294).
+     * Without this, an attacker can record a valid ClientHello and replay
+     * it to confirm the server is a MOOR relay. */
+    {
+        #define MIRAGE_REPLAY_CACHE_SIZE 256
+        #define MIRAGE_REPLAY_TTL_SECS   600
+        static struct { uint8_t key[32]; uint64_t timestamp; } replay_cache[MIRAGE_REPLAY_CACHE_SIZE];
+        static int replay_idx = 0;
+        static pthread_mutex_t replay_mutex = PTHREAD_MUTEX_INITIALIZER;
+        pthread_mutex_lock(&replay_mutex);
+        uint64_t now = (uint64_t)time(NULL);
+        for (int r = 0; r < MIRAGE_REPLAY_CACHE_SIZE; r++) {
+            if (now - replay_cache[r].timestamp < MIRAGE_REPLAY_TTL_SECS &&
+                sodium_memcmp(replay_cache[r].key, client_eph_pk, 32) == 0) {
+                pthread_mutex_unlock(&replay_mutex);
+                return -1; /* replay detected */
+            }
+        }
+        memcpy(replay_cache[replay_idx].key, client_eph_pk, 32);
+        replay_cache[replay_idx].timestamp = now;
+        replay_idx = (replay_idx + 1) % MIRAGE_REPLAY_CACHE_SIZE;
+        pthread_mutex_unlock(&replay_mutex);
     }
 
     /* Extract client session_id for echo (offset: 4 + 2 + 32 + 1 = 39) */
@@ -896,32 +1065,44 @@ static ssize_t mirage_recv(moor_transport_state_t *state, int fd,
                               uint8_t *buf, size_t len) {
     mirage_state_t *st = (mirage_state_t *)state;
 
-    /* If we have buffered data, return it first */
-    if (st->recv_len > 0) {
-        size_t copy = (st->recv_len < len) ? st->recv_len : len;
-        memcpy(buf, st->recv_buf, copy);
-        if (copy < st->recv_len)
-            memmove(st->recv_buf, st->recv_buf + copy, st->recv_len - copy);
-        st->recv_len -= copy;
-        return (ssize_t)copy;
+    /* Incremental TLS record assembly — handles both blocking (handshake)
+     * and non-blocking (event loop) sockets. recv_buf accumulates raw wire
+     * bytes. We loop until we have a complete TLS record, then decrypt. */
+
+    /* Read until we have at least a TLS record header */
+    while (st->recv_len < TLS_RECORD_HEADER) {
+        ssize_t n = recv(fd, (char *)st->recv_buf + st->recv_len,
+                         sizeof(st->recv_buf) - st->recv_len, 0);
+        if (n > 0) { st->recv_len += (size_t)n; continue; }
+        if (n == 0) return 0; /* EOF */
+        /* EAGAIN on non-blocking socket — no complete record yet */
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return -1;
+        return -1; /* real error */
     }
 
-    /* Read TLS record header (use recv_all for reliability) */
-    uint8_t hdr[TLS_RECORD_HEADER];
-    if (recv_all(fd, hdr, TLS_RECORD_HEADER) != 0) return -1;
-
-    if (hdr[0] != TLS_APPLICATION_DATA) return -1;
-    uint16_t record_len = ((uint16_t)hdr[3] << 8) | hdr[4];
+    /* Parse TLS record header */
+    if (st->recv_buf[0] != TLS_APPLICATION_DATA) {
+        LOG_WARN("mirage recv: unexpected record type 0x%02x", st->recv_buf[0]);
+        return -1;
+    }
+    uint16_t record_len = ((uint16_t)st->recv_buf[3] << 8) | st->recv_buf[4];
     if (record_len < 3 + 16 || record_len > TLS_MAX_FRAGMENT + 16) return -1;
 
-    /* Read full record body (ciphertext + 16-byte MAC) */
-    uint8_t record[TLS_MAX_FRAGMENT + 16];
-    if (recv_all(fd, record, record_len) != 0) return -1;
+    size_t total_needed = TLS_RECORD_HEADER + record_len;
 
-    /* Check nonce BEFORE decrypt to prevent keystream reuse (#213) */
+    /* Read until we have the full record */
+    while (st->recv_len < total_needed) {
+        ssize_t n = recv(fd, (char *)st->recv_buf + st->recv_len,
+                         sizeof(st->recv_buf) - st->recv_len, 0);
+        if (n > 0) { st->recv_len += (size_t)n; continue; }
+        if (n == 0) return 0;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return -1;
+        return -1;
+    }
+
+    /* Full TLS record available — decrypt */
     if (st->recv_nonce == UINT64_MAX) return -1;
 
-    /* Decrypt with ChaCha20-Poly1305 AEAD (verifies integrity) */
     uint8_t nonce[12];
     memset(nonce, 0, 12);
     for (int i = 0; i < 8; i++)
@@ -932,37 +1113,37 @@ static ssize_t mirage_recv(moor_transport_state_t *state, int fd,
     if (crypto_aead_chacha20poly1305_ietf_decrypt(
             decrypted, &decrypted_len,
             NULL,
-            record, record_len,
+            st->recv_buf + TLS_RECORD_HEADER, record_len,
             NULL, 0,
             nonce, st->recv_key) != 0) {
-        LOG_WARN("TLS camo: AEAD decryption/MAC verification failed");
+        LOG_WARN("mirage recv: AEAD decrypt failed (nonce=%llu)",
+                 (unsigned long long)st->recv_nonce);
         return -1;
     }
     st->recv_nonce++;
 
-    /* Extract actual data length from 2-byte prefix (padding discarded) */
+    /* Consume the TLS record from the buffer */
+    if (total_needed < st->recv_len)
+        memmove(st->recv_buf, st->recv_buf + total_needed,
+                st->recv_len - total_needed);
+    st->recv_len -= total_needed;
+
+    /* Extract actual data from 2-byte length prefix (discard padding) */
+    if (decrypted_len < 2) return -1;
     uint16_t data_len = ((uint16_t)decrypted[0] << 8) | decrypted[1];
-    if (data_len + 2 > (uint16_t)decrypted_len) return -1; /* corrupt */
+    if (data_len + 2 > (uint16_t)decrypted_len) return -1;
 
     size_t copy = (data_len < len) ? data_len : len;
     memcpy(buf, decrypted + 2, copy);
-
-    /* Buffer excess real data beyond what caller asked for */
-    if (data_len > copy) {
-        size_t excess = data_len - copy;
-        if (excess <= sizeof(st->recv_buf) - st->recv_len) {
-            memcpy(st->recv_buf + st->recv_len, decrypted + 2 + copy, excess);
-            st->recv_len += excess;
-        }
-    }
-
     sodium_memzero(decrypted, sizeof(decrypted));
     return (ssize_t)copy;
 }
 
 static int mirage_has_pending(moor_transport_state_t *state) {
     mirage_state_t *st = (mirage_state_t *)state;
-    return st->recv_len > 0;
+    if (st->recv_len < TLS_RECORD_HEADER) return 0;
+    uint16_t record_len = ((uint16_t)st->recv_buf[3] << 8) | st->recv_buf[4];
+    return st->recv_len >= (size_t)(TLS_RECORD_HEADER + record_len);
 }
 
 static void mirage_free(moor_transport_state_t *state) {

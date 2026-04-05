@@ -17,6 +17,7 @@
  *   Payload encrypted with ChaCha20-Poly1305
  */
 #include "moor/moor.h"
+#include "moor/elligator2.h"
 #include <sodium.h>
 #include <string.h>
 #include <stdlib.h>
@@ -137,11 +138,16 @@ static int scramble_client_handshake(int fd, const void *params,
         return -1;
     }
 
-    /* Generate ephemeral Curve25519 keypair */
-    uint8_t eph_pk[32], eph_sk[32];
-    moor_crypto_box_keygen(eph_pk, eph_sk);
+    /* Generate Elligator2-representable ephemeral keypair.
+     * The representative (not the raw pk) goes on the wire — it's
+     * indistinguishable from uniform random bytes, unlike raw Curve25519
+     * which is mathematically distinguishable (curve equation test). */
+    uint8_t eph_pk[32], eph_sk[32], eph_repr[32];
+    if (moor_elligator2_keygen(eph_pk, eph_sk, eph_repr) != 0) {
+        return -1;
+    }
 
-    /* DH with bridge's Curve25519 key */
+    /* DH with bridge's Curve25519 key (using the REAL pk, not repr) */
     uint8_t auth_shared[32];
     if (moor_crypto_dh(auth_shared, eph_sk, bridge_curve_pk) != 0) {
         moor_crypto_wipe(eph_sk, 32);
@@ -174,10 +180,10 @@ static int scramble_client_handshake(int fd, const void *params,
     }
 
     memcpy(msg, ascii_cover, SCRAMBLE_COVER_LEN);
-    memcpy(msg + SCRAMBLE_COVER_LEN, eph_pk, 32);
+    memcpy(msg + SCRAMBLE_COVER_LEN, eph_repr, 32); /* representative on wire */
     moor_crypto_random(msg + SCRAMBLE_COVER_LEN + 32, pad_len);
 
-    /* HMAC over eph_pk + pad (not including cover prefix) */
+    /* HMAC over repr + pad (not including cover prefix) */
     compute_hmac(msg + SCRAMBLE_COVER_LEN + 32 + pad_len,
                  msg + SCRAMBLE_COVER_LEN, 32 + pad_len, hmac_key);
 
@@ -199,31 +205,42 @@ static int scramble_client_handshake(int fd, const void *params,
     }
     resp_total = 96;
 
-    /* Server sends [eph_pk:32][pad:32-480][hmac:32].
-     * We need to find the HMAC. Try offsets from 64 (32+32) to 512 (32+480) */
-    uint8_t server_eph_pk[32];
-    memcpy(server_eph_pk, resp_buf, 32);
+    /* Server sends [eph_repr:32][pad:32-480][hmac:32].
+     * Read ALL data first (up to max 544 bytes), then scan for HMAC
+     * at every valid position in constant time to prevent a timing
+     * oracle that leaks the padding length. */
+    uint8_t server_eph_repr[32], server_eph_pk[32];
+    memcpy(server_eph_repr, resp_buf, 32);
+    moor_elligator2_representative_to_key(server_eph_pk, server_eph_repr);
 
-    /* Server also derived HMAC from same auth_shared */
-    int found = 0;
-
-    /* Read more data until we find valid HMAC or hit max */
-    while (resp_total <= 544) {
-        /* Try HMAC at resp_total - 32 */
-        if (resp_total >= 96) { /* at least 32+32+32 */
-            size_t try_off = resp_total - 32;
-            uint8_t expected[32];
-            compute_hmac(expected, resp_buf, try_off, hmac_key);
-            if (sodium_memcmp(expected, resp_buf + try_off, 32) == 0) {
-                found = 1;
-                break;
-            }
-        }
-        if (resp_total >= 544) break;
-        /* Read one more byte */
-        ssize_t n = recv(fd, (char *)resp_buf + resp_total, 1, 0);
+    /* Read remaining data with short timeout — server sends 96-544 bytes,
+     * we don't know the exact length. Use 500ms timeout so we collect
+     * whatever was sent without blocking forever. */
+    {
+        struct timeval tv = { 0, 500000 }; /* 500ms */
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
+    while (resp_total < 544) {
+        ssize_t n = recv(fd, (char *)resp_buf + resp_total,
+                         544 - resp_total, 0);
         if (n <= 0) break;
         resp_total += n;
+    }
+    /* Restore longer timeout */
+    {
+        struct timeval tv = { 10, 0 }; /* 10s */
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
+
+    /* Constant-time scan: check HMAC at every valid position.
+     * Always scan ALL positions to avoid timing leak. */
+    int found = 0;
+    for (size_t try_off = 64; try_off + 32 <= resp_total; try_off++) {
+        uint8_t expected[32];
+        compute_hmac(expected, resp_buf, try_off, hmac_key);
+        int match = (sodium_memcmp(expected, resp_buf + try_off, 32) == 0);
+        if (match && !found)
+            found = 1;
     }
 
     if (!found) {
@@ -293,9 +310,10 @@ static int scramble_server_handshake(int fd, const void *params,
     }
     client_total = 96;
 
-    /* Extract client ephemeral pk (first 32 bytes after cover) */
-    uint8_t client_eph_pk[32];
-    memcpy(client_eph_pk, client_buf, 32);
+    /* Extract client Elligator2 representative and recover real pk */
+    uint8_t client_eph_repr[32], client_eph_pk[32];
+    memcpy(client_eph_repr, client_buf, 32);
+    moor_elligator2_representative_to_key(client_eph_pk, client_eph_repr);
 
     /* Replay cache: reject previously-seen ephemeral keys (CWE-294).
      * Mirrors Shade pattern: 256 entries with timestamp + 600s TTL (#R1-D4). */
@@ -309,13 +327,13 @@ static int scramble_server_handshake(int fd, const void *params,
         uint64_t now = (uint64_t)time(NULL);
         for (int r = 0; r < SCRAMBLE_REPLAY_CACHE_SIZE; r++) {
             if (now - replay_cache[r].timestamp < SCRAMBLE_REPLAY_TTL_SECS &&
-                sodium_memcmp(replay_cache[r].key, client_eph_pk, 32) == 0) {
+                sodium_memcmp(replay_cache[r].key, client_eph_repr, 32) == 0) {
                 pthread_mutex_unlock(&replay_mutex);
                 moor_crypto_wipe(our_curve_sk, 32);
                 return -1; /* replay detected */
             }
         }
-        memcpy(replay_cache[replay_idx].key, client_eph_pk, 32);
+        memcpy(replay_cache[replay_idx].key, client_eph_repr, 32);
         replay_cache[replay_idx].timestamp = now;
         replay_idx = (replay_idx + 1) % SCRAMBLE_REPLAY_CACHE_SIZE;
         pthread_mutex_unlock(&replay_mutex);
@@ -333,22 +351,31 @@ static int scramble_server_handshake(int fd, const void *params,
     moor_crypto_hash_keyed(hmac_key, (const uint8_t *)"moorscr0", 8,
                            auth_shared);
 
-    /* Find valid HMAC in client message */
-    int found = 0;
-    while (client_total <= 544) {
-        if (client_total >= 96) {
-            size_t try_off = client_total - 32;
-            uint8_t expected[32];
-            compute_hmac(expected, client_buf, try_off, hmac_key);
-            if (sodium_memcmp(expected, client_buf + try_off, 32) == 0) {
-                found = 1;
-                break;
-            }
-        }
-        if (client_total >= 544) break;
-        ssize_t n = recv(fd, (char *)client_buf + client_total, 1, 0);
+    /* Read ALL remaining client data with short timeout, then constant-time
+     * scan for HMAC. Timeout ensures we don't block forever if client sent
+     * less than 544 bytes. Prevents timing oracle on padding length. */
+    {
+        struct timeval tv = { 0, 500000 };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
+    while (client_total < 544) {
+        ssize_t n = recv(fd, (char *)client_buf + client_total,
+                         544 - client_total, 0);
         if (n <= 0) break;
         client_total += n;
+    }
+    {
+        struct timeval tv = { 10, 0 };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
+
+    int found = 0;
+    for (size_t try_off = 64; try_off + 32 <= client_total; try_off++) {
+        uint8_t expected[32];
+        compute_hmac(expected, client_buf, try_off, hmac_key);
+        int match = (sodium_memcmp(expected, client_buf + try_off, 32) == 0);
+        if (match && !found)
+            found = 1;
     }
 
     if (!found) {
@@ -358,9 +385,13 @@ static int scramble_server_handshake(int fd, const void *params,
         return -1;
     }
 
-    /* Generate server ephemeral keypair */
-    uint8_t eph_pk[32], eph_sk[32];
-    moor_crypto_box_keygen(eph_pk, eph_sk);
+    /* Generate Elligator2-representable server ephemeral keypair */
+    uint8_t eph_pk[32], eph_sk[32], eph_repr[32];
+    if (moor_elligator2_keygen(eph_pk, eph_sk, eph_repr) != 0) {
+        moor_crypto_wipe(our_curve_sk, 32);
+        moor_crypto_wipe(auth_shared, 32);
+        return -1;
+    }
 
     /* Random padding */
     uint32_t pad_len_raw;
@@ -376,7 +407,7 @@ static int scramble_server_handshake(int fd, const void *params,
         return -1;
     }
 
-    memcpy(resp, eph_pk, 32);
+    memcpy(resp, eph_repr, 32); /* representative on wire, not raw pk */
     moor_crypto_random(resp + 32, pad_len);
     compute_hmac(resp + 32 + pad_len, resp, 32 + pad_len, hmac_key);
 
@@ -429,8 +460,9 @@ static ssize_t scramble_send(moor_transport_state_t *state, int fd,
                               const uint8_t *data, size_t len) {
     moor_scramble_state_t *st = (moor_scramble_state_t *)state;
 
-    /* Reject oversized payloads (wire length is uint16) */
-    if (len > UINT16_MAX - 16) return -1;
+    /* Reject oversized payloads.  Frame must fit the receiver's buffer:
+     * 4096 - 2 (header) - 16 (MAC) - 16 (max padding + pad_len byte) */
+    if (len > 4062) return -1;
 
     /* Random padding: 0-15 bytes */
     uint8_t pad_len = 0;
@@ -527,6 +559,9 @@ static ssize_t scramble_recv(moor_transport_state_t *state, int fd,
         size_t needed = 2 + peek_len;
 
         if (st->recv_len >= needed) break; /* have full frame */
+
+        /* Reject frames that exceed buffer capacity (malicious/malformed) */
+        if (needed > sizeof(st->recv_buf)) return -1;
 
         /* Need more data — keep reading */
         if (st->recv_len >= sizeof(st->recv_buf)) return -1; /* buffer full */

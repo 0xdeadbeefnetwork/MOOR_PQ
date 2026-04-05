@@ -1,8 +1,16 @@
 /*
- * MOOR -- Output cell queue and scheduling
+ * MOOR -- Output cell queue and per-connection flush
+ *
+ * One queue: per-connection outq (moor_cell_queue_t) for wire frames
+ * that couldn't be sent immediately (EAGAIN).  The event loop flushes
+ * them when the socket becomes writable.
+ *
+ * All cells go through moor_connection_send_cell() which encrypts
+ * and tries to send inline.  No separate scheduler needed.
  */
 #include "moor/moor.h"
 #include <string.h>
+#include <stdlib.h>
 #include <errno.h>
 
 #ifdef _WIN32
@@ -13,46 +21,82 @@
 #include <sys/socket.h>
 #endif
 
+/* Global cell count across all queues (OOM pressure) */
+static volatile int g_global_queued = 0;
+
+int moor_queue_global_count(void) {
+    return g_global_queued;
+}
+
 void moor_queue_init(moor_cell_queue_t *q) {
-    memset(q, 0, sizeof(*q));
+    q->head = NULL;
+    q->tail = NULL;
+    q->count = 0;
+}
+
+void moor_queue_clear(moor_cell_queue_t *q) {
+    moor_queued_cell_t *cur = q->head;
+    while (cur) {
+        moor_queued_cell_t *next = cur->next;
+        free(cur);
+        if (g_global_queued > 0) g_global_queued--;
+        cur = next;
+    }
+    q->head = NULL;
+    q->tail = NULL;
+    q->count = 0;
 }
 
 int moor_queue_push(moor_cell_queue_t *q, const uint8_t *wire_data,
                     uint16_t wire_len, uint32_t circuit_id) {
-    if (q->count >= MOOR_CELL_QUEUE_SIZE)
+    /* OOM safety: reject if global queue pressure is extreme */
+    if (g_global_queued >= MOOR_GLOBAL_QUEUE_HARD_LIMIT) {
+        LOG_WARN("global queue limit reached (%d cells), dropping",
+                 g_global_queued);
         return -1;
+    }
 
-    moor_queued_cell_t *slot = &q->cells[q->tail];
+    moor_queued_cell_t *cell = malloc(sizeof(moor_queued_cell_t));
+    if (!cell) return -1;
+
+    cell->next = NULL;
     if (wire_len > MOOR_CELL_WIRE_SIZE)
         wire_len = MOOR_CELL_WIRE_SIZE;
-    memcpy(slot->data, wire_data, wire_len);
-    slot->len = wire_len;
-    slot->circuit_id = circuit_id;
+    memcpy(cell->data, wire_data, wire_len);
+    cell->len = wire_len;
+    cell->circuit_id = circuit_id;
 
-    q->tail = (q->tail + 1) % MOOR_CELL_QUEUE_SIZE;
+    if (q->tail) {
+        q->tail->next = cell;
+    } else {
+        q->head = cell;
+    }
+    q->tail = cell;
     q->count++;
+    g_global_queued++;
+
     return 0;
 }
 
 int moor_queue_pop(moor_cell_queue_t *q, uint8_t *out, uint16_t *out_len) {
-    if (q->count <= 0)
+    if (!q->head)
         return -1;
 
-    moor_queued_cell_t *slot = &q->cells[q->head];
-    memcpy(out, slot->data, slot->len);
-    *out_len = slot->len;
+    moor_queued_cell_t *cell = q->head;
+    memcpy(out, cell->data, cell->len);
+    *out_len = cell->len;
 
-    q->head = (q->head + 1) % MOOR_CELL_QUEUE_SIZE;
+    q->head = cell->next;
+    if (!q->head) q->tail = NULL;
     q->count--;
+    if (g_global_queued > 0) g_global_queued--;
+    free(cell);
+
     return 0;
 }
 
 int moor_queue_is_empty(const moor_cell_queue_t *q) {
-    return q->count == 0;
-}
-
-int moor_queue_is_full(const moor_cell_queue_t *q) {
-    return q->count >= MOOR_CELL_QUEUE_SIZE;
+    return q->head == NULL;
 }
 
 int moor_queue_count(const moor_cell_queue_t *q) {
@@ -69,12 +113,12 @@ int moor_queue_flush(moor_cell_queue_t *q, struct moor_connection *conn,
                      size_t *write_off) {
     int flushed = 0;
 
-    while (q->count > 0) {
-        moor_queued_cell_t *slot = &q->cells[q->head];
+    while (q->head) {
+        moor_queued_cell_t *cell = q->head;
         size_t off = *write_off;
-        size_t remaining = slot->len - off;
+        size_t remaining = cell->len - off;
 
-        ssize_t n = moor_connection_send_raw(conn, slot->data + off, remaining);
+        ssize_t n = moor_connection_send_raw(conn, cell->data + off, remaining);
         if (n < 0) {
 #ifdef _WIN32
             int err = WSAGetLastError();
@@ -90,11 +134,14 @@ int moor_queue_flush(moor_cell_queue_t *q, struct moor_connection *conn,
             return flushed;
 
         *write_off += (size_t)n;
-        if (*write_off >= (size_t)slot->len) {
-            /* Cell fully sent */
+        if (*write_off >= (size_t)cell->len) {
+            /* Cell fully sent — dequeue and free */
             *write_off = 0;
-            q->head = (q->head + 1) % MOOR_CELL_QUEUE_SIZE;
+            q->head = cell->next;
+            if (!q->head) q->tail = NULL;
             q->count--;
+            if (g_global_queued > 0) g_global_queued--;
+            free(cell);
             flushed++;
         } else {
             /* Partial write -- stop and wait for POLLOUT */
@@ -104,3 +151,31 @@ int moor_queue_flush(moor_cell_queue_t *q, struct moor_connection *conn,
 
     return flushed;
 }
+
+/* Per-circuit cell queue stubs — queues exist on the struct but are
+ * never populated since cells go through direct send.  Init/clear
+ * are kept for circuit alloc/free safety. */
+
+void moor_circ_queue_init(moor_circ_cell_queue_t *q) {
+    q->head = q->tail = NULL;
+    q->count = 0;
+}
+
+void moor_circ_queue_clear(moor_circ_cell_queue_t *q) {
+    moor_circ_queued_cell_t *cur = q->head;
+    while (cur) {
+        moor_circ_queued_cell_t *next = cur->next;
+        if (g_global_queued > 0) g_global_queued--;
+        free(cur);
+        cur = next;
+    }
+    q->head = q->tail = NULL;
+    q->count = 0;
+}
+
+/* KIST stubs — no scheduler, direct send handles everything. */
+void moor_kist_run(void *arg) { (void)arg; }
+void moor_kist_channel_has_cells(moor_channel_t *chan) { (void)chan; }
+void moor_kist_channel_wants_writes(moor_channel_t *chan) { (void)chan; }
+void moor_kist_remove_channel(moor_channel_t *chan) { (void)chan; }
+void moor_kist_init(void) { /* no timer, no scheduler */ }

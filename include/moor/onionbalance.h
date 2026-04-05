@@ -23,7 +23,7 @@ typedef struct {
     uint8_t  identity_sk[64];
     uint8_t  onion_pk[32];
     uint8_t  onion_sk[32];
-    char     moor_address[64];
+    char     moor_address[128];
     char     hs_dir[256];
     char     da_address[64];
     uint16_t da_port;

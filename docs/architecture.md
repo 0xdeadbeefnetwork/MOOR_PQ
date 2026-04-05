@@ -22,7 +22,7 @@ src/
                       Noise_IK link handshake + Kyber768 hybrid, AEAD cell send/recv,
                       transport-aware I/O, dual-stack IPv4/IPv6
   circuit.c           Circuit pool (1024 slots), hash table (4096 Fibonacci),
-                      CREATE/EXTEND (CKE: X25519 DH), CREATE_PQ/EXTEND_PQ (+ Kyber768 KEM),
+                      CREATE/EXTEND (CKE: onion key DH), CREATE_PQ/EXTEND_PQ (+ Kyber768 KEM),
                       path selection (bandwidth-weighted, GeoIP-diverse, guard pinning),
                       vanguards (L2/L3), congestion control (Vegas/Prop 324), CBT,
                       path bias detection, OOM killer, non-blocking async builder (event-driven state machine)
@@ -37,10 +37,10 @@ src/
   socks5.c            SOCKS5 proxy server, stream management, circuit isolation
                       (per-domain), prebuilt circuit pool (8 slots) + async builder,
                       queued BUILDING state for clearnet + HS, conflux integration
-  hidden_service.c    HS keygen (Ed25519 + Curve25519), key blinding (time-period rotation),
-                      intro point establishment (with vanguards), descriptor encryption
-                      (AEAD with derived key), rendezvous protocol, .moor addresses
-                      (base32(identity_pk) + ".moor")
+  hidden_service.c    HS keygen (Ed25519 + Curve25519 + Kyber768), key blinding (time-period
+                      rotation), intro point establishment (with vanguards), descriptor
+                      encryption (AEAD with derived key), rendezvous protocol, PQ-committed
+                      .moor addresses (base32(identity_pk + BLAKE2b_16(kem_pk)) + ".moor")
   dht.c               Distributed hash table for HS descriptors: ring position computation
                       (BLAKE2b), XOR distance, responsible relay selection, PIR fetch
                       (bitmask query + XOR-aggregated response), 3 replicas per epoch
@@ -55,6 +55,8 @@ src/
                       ChaCha20-Poly1305 AEAD framing, IAT modes (none/delay/fragment)
   transport_mirage.c  Mirage: TLS 1.3 camouflage, fake ClientHello/ServerHello with real
                       x25519 DH, variable-length TLS Application Data records
+  transport_shitstorm.c ShitStorm: Chrome TLS 1.3 fingerprint, Elligator2 key material,
+                      double AEAD, HTTP/2 framing, dynamic SNI via GeoIP + CDN resolution
   geoip.c             Tor-compatible GeoIP database parser (IPv4/IPv6), country code +
                       AS number lookup via binary search
   fragment.c          Cell fragmentation for oversized payloads (KEM data): fragment ID,
@@ -92,8 +94,9 @@ src/
   bridge_auth.c       Bridge authority: bridge registration, descriptor storage
   exit_sla.c          Exit relay SLA monitoring: per-relay success rate, latency tracking,
                       scoring (0-100)
-  crypto_worker.c     Threaded crypto offload: CKE DH computation in worker pool,
-                      results via pipe (Unix) or loopback socket pair (Windows)
+  channel.c           Channel abstraction: multiplexed circuit transport over a
+                      connection, state machine, circuit slot management, mark-for-close
+  transport_speakeasy.c Speakeasy: SSH protocol camouflage with real banner/KEX framing
 
   kyber/              Vendored Kyber768 (ML-KEM-768) reference implementation
   dilithium/          Vendored Dilithium3 (ML-DSA-65) reference implementation
@@ -171,7 +174,7 @@ With the encrypted link to the guard established, the client builds a circuit th
 - **Middle**: Any relay with the Running flag, excluding the guard and same-family relays. Different country/AS from guard and exit.
 - **Exit**: A relay with the Exit flag whose exit policy allows the destination port.
 
-**Hop 1 (to guard):** The client sends a `CREATE_PQ` cell containing its X25519 ephemeral public key and the relay's identity key. The guard performs an X25519 DH, derives circuit keys via HKDF, and replies with `CREATED_PQ`. Then a Kyber768 KEM exchange follows (CELL_KEM_CT fragments), and the KEM shared secret is mixed into the circuit keys. The client now has forward/backward ChaCha20 stream cipher keys for hop 1.
+**Hop 1 (to guard):** The client sends a `CREATE_PQ` cell containing its X25519 ephemeral public key and the relay's identity key (for identification). The guard performs two X25519 DH operations: one ephemeral-ephemeral (forward secrecy) and one ephemeral-static using its **onion key** (a Curve25519 key that rotates every 28 days, separate from the permanent identity key). The guard derives circuit keys via HKDF (with identity key in the salt for authentication binding) and replies with `CREATED_PQ`. Then a Kyber768 KEM exchange follows (CELL_KEM_CT fragments), and the KEM shared secret is mixed into the circuit keys. The client now has forward/backward ChaCha20 stream cipher keys for hop 1.
 
 **Hop 2 (to middle):** The client wraps an `EXTEND` command in a relay cell, encrypts it with hop 1's key, and sends it. The guard decrypts one layer, sees the EXTEND, and opens a TCP connection to the middle relay (reuses existing connection if available) (with its own Noise_IK + Kyber768 link handshake). The guard forwards the CREATE to the middle, receives CREATED, and sends RELAY_EXTENDED back to the client. The client now has circuit keys for hop 2. The guard cannot read hop 2's encrypted content.
 
@@ -287,7 +290,7 @@ DA-to-DA communication uses encrypted channels: ephemeral Curve25519 DH + HKDF, 
 
 ## Hidden services
 
-Hidden services let you host a server that is reachable without revealing its IP address. The server's address is `base32(identity_pk).moor`.
+Hidden services let you host a server that is reachable without revealing its IP address. The server's address is `base32(identity_pk + BLAKE2b_16(kem_pk)).moor` — a PQ-committed address that binds the Kyber768 public key hash into the address itself.
 
 ### Publishing (HS side)
 
@@ -382,7 +385,7 @@ MOOR implements multiple layers of defense against traffic analysis:
 4. **Constant-rate padding** -- optional 50ms floor to mask burst patterns.
 5. **FRONT padding** -- Rayleigh-distributed front padding cells at circuit start.
 6. **Poisson mixing** -- optional relay-side exponential delay pool with cover cells.
-7. **Pluggable transports** -- Scramble (random bytes), Shade (Elligator2 obfuscation), Mirage (TLS 1.3 camouflage) hide the fact that MOOR is being used at all.
+7. **Pluggable transports** -- ShitStorm (Chrome TLS 1.3), Scramble (random bytes), Shade (Elligator2), Mirage (TLS 1.3), Speakeasy (SSH) hide the fact that MOOR is being used at all.
 
 ## Bridge support
 

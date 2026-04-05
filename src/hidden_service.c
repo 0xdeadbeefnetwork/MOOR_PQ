@@ -63,17 +63,39 @@ static int hs_wait_for_readable(int fd, int timeout_ms)
 }
 
 int moor_hs_compute_address(char *out, size_t out_len,
-                            const uint8_t identity_pk[32]) {
-    /* address = base32(identity_pk) + ".moor"
-     * Encodes the full 32-byte public key so clients can verify
-     * the service identity and decrypt descriptors. */
-    char b32[64];
-    int b32_len = moor_base32_encode(b32, sizeof(b32), identity_pk, 32);
+                            const uint8_t identity_pk[32],
+                            const uint8_t *kem_pk, size_t kem_pk_len) {
+    /* PQ-committed address format (v2):
+     *   base32(Ed25519_pk(32) + BLAKE2b_16(Kyber768_pk)(16)) + ".moor"
+     *
+     * The 16-byte hash of the Kyber768 pk is baked into the address.
+     * Breaking Ed25519 lets you decrypt the descriptor (public info anyway)
+     * but you CANNOT forge the service: you'd need a Kyber768 pk that
+     * hashes to the committed value, which requires breaking BLAKE2b.
+     *
+     * If kem_pk is NULL, fall back to v1 (Ed25519-only, 32 bytes). */
+    uint8_t addr_data[48]; /* 32 (Ed25519) + 16 (PQ hash) */
+    size_t addr_data_len;
+
+    memcpy(addr_data, identity_pk, 32);
+
+    if (kem_pk && kem_pk_len > 0) {
+        /* BLAKE2b-16: truncated hash of KEM public key */
+        uint8_t full_hash[32];
+        moor_crypto_hash(full_hash, kem_pk, kem_pk_len);
+        memcpy(addr_data + 32, full_hash, 16);
+        addr_data_len = 48;
+    } else {
+        addr_data_len = 32; /* v1 compat */
+    }
+
+    char b32[128];
+    int b32_len = moor_base32_encode(b32, sizeof(b32), addr_data, addr_data_len);
     if (b32_len < 0) return -1;
 
     if ((size_t)b32_len + 6 > out_len) return -1;
     memcpy(out, b32, b32_len);
-    memcpy(out + b32_len, ".moor", 6); /* includes null terminator */
+    memcpy(out + b32_len, ".moor", 6);
     return 0;
 }
 
@@ -99,19 +121,23 @@ static uint64_t current_time_period(void) {
 int moor_hs_keygen(moor_hs_config_t *config) {
     moor_crypto_sign_keygen(config->identity_pk, config->identity_sk);
     moor_crypto_box_keygen(config->onion_pk, config->onion_sk);
+
+    /* Generate Kyber768 keypair for PQ hybrid e2e — BEFORE computing address
+     * so the KEM pk hash is baked into the .moor address. */
+    moor_kem_keygen(config->kem_pk, config->kem_sk);
+    config->kem_generated = 1;
+
+    /* PQ-committed address: base32(Ed25519_pk + BLAKE2b_16(Kyber768_pk)) */
     moor_hs_compute_address(config->moor_address, sizeof(config->moor_address),
-                            config->identity_pk);
+                            config->identity_pk,
+                            config->kem_pk, sizeof(config->kem_pk));
 
     /* Derive initial blinded keys for current time period */
     config->current_time_period = current_time_period();
     moor_crypto_blind_keypair(config->blinded_pk, config->blinded_sk,
                               config->identity_pk, config->identity_sk,
                               config->current_time_period);
-
-    /* Generate Kyber768 keypair for PQ hybrid e2e */
-    moor_kem_keygen(config->kem_pk, config->kem_sk);
-    config->kem_generated = 1;
-    LOG_INFO("generated HS keys (with PQ KEM)");
+    LOG_INFO("generated HS keys (PQ-committed address)");
     return 0;
 }
 
@@ -269,10 +295,8 @@ int moor_hs_load_keys(moor_hs_config_t *config) {
     if (fread(config->onion_pk, 1, 32, f) != 32) { fclose(f); return -1; }
     fclose(f);
 
-    moor_hs_compute_address(config->moor_address, sizeof(config->moor_address),
-                            config->identity_pk);
-
-    /* Load KEM keypair if it exists (PQ hybrid e2e) */
+    /* Load KEM keypair if it exists (PQ hybrid e2e) — before computing
+     * address so the KEM pk hash is included in the .moor address. */
     snprintf(path, sizeof(path), "%s/kem_sk", config->hs_dir);
     f = nofollow_fopen(path);
     if (f) {
@@ -292,13 +316,19 @@ int moor_hs_load_keys(moor_hs_config_t *config) {
         }
     }
 
+    /* Compute PQ-committed .moor address (includes KEM pk hash if available) */
+    moor_hs_compute_address(config->moor_address, sizeof(config->moor_address),
+                            config->identity_pk,
+                            config->kem_generated ? config->kem_pk : NULL,
+                            config->kem_generated ? sizeof(config->kem_pk) : 0);
+
     /* Derive blinded keys for current time period */
     config->current_time_period = current_time_period();
     moor_crypto_blind_keypair(config->blinded_pk, config->blinded_sk,
                               config->identity_pk, config->identity_sk,
                               config->current_time_period);
 
-    LOG_INFO("HS keys loaded");
+    LOG_INFO("HS keys loaded (PQ-committed address)");
     return 0;
 }
 
@@ -344,7 +374,7 @@ int moor_hs_build_circuit(moor_circuit_t *circ,
     }
 
     memcpy(circ->hops[0].node_id, guard->identity_pk, 32);
-    if (moor_circuit_create(circ, guard->identity_pk) != 0)
+    if (moor_circuit_create(circ, guard->identity_pk, guard->onion_pk) != 0)
         return -1;
 
     /* Middle: use L2 vanguard (restricted set, rotates 24h) */
@@ -444,7 +474,7 @@ static int moor_hs_build_circuit_to_rp(moor_circuit_t *circ,
     }
 
     memcpy(circ->hops[0].node_id, guard->identity_pk, 32);
-    if (moor_circuit_create(circ, guard->identity_pk) != 0)
+    if (moor_circuit_create(circ, guard->identity_pk, guard->onion_pk) != 0)
         return -1;
 
     /* Middle: use L2 vanguard if available, exclude guard and RP */
@@ -682,11 +712,14 @@ int moor_hs_publish_descriptor(moor_hs_config_t *config) {
         moor_crypto_random(inner_key, 32);
 
         /* Seal inner_key to each authorized client (crypto_box_seal: 48 bytes each) */
-        uint8_t super_buf[2 + 16 * 48 + 8 + sizeof(plaintext) + 16]; /* max superencrypted */
+        uint8_t super_buf[2 + MOOR_MAX_AUTH_CLIENTS * 48 + 8 + sizeof(plaintext) + 16];
         size_t spos = 0;
+        int num_ac = config->num_auth_clients;
+        if (num_ac > MOOR_MAX_AUTH_CLIENTS) num_ac = MOOR_MAX_AUTH_CLIENTS;
+        if (num_ac < 0) num_ac = 0;
         super_buf[spos++] = 2; /* auth_type 2 = superencrypted descriptor */
-        super_buf[spos++] = (uint8_t)config->num_auth_clients;
-        for (int i = 0; i < config->num_auth_clients; i++) {
+        super_buf[spos++] = (uint8_t)num_ac;
+        for (int i = 0; i < num_ac; i++) {
             moor_crypto_seal(super_buf + spos,
                              inner_key, 32,
                              config->auth_clients[i].client_pk);
@@ -1093,25 +1126,32 @@ int moor_hs_client_connect_start(const char *moor_address,
     if (hs_kem_available_out) *hs_kem_available_out = 0;
     LOG_DEBUG("connecting to hidden service");
 
-    /* Decode .moor address to extract full service identity_pk.
-     * Address format: base32(identity_pk) + ".moor" */
+    /* Decode .moor address to extract identity_pk and optional PQ commitment.
+     * v1: base32(Ed25519_pk(32)) + ".moor"              — 52 chars + .moor
+     * v2: base32(Ed25519_pk(32) + KEM_hash(16)) + ".moor" — 77 chars + .moor */
     size_t addr_len = strlen(moor_address);
     if (addr_len <= 5) return -1;
 
-    char b32_part[64];
+    char b32_part[128];
     size_t b32_len = addr_len - 5; /* minus ".moor" */
     if (b32_len >= sizeof(b32_part)) return -1;
     memcpy(b32_part, moor_address, b32_len);
     b32_part[b32_len] = '\0';
 
-    /* Decode base32 to get the full 32-byte identity public key */
-    uint8_t service_pk[32];
-    int decoded_len = moor_base32_decode(service_pk, sizeof(service_pk),
+    /* Decode base32 — 32 bytes (v1) or 48 bytes (v2 with PQ commitment) */
+    uint8_t addr_data[48];
+    int decoded_len = moor_base32_decode(addr_data, sizeof(addr_data),
                                           b32_part, b32_len);
     if (decoded_len < 32) {
         LOG_ERROR("HS: failed to decode .moor address (got %d bytes)", decoded_len);
         return -1;
     }
+    uint8_t service_pk[32];
+    memcpy(service_pk, addr_data, 32);
+    int has_pq_commitment = (decoded_len >= 48);
+    uint8_t pq_commitment[16];
+    if (has_pq_commitment)
+        memcpy(pq_commitment, addr_data + 32, 16);
 
     /* Compute address_hash for DA lookup: BLAKE2b(identity_pk) */
     uint8_t lookup_hash[32];
@@ -1305,6 +1345,21 @@ verify_descriptor:
             return -1;
         }
         LOG_DEBUG("HS: descriptor signature verified");
+    }
+
+    /* Verify PQ commitment: if the .moor address contains a KEM pk hash,
+     * check that the descriptor's Kyber768 pk matches the commitment.
+     * This prevents service impersonation even if Ed25519 is broken. */
+    if (has_pq_commitment && hs_desc.kem_available) {
+        uint8_t kem_hash[32];
+        moor_crypto_hash(kem_hash, hs_desc.kem_pk, sizeof(hs_desc.kem_pk));
+        if (sodium_memcmp(kem_hash, pq_commitment, 16) != 0) {
+            LOG_ERROR("HS: PQ commitment mismatch — KEM pk doesn't match address");
+            return -1;
+        }
+        LOG_DEBUG("HS: PQ commitment verified (KEM pk matches address)");
+    } else if (has_pq_commitment && !hs_desc.kem_available) {
+        LOG_WARN("HS: address has PQ commitment but descriptor has no KEM pk");
     }
 
     /* Legacy client auth (auth_type 1): only onion_pk is sealed per client.
@@ -1900,4 +1955,39 @@ int moor_hs_load_revision(moor_hs_config_t *config) {
     LOG_INFO("HS: loaded revision counter: %llu",
              (unsigned long long)config->desc_revision);
     return 0;
+}
+
+/* ---- Pointer invalidation (called from circ_free_unlocked / conn_free) ---- */
+
+extern moor_hs_config_t *g_hs_configs;
+extern int g_num_hs_configs;
+
+void moor_hs_invalidate_circuit(moor_circuit_t *circ) {
+    if (!circ || !g_hs_configs) return;
+
+    for (int h = 0; h < g_num_hs_configs; h++) {
+        moor_hs_config_t *cfg = &g_hs_configs[h];
+        for (int i = 0; i < MOOR_MAX_INTRO_POINTS; i++) {
+            if (cfg->intro_circuits[i] == circ)
+                cfg->intro_circuits[i] = NULL;
+        }
+        for (int i = 0; i < 8; i++) {
+            if (cfg->rp_circuits[i] == circ) {
+                cfg->rp_circuits[i] = NULL;
+                cfg->rp_connections[i] = NULL;
+            }
+        }
+    }
+}
+
+void moor_hs_nullify_conn(moor_connection_t *conn) {
+    if (!conn || !g_hs_configs) return;
+
+    for (int h = 0; h < g_num_hs_configs; h++) {
+        moor_hs_config_t *cfg = &g_hs_configs[h];
+        for (int i = 0; i < 8; i++) {
+            if (cfg->rp_connections[i] == conn)
+                cfg->rp_connections[i] = NULL;
+        }
+    }
 }

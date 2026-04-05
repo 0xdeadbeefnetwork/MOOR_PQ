@@ -41,8 +41,13 @@ static int circ_wait_for_readable(int fd, int timeout_ms)
 #endif
 }
 
-moor_circuit_t g_circuit_pool[MOOR_MAX_CIRCUITS];
-static int g_circuit_pool_init = 0;
+/* Dynamic circuit tracking — no hard cap.
+ * Every entry in g_circuits is a live circuit (circuit_id != 0).
+ * Circuits are individually malloc'd and freed. */
+static moor_circuit_t **g_circuits = NULL;
+static int g_circuits_count = 0;
+static int g_circuits_cap = 0;
+static int g_circuit_init_done = 0;
 
 /* Client-side guard state for path bias detection */
 static moor_guard_state_t g_pathbias_guard_state;
@@ -224,6 +229,21 @@ static const moor_cc_params_t *cc_params_for(const moor_circuit_t *circ) {
     return &g_cc_params[MOOR_CC_PATH_EXIT];
 }
 
+/* Human-readable destroy reason */
+static const char *destroy_reason_str(uint8_t reason) {
+    switch (reason) {
+    case 0: return "none";
+    case 1: return "protocol error";
+    case 2: return "internal error";
+    case 3: return "connect failed";
+    case 4: return "resource limit";
+    case 5: return "timeout";
+    case 6: return "destroyed by peer";
+    case 7: return "finished";
+    default: return "unknown";
+    }
+}
+
 /* Global GeoIP database for diverse path selection (NULL if not loaded) */
 static moor_geoip_db_t *g_geoip_db = NULL;
 
@@ -231,90 +251,110 @@ void moor_circuit_set_geoip(moor_geoip_db_t *db) {
     g_geoip_db = db;
 }
 
+/* ---- Tor-aligned deferred close queue ----
+ * Circuits marked for close are added here.  moor_circuit_close_all_marked()
+ * processes this list at the end of each event loop iteration. */
+static moor_circuit_t **g_pending_close = NULL;
+static int g_pending_close_count = 0;
+static int g_pending_close_cap = 0;
+
+/* ---- Dynamic circuit array helpers ---- */
+static int circ_array_add(moor_circuit_t *circ) {
+    if (g_circuits_count >= g_circuits_cap) {
+        int new_cap = g_circuits_cap ? g_circuits_cap * 2 : 256;
+        moor_circuit_t **p = realloc(g_circuits, (size_t)new_cap * sizeof(moor_circuit_t *));
+        if (!p) return -1;
+        g_circuits = p;
+        g_circuits_cap = new_cap;
+    }
+    g_circuits[g_circuits_count++] = circ;
+    return 0;
+}
+
+static void circ_array_remove(moor_circuit_t *circ) {
+    for (int i = 0; i < g_circuits_count; i++) {
+        if (g_circuits[i] == circ) {
+            g_circuits[i] = g_circuits[--g_circuits_count];
+            return;
+        }
+    }
+}
+
+static int pending_close_add(moor_circuit_t *circ) {
+    if (g_pending_close_count >= g_pending_close_cap) {
+        int new_cap = g_pending_close_cap ? g_pending_close_cap * 2 : 256;
+        moor_circuit_t **p = realloc(g_pending_close, (size_t)new_cap * sizeof(moor_circuit_t *));
+        if (!p) return -1;
+        g_pending_close = p;
+        g_pending_close_cap = new_cap;
+    }
+    g_pending_close[g_pending_close_count++] = circ;
+    return 0;
+}
+
 void moor_circuit_init_pool(void) {
-    memset(g_circuit_pool, 0, sizeof(g_circuit_pool));
     memset(g_circ_ht, 0, sizeof(g_circ_ht));
-    g_circuit_pool_init = 1;
+    g_pending_close_count = 0;
+    g_circuit_init_done = 1;
+}
+
+static void circ_init_fields(moor_circuit_t *circ) {
+    circ->next_stream_id = 1;
+    circ->created_at = (uint64_t)time(NULL);
+    circ->last_cell_time = circ->created_at;
+    circ->circ_package_window = MOOR_CIRCUIT_WINDOW;
+    circ->circ_deliver_window = MOOR_CIRCUIT_WINDOW;
+    circ->cc_state = MOOR_CC_SLOW_START;
+    circ->cwnd = MOOR_CC_CWND_INIT;
+    circ->ssthresh = MOOR_CC_SSTHRESH_INIT;
+    circ->min_rtt_us = UINT64_MAX;
+    for (int s = 0; s < MOOR_MAX_STREAMS; s++)
+        circ->streams[s].target_fd = -1;
+    moor_reassembly_init(&circ->reassembly);
+    moor_circ_queue_init(&circ->cell_queue_n);
+    moor_circ_queue_init(&circ->cell_queue_p);
 }
 
 moor_circuit_t *moor_circuit_alloc(void) {
     circ_pool_lock();
-    if (!g_circuit_pool_init) moor_circuit_init_pool();
-    for (int i = 0; i < MOOR_MAX_CIRCUITS; i++) {
-        if (g_circuit_pool[i].circuit_id == 0) {
-            memset(&g_circuit_pool[i], 0, sizeof(moor_circuit_t));
-            g_circuit_pool[i].next_stream_id = 1;
-            g_circuit_pool[i].created_at = (uint64_t)time(NULL);
-            g_circuit_pool[i].last_cell_time = g_circuit_pool[i].created_at;
-            g_circuit_pool[i].circ_package_window = MOOR_CIRCUIT_WINDOW;
-            g_circuit_pool[i].circ_deliver_window = MOOR_CIRCUIT_WINDOW;
-            /* Congestion control init (Prop 324) */
-            g_circuit_pool[i].cc_state = MOOR_CC_SLOW_START;
-            g_circuit_pool[i].cwnd = MOOR_CC_CWND_INIT;
-            g_circuit_pool[i].ssthresh = MOOR_CC_SSTHRESH_INIT;
-            g_circuit_pool[i].inflight = 0;
-            g_circuit_pool[i].srtt_us = 0;
-            g_circuit_pool[i].rtt_var_us = 0;
-            g_circuit_pool[i].sendme_ts_head = 0;
-            g_circuit_pool[i].sendme_ts_count = 0;
-            g_circuit_pool[i].rtt_initialized = 0;
-            g_circuit_pool[i].min_rtt_us = UINT64_MAX;
-            g_circuit_pool[i].bdp = 0;
-            g_circuit_pool[i].cwnd_full = 0;
-            g_circuit_pool[i].sendme_ack_count = 0;
-            g_circuit_pool[i].ewma_cell_count = 0.0;
-            g_circuit_pool[i].ewma_last_update = 0;
-            for (int s = 0; s < MOOR_MAX_STREAMS; s++)
-                g_circuit_pool[i].streams[s].target_fd = -1;
-            moor_reassembly_init(&g_circuit_pool[i].reassembly);
-            /* Bump monitoring stats */
-            moor_monitor_stats()->circuits_created++;
-            moor_monitor_stats()->circuits_active++;
-            circ_pool_unlock();
-            return &g_circuit_pool[i];
-        }
-    }
-
-    /* Pool exhausted: release lock before OOM kill (which calls
-     * circuit_destroy -> circuit_free -> reacquires lock). */
+    if (!g_circuit_init_done) moor_circuit_init_pool();
     circ_pool_unlock();
-    int freed = moor_circuit_oom_kill(1);
-    if (freed > 0) {
-        circ_pool_lock();
-        /* Retry allocation after OOM kill */
-        for (int i = 0; i < MOOR_MAX_CIRCUITS; i++) {
-            if (g_circuit_pool[i].circuit_id == 0) {
-                memset(&g_circuit_pool[i], 0, sizeof(moor_circuit_t));
-                g_circuit_pool[i].next_stream_id = 1;
-                g_circuit_pool[i].created_at = (uint64_t)time(NULL);
-                g_circuit_pool[i].last_cell_time = g_circuit_pool[i].created_at;
-                g_circuit_pool[i].circ_package_window = MOOR_CIRCUIT_WINDOW;
-                g_circuit_pool[i].circ_deliver_window = MOOR_CIRCUIT_WINDOW;
-                g_circuit_pool[i].cc_state = MOOR_CC_SLOW_START;
-                g_circuit_pool[i].cwnd = MOOR_CC_CWND_INIT;
-                g_circuit_pool[i].ssthresh = MOOR_CC_SSTHRESH_INIT;
-                g_circuit_pool[i].min_rtt_us = UINT64_MAX;
-                g_circuit_pool[i].bdp = 0;
-                g_circuit_pool[i].cwnd_full = 0;
-                g_circuit_pool[i].sendme_ack_count = 0;
-                for (int s = 0; s < MOOR_MAX_STREAMS; s++)
-                    g_circuit_pool[i].streams[s].target_fd = -1;
-                moor_reassembly_init(&g_circuit_pool[i].reassembly);
-                moor_monitor_stats()->circuits_created++;
-                moor_monitor_stats()->circuits_active++;
-                circ_pool_unlock();
-                return &g_circuit_pool[i];
-            }
+
+    moor_circuit_t *circ = calloc(1, sizeof(moor_circuit_t));
+    if (!circ) {
+        /* Real OOM — try to free some circuits and retry */
+        moor_circuit_oom_kill(1);
+        circ = calloc(1, sizeof(moor_circuit_t));
+        if (!circ) {
+            LOG_ERROR("circuit alloc: out of memory");
+            return NULL;
         }
-        circ_pool_unlock();
     }
 
-    LOG_ERROR("circuit pool exhausted");
-    return NULL;
+    circ_init_fields(circ);
+
+    circ_pool_lock();
+    if (circ_array_add(circ) != 0) {
+        circ_pool_unlock();
+        free(circ);
+        LOG_ERROR("circuit alloc: tracking array grow failed");
+        return NULL;
+    }
+    moor_monitor_stats()->circuits_created++;
+    moor_monitor_stats()->circuits_active++;
+    circ_pool_unlock();
+    return circ;
 }
 
-static void circ_free_unlocked(moor_circuit_t *circ) {
+/* circ_cleanup_unlocked: make circuit logically dead.  Memory stays valid.
+ * Sets circuit_id = 0 so close_all_marked can detect already-cleaned entries. */
+static void circ_cleanup_unlocked(moor_circuit_t *circ) {
     circ_unregister_unlocked(circ);
+    moor_socks5_invalidate_circuit(circ);
+    moor_hs_invalidate_circuit(circ);
+    moor_hs_event_invalidate_circuit(circ);
+    moor_circ_queue_clear(&circ->cell_queue_n);
+    moor_circ_queue_clear(&circ->cell_queue_p);
     moor_monitor_stats()->circuits_destroyed++;
     if (moor_monitor_stats()->circuits_active > 0)
         moor_monitor_stats()->circuits_active--;
@@ -324,7 +364,9 @@ static void circ_free_unlocked(moor_circuit_t *circ) {
         circ->prev_conn->circuit_refcount--;
     if (circ->next_conn && circ->next_conn->circuit_refcount > 0)
         circ->next_conn->circuit_refcount--;
-    /* Detach from conflux set so legs don't hold dangling pointers */
+    if (circ->chan)  moor_circuitmux_detach(circ->chan, circ);
+    if (circ->p_chan) moor_circuitmux_detach(circ->p_chan, circ);
+    if (circ->n_chan) moor_circuitmux_detach(circ->n_chan, circ);
     if (circ->conflux)
         moor_conflux_leg_failed(circ->conflux, circ);
     if (circ->rp_partner) {
@@ -333,9 +375,10 @@ static void circ_free_unlocked(moor_circuit_t *circ) {
     }
     moor_relay_invalidate_rp_cookies(circ);
     moor_relay_cleanup_exit_fds(circ);
-    /* Release per-IP circuit count so the slot can be reused */
     moor_relay_ip_circ_release(circ->relay_peer_ipv4);
     if (circ->build_ctx) {
+        if (circ->build_ctx->timeout_timer_id >= 0)
+            moor_event_remove_timer(circ->build_ctx->timeout_timer_id);
         moor_crypto_wipe(circ->build_ctx, sizeof(moor_cbuild_ctx_t));
         free(circ->build_ctx);
         circ->build_ctx = NULL;
@@ -348,23 +391,195 @@ static void circ_free_unlocked(moor_circuit_t *circ) {
     moor_crypto_wipe(circ->relay_backward_key, 32);
     moor_crypto_wipe(circ->relay_forward_digest, 32);
     moor_crypto_wipe(circ->relay_backward_digest, 32);
-    /* R10-CC2: Wipe HS e2e keys before zeroing the struct */
     moor_crypto_wipe(circ->e2e_send_key, 32);
     moor_crypto_wipe(circ->e2e_recv_key, 32);
     moor_crypto_wipe(circ->e2e_dh_shared, 32);
-    memset(circ, 0, sizeof(*circ));
+    /* Mark dead — memory stays valid for close_all_marked batch safety */
+    circ->circuit_id = 0;
+    circ->marked_for_close = 0;
+}
+
+/* circ_release_unlocked: remove from tracking array and free memory. */
+static void circ_release_unlocked(moor_circuit_t *circ) {
+    circ_array_remove(circ);
+    free(circ);
 }
 
 void moor_circuit_free(moor_circuit_t *circ) {
     if (!circ) return;
     circ_pool_lock();
-    circ_free_unlocked(circ);
+    /* If in pending close list, don't free — close_all_marked handles it.
+     * This prevents dangling pointers in the pending list. */
+    if (circ->marked_for_close) {
+        circ_pool_unlock();
+        return;
+    }
+    circ_cleanup_unlocked(circ);
+    circ_release_unlocked(circ);
     circ_pool_unlock();
 }
 
+/* ====================================================================
+ * Tor-aligned deferred circuit close
+ *
+ * The #1 source of UAF in MOOR was freeing circuits inline during
+ * event processing.  Tor solves this with mark-then-close:
+ *
+ *   1. moor_circuit_mark_for_close() — sets flags, adds to pending list
+ *      Circuit becomes invisible to lookups but slot stays valid.
+ *   2. moor_circuit_close_all_marked() — runs at end of event loop
+ *      Sends DESTROY cells, cleans up streams, frees the slot.
+ *
+ * No circuit is EVER freed while a callback might be using it.
+ * ==================================================================== */
+
+void moor_circuit_mark_for_close_(moor_circuit_t *circ, uint8_t reason,
+                                   int line, const char *file) {
+    if (!circ || circ->circuit_id == 0) return;
+
+    /* Already marked — don't double-add to pending list */
+    if (circ->marked_for_close) {
+        LOG_DEBUG("circuit %u already marked for close (at %s:%d), "
+                  "re-mark from %s:%d ignored",
+                  circ->circuit_id,
+                  circ->marked_for_close_file ? circ->marked_for_close_file : "?",
+                  circ->marked_for_close,
+                  file, line);
+        return;
+    }
+
+    LOG_INFO("circuit %u closing (%s)",
+             circ->circuit_id, destroy_reason_str(reason));
+
+    circ->marked_for_close = (uint16_t)(line > 0 ? line : 1);
+    circ->marked_for_close_file = file;
+    circ->marked_for_close_reason = reason;
+
+    /* Cancel async build if in progress */
+    if (circ->build_ctx)
+        moor_circuit_build_cancel(circ);
+
+    /* Unlink from RP partner immediately — prevents partner from
+     * forwarding cells to a dying circuit */
+    if (circ->rp_partner) {
+        moor_circuit_t *partner = circ->rp_partner;
+        partner->rp_partner = NULL;
+        circ->rp_partner = NULL;
+        /* Also mark the partner if it's alive */
+        if (partner->circuit_id != 0 && !partner->marked_for_close)
+            moor_circuit_mark_for_close_(partner, reason, line, file);
+    }
+
+    /* Add to pending-close list */
+    pending_close_add(circ);
+}
+
+void moor_circuit_close_all_marked(void) {
+    if (g_pending_close_count == 0) return;
+
+    /* Snapshot and clear the pending list — callbacks during cleanup
+     * can mark MORE circuits, which go into a fresh batch. */
+    int count = g_pending_close_count;
+    moor_circuit_t **batch = malloc((size_t)count * sizeof(moor_circuit_t *));
+    if (!batch) { g_pending_close_count = 0; return; }
+    memcpy(batch, g_pending_close, (size_t)count * sizeof(moor_circuit_t *));
+    g_pending_close_count = 0;
+
+    /* Phase 1-5: Process each circuit.  Memory stays valid (no free yet)
+     * so later iterations can safely check circuit_id on batch entries. */
+    for (int i = 0; i < count; i++) {
+        moor_circuit_t *circ = batch[i];
+
+        /* Could have been cleaned up by an earlier iteration in this batch
+         * (e.g. RP partner cleaned by its partner's cleanup) */
+        if (circ->circuit_id == 0 && !circ->marked_for_close)
+            continue;
+
+        LOG_DEBUG("circuit %u freed (%s)",
+                  circ->circuit_id,
+                  destroy_reason_str(circ->marked_for_close_reason));
+
+        /* --- Phase 1: Send DESTROY cells to peers --- */
+        uint8_t destroy_reason = circ->marked_for_close_reason;
+
+        if (circ->prev_conn && circ->prev_conn->state == CONN_STATE_OPEN) {
+            moor_cell_t dcell;
+            moor_cell_destroy(&dcell, circ->prev_circuit_id);
+            dcell.payload[0] = destroy_reason;
+            moor_connection_send_cell(circ->prev_conn, &dcell);
+        }
+
+        if (circ->next_conn && circ->next_conn->state == CONN_STATE_OPEN) {
+            moor_cell_t dcell;
+            moor_cell_destroy(&dcell, circ->next_circuit_id);
+            dcell.payload[0] = destroy_reason;
+            moor_connection_send_cell(circ->next_conn, &dcell);
+        }
+
+        if (circ->conn && circ->conn->state == CONN_STATE_OPEN) {
+            moor_cell_t dcell;
+            moor_cell_destroy(&dcell, circ->circuit_id);
+            dcell.payload[0] = destroy_reason;
+            moor_connection_send_cell(circ->conn, &dcell);
+        }
+
+        /* --- Phase 2: Close exit streams --- */
+        moor_relay_cleanup_exit_fds(circ);
+        for (int j = 0; j < MOOR_MAX_STREAMS; j++) {
+            if (circ->streams[j].target_fd >= 0) {
+                moor_event_remove(circ->streams[j].target_fd);
+                close(circ->streams[j].target_fd);
+                circ->streams[j].target_fd = -1;
+            }
+        }
+
+        /* --- Phase 3: Flush mix pool --- */
+        if (moor_mix_enabled()) {
+            if (circ->next_conn)
+                moor_mix_flush_circuit(circ->next_conn, circ->next_circuit_id);
+            if (circ->prev_conn)
+                moor_mix_flush_circuit(circ->prev_conn, circ->prev_circuit_id);
+        }
+
+        /* --- Phase 4: Notify subsystems --- */
+        moor_monitor_notify_circ(circ->circuit_id, "CLOSED");
+        moor_relay_invalidate_rp_cookies(circ);
+        moor_socks5_invalidate_circuit(circ);
+
+        /* --- Phase 5: Cleanup (logically dead, memory still valid) --- */
+        circ_pool_lock();
+        circ_cleanup_unlocked(circ);
+        circ_pool_unlock();
+    }
+
+    /* Phase 6: Actually free memory and remove from tracking array.
+     * All batch entries are now either cleaned up (circuit_id == 0) or
+     * were already dead before we started. */
+    circ_pool_lock();
+    for (int i = 0; i < count; i++) {
+        if (batch[i]->circuit_id == 0)
+            circ_release_unlocked(batch[i]);
+    }
+    circ_pool_unlock();
+
+    free(batch);
+}
+
+/* Mark ALL circuits on a dying connection for close.
+ * Like Tor's circuit_unlink_all_from_channel. */
+void moor_circuit_mark_all_for_conn(moor_connection_t *conn, uint8_t reason) {
+    if (!conn) return;
+    for (int i = 0; i < g_circuits_count; i++) {
+        moor_circuit_t *c = g_circuits[i];
+        if (c->circuit_id == 0 || c->marked_for_close) continue;
+        if (c->conn == conn || c->prev_conn == conn || c->next_conn == conn)
+            moor_circuit_mark_for_close(c, reason);
+    }
+}
+
 static void circ_nullify_conn_unlocked(moor_connection_t *conn) {
-    for (int i = 0; i < MOOR_MAX_CIRCUITS; i++) {
-        moor_circuit_t *c = &g_circuit_pool[i];
+    for (int i = 0; i < g_circuits_count; i++) {
+        moor_circuit_t *c = g_circuits[i];
         if (c->circuit_id == 0) continue;
         if (c->conn == conn) {
             circ_ht_remove(conn, c->circuit_id);
@@ -398,8 +613,8 @@ void moor_circuit_nullify_conn(moor_connection_t *conn) {
 int moor_circuit_conn_in_use(moor_connection_t *conn) {
     if (!conn) return 0;
     circ_pool_lock();
-    for (int j = 0; j < MOOR_MAX_CIRCUITS; j++) {
-        moor_circuit_t *o = &g_circuit_pool[j];
+    for (int j = 0; j < g_circuits_count; j++) {
+        moor_circuit_t *o = g_circuits[j];
         if (o->circuit_id == 0) continue;
         if (o->conn == conn || o->prev_conn == conn ||
             o->next_conn == conn) {
@@ -411,88 +626,21 @@ int moor_circuit_conn_in_use(moor_connection_t *conn) {
     return 0;
 }
 
-/* Check if any circuit (other than skip_idx) references this connection */
-static int conn_has_other_refs(moor_connection_t *target, int skip_idx) {
-    for (int j = 0; j < MOOR_MAX_CIRCUITS; j++) {
-        if (j == skip_idx) continue;
-        moor_circuit_t *o = &g_circuit_pool[j];
-        if (o->circuit_id == 0) continue;
-        if (o->conn == target || o->prev_conn == target ||
-            o->next_conn == target)
-            return 1;
-    }
-    return 0;
-}
+
 
 void moor_circuit_teardown_for_conn(moor_connection_t *conn) {
-    if (!conn) return;
-    circ_pool_lock();
-    LOG_DEBUG("teardown_for_conn: conn=%p fd=%d", (void*)conn, conn->fd);
-    for (int i = 0; i < MOOR_MAX_CIRCUITS; i++) {
-        moor_circuit_t *c = &g_circuit_pool[i];
-        if (c->circuit_id == 0) continue;
+    MOOR_ASSERT_MSG(conn != NULL, "teardown_for_conn: NULL conn");
+    LOG_WARN("teardown_for_conn: conn=%p fd=%d state=%d gen=%u",
+             (void*)conn, conn->fd, conn->state, conn->generation);
 
-        int match = (c->conn == conn || c->prev_conn == conn ||
-                     c->next_conn == conn);
-        if (!match) continue;
-        LOG_DEBUG("teardown match: circ %u slot=%d (conn=%d prev=%d next=%d) "
-                  "conn_ptr=%p prev_ptr=%p next_ptr=%p",
-                  c->circuit_id, i,
-                  c->conn == conn, c->prev_conn == conn, c->next_conn == conn,
-                  (void*)c->conn, (void*)c->prev_conn, (void*)c->next_conn);
+    /* Tor-aligned: mark ALL circuits on this dying connection for close.
+     * No inline free, no cascade, no UAF.  DESTROY cells and cleanup
+     * happen in moor_circuit_close_all_marked() at end of event loop. */
+    moor_circuit_mark_all_for_conn(conn, DESTROY_REASON_CONNECTFAILED);
 
-        /* Close next_conn if it's not the dying connection */
-        if (c->next_conn && c->next_conn != conn) {
-            moor_connection_t *nc = c->next_conn;
-            if (nc->state == CONN_STATE_OPEN) {
-                moor_cell_t destroy;
-                moor_cell_destroy(&destroy, c->next_circuit_id);
-                moor_connection_send_cell(nc, &destroy);
-            }
-            c->next_conn = NULL;
-            if (!conn_has_other_refs(nc, i)) {
-                moor_event_remove(nc->fd);
-                /* Close without moor_connection_close() to avoid deadlock:
-                 * we already hold circ_pool_lock and nullify manually */
-                moor_mix_purge_conn(nc);
-                circ_nullify_conn_unlocked(nc);
-                if (nc->fd >= 0) close(nc->fd);
-                moor_connection_free(nc);
-            }
-        }
-
-        /* Notify upstream via prev_conn but only close if not shared */
-        if (c->prev_conn && c->prev_conn != conn) {
-            moor_connection_t *pc = c->prev_conn;
-            if (pc->state == CONN_STATE_OPEN) {
-                moor_cell_t destroy;
-                moor_cell_destroy(&destroy, c->prev_circuit_id);
-                moor_connection_send_cell(pc, &destroy);
-            }
-            c->prev_conn = NULL;
-            if (!conn_has_other_refs(pc, i)) {
-                moor_event_remove(pc->fd);
-                moor_mix_purge_conn(pc);
-                circ_nullify_conn_unlocked(pc);
-                if (pc->fd >= 0) close(pc->fd);
-                moor_connection_free(pc);
-            }
-        }
-
-        moor_relay_cleanup_exit_fds(c);
-
-        for (int j = 0; j < MOOR_MAX_STREAMS; j++) {
-            if (c->streams[j].target_fd >= 0) {
-                moor_event_remove(c->streams[j].target_fd);
-                close(c->streams[j].target_fd);
-                c->streams[j].target_fd = -1;
-            }
-        }
-
-        LOG_INFO("circuit %u torn down (connection lost)", c->circuit_id);
-        circ_free_unlocked(c);
-    }
-    circ_pool_unlock();
+    /* Nullify conn pointers so marked circuits don't try to send on the
+     * dead connection during close_all_marked's DESTROY phase. */
+    moor_circuit_nullify_conn(conn);
 }
 
 moor_circuit_t *moor_circuit_find(uint32_t circuit_id,
@@ -500,32 +648,32 @@ moor_circuit_t *moor_circuit_find(uint32_t circuit_id,
     circ_pool_lock();
     /* O(1) hash table lookup */
     moor_circuit_t *c = circ_ht_lookup(conn, circuit_id);
-    if (c) { circ_pool_unlock(); return c; }
+    /* Tor-aligned: marked circuits are invisible to normal lookups */
+    if (c && !c->marked_for_close) { circ_pool_unlock(); return c; }
 
     /* Fallback: linear scan for circuits not yet registered in HT
      * (e.g. during CREATE before register, or legacy paths) */
-    for (int i = 0; i < MOOR_MAX_CIRCUITS; i++) {
-        if (g_circuit_pool[i].circuit_id == circuit_id) {
-            if (g_circuit_pool[i].conn == conn ||
-                g_circuit_pool[i].prev_conn == conn ||
-                g_circuit_pool[i].next_conn == conn) {
+    for (int i = 0; i < g_circuits_count; i++) {
+        moor_circuit_t *ci = g_circuits[i];
+        if (ci->marked_for_close) continue;
+        if (ci->circuit_id == circuit_id) {
+            if (ci->conn == conn || ci->prev_conn == conn ||
+                ci->next_conn == conn) {
                 circ_pool_unlock();
-                return &g_circuit_pool[i];
+                return ci;
             }
-            if (g_circuit_pool[i].is_client && g_circuit_pool[i].conn == conn) {
+            if (ci->is_client && ci->conn == conn) {
                 circ_pool_unlock();
-                return &g_circuit_pool[i];
+                return ci;
             }
         }
-        if (g_circuit_pool[i].prev_circuit_id == circuit_id &&
-            g_circuit_pool[i].prev_conn == conn) {
+        if (ci->prev_circuit_id == circuit_id && ci->prev_conn == conn) {
             circ_pool_unlock();
-            return &g_circuit_pool[i];
+            return ci;
         }
-        if (g_circuit_pool[i].next_circuit_id == circuit_id &&
-            g_circuit_pool[i].next_conn == conn) {
+        if (ci->next_circuit_id == circuit_id && ci->next_conn == conn) {
             circ_pool_unlock();
-            return &g_circuit_pool[i];
+            return ci;
         }
     }
     circ_pool_unlock();
@@ -535,8 +683,8 @@ moor_circuit_t *moor_circuit_find(uint32_t circuit_id,
 moor_circuit_t *moor_circuit_find_by_intro_pk(const moor_circuit_t *exclude) {
     circ_pool_lock();
     moor_circuit_t *found = NULL;
-    for (int i = 0; i < MOOR_MAX_CIRCUITS; i++) {
-        moor_circuit_t *c = &g_circuit_pool[i];
+    for (int i = 0; i < g_circuits_count; i++) {
+        moor_circuit_t *c = g_circuits[i];
         if (c->circuit_id != 0 && c != exclude &&
             c->intro_service_pk[0] != 0 &&
             c->prev_conn && c->prev_conn->state == CONN_STATE_OPEN) {
@@ -623,17 +771,16 @@ static int cke_derive(uint8_t key_seed[32], uint8_t auth_tag[32],
  *   Derive key_seed via CKE HKDF, verify auth_tag, derive circuit keys.
  */
 int moor_circuit_create(moor_circuit_t *circ,
-                        const uint8_t relay_identity_pk[32]) {
+                        const uint8_t relay_identity_pk[32],
+                        const uint8_t relay_onion_pk[32]) {
     /* H3: Record build start time for cumulative deadline */
     if (circ->build_started_ms == 0)
         circ->build_started_ms = moor_time_ms();
 
-    /* Convert relay's Ed25519 identity pk to Curve25519 */
-    uint8_t relay_curve_pk[32];
-    if (moor_crypto_ed25519_to_curve25519_pk(relay_curve_pk, relay_identity_pk) != 0) {
-        LOG_ERROR("CKE: failed to convert relay identity pk to Curve25519");
-        return -1;
-    }
+    /* Use relay's Curve25519 onion key directly for DH (rotatable,
+     * provides forward secrecy window).  Identity key stays in HKDF
+     * salt for authentication binding. */
+    const uint8_t *relay_curve_pk = relay_onion_pk;
 
     /* Generate ephemeral X25519 keypair */
     uint8_t eph_pk[32], eph_sk[32];
@@ -757,13 +904,12 @@ int moor_circuit_create(moor_circuit_t *circ,
  */
 int moor_circuit_create_pq(moor_circuit_t *circ,
                            const uint8_t relay_identity_pk[32],
+                           const uint8_t relay_onion_pk[32],
                            const uint8_t relay_kem_pk[1184]) {
     if (circ->build_started_ms == 0)
         circ->build_started_ms = moor_time_ms();
 
-    uint8_t relay_curve_pk[32];
-    if (moor_crypto_ed25519_to_curve25519_pk(relay_curve_pk, relay_identity_pk) != 0)
-        return -1;
+    const uint8_t *relay_curve_pk = relay_onion_pk;
 
     /* Classical X25519 ephemeral keypair */
     uint8_t eph_pk[32], eph_sk[32];
@@ -918,12 +1064,8 @@ int moor_circuit_extend(moor_circuit_t *circ,
         return -1;
     }
 
-    /* Convert relay's Ed25519 identity pk to Curve25519 for DH */
-    uint8_t relay_curve_pk[32];
-    if (moor_crypto_ed25519_to_curve25519_pk(relay_curve_pk, next_relay->identity_pk) != 0) {
-        LOG_ERROR("EXTEND: failed to convert relay identity to Curve25519");
-        return -1;
-    }
+    /* Use relay's Curve25519 onion key for static DH (rotatable) */
+    const uint8_t *relay_curve_pk = next_relay->onion_pk;
 
     /* Generate ephemeral X25519 keypair */
     uint8_t eph_pk[32], eph_sk[32];
@@ -1129,10 +1271,7 @@ int moor_circuit_extend(moor_circuit_t *circ,
  */
 int moor_circuit_extend_pq(moor_circuit_t *circ,
                            const moor_node_descriptor_t *next_relay) {
-    uint8_t relay_curve_pk[32];
-    if (moor_crypto_ed25519_to_curve25519_pk(relay_curve_pk,
-                                              next_relay->identity_pk) != 0)
-        return -1;
+    const uint8_t *relay_curve_pk = next_relay->onion_pk;
 
     /* Classical X25519 ephemeral */
     uint8_t eph_pk[32], eph_sk[32];
@@ -1428,8 +1567,7 @@ int moor_circuit_open_stream(moor_circuit_t *circ, uint16_t *stream_id,
                            (uint8_t *)begin_data, (uint16_t)(n + 1));
 
             if (moor_circuit_encrypt_forward(circ, &cell) != 0) return -1;
-            if (!circ->conn) return -1;
-            moor_connection_send_cell(circ->conn, &cell);
+            if (moor_circuit_queue_cell(circ, &cell, 0) != 0) return -1;
 
             LOG_INFO("stream %u: BEGIN sent", circ->streams[i].stream_id);
             return 0;
@@ -1461,8 +1599,7 @@ uint32_t moor_circuit_resolve(moor_circuit_t *circ, const char *hostname) {
     moor_cell_relay(&cell, circ->circuit_id, RELAY_RESOLVE, 0,
                     (const uint8_t *)hostname, (uint16_t)hlen);
     if (moor_circuit_encrypt_forward(circ, &cell) != 0) return 0;
-    if (!circ->conn) return 0;
-    if (moor_connection_send_cell(circ->conn, &cell) != 0) return 0;
+    if (moor_circuit_queue_cell(circ, &cell, 0) != 0) return 0;
 
     /* Wait for RELAY_RESOLVED (up to 10s) */
     moor_cell_t resp;
@@ -1499,6 +1636,22 @@ uint32_t moor_circuit_resolve(moor_circuit_t *circ, const char *hostname) {
     return 0;
 }
 
+/* Send a cell on a circuit's connection.
+ * direction: 0=toward n_chan/conn (forward), 1=toward p_chan/conn (backward).
+ * Cell is relay-encrypted; link-AEAD happens in moor_connection_send_cell. */
+int moor_circuit_queue_cell(moor_circuit_t *circ, const moor_cell_t *cell,
+                            uint8_t direction) {
+    if (!circ || !cell) return -1;
+    if (MOOR_CIRCUIT_IS_MARKED(circ)) return -1;
+
+    moor_connection_t *conn = (direction == 0)
+        ? (circ->next_conn ? circ->next_conn : circ->conn)
+        : (circ->prev_conn ? circ->prev_conn : circ->conn);
+    if (conn && conn->state == CONN_STATE_OPEN)
+        return moor_connection_send_cell(conn, cell);
+    return -1;
+}
+
 int moor_circuit_send_data(moor_circuit_t *circ, uint16_t stream_id,
                            const uint8_t *data, size_t len) {
     moor_stream_t *stream = moor_circuit_find_stream(circ, stream_id);
@@ -1524,7 +1677,7 @@ int moor_circuit_send_data(moor_circuit_t *circ, uint16_t stream_id,
                        stream_id, data, chunk);
         if (moor_circuit_encrypt_forward(circ, &cell) != 0) return -1;
 
-        if (!circ->conn || moor_connection_send_cell(circ->conn, &cell) != 0)
+        if (moor_circuit_queue_cell(circ, &cell, 0) != 0)
             return -1;
 
         /* Track inflight for CC, decrement legacy + stream windows */
@@ -1575,9 +1728,9 @@ int moor_circuit_handle_sendme(moor_circuit_t *circ, uint16_t stream_id,
         }
         /* SENDME auth (Prop 289): verify digest from peer */
         if (circ->sendme_auth_count > 0) {
-            if (sendme_len < 8) {
-                LOG_WARN("circuit %u: SENDME missing auth digest",
-                         circ->circuit_id);
+            if (sendme_len < MOOR_SENDME_AUTH_LEN) {
+                LOG_WARN("circuit %u: SENDME too short (%u < %d)",
+                         circ->circuit_id, sendme_len, MOOR_SENDME_AUTH_LEN);
                 return -1;
             }
             uint8_t tail = (circ->sendme_auth_head +
@@ -1741,15 +1894,17 @@ int moor_circuit_maybe_send_sendme(moor_circuit_t *circ, uint16_t stream_id) {
         }
         circ->circ_deliver_window--;
         if (circ->circ_deliver_window <= MOOR_CIRCUIT_WINDOW - MOOR_SENDME_INCREMENT) {
-            /* Send circuit-level SENDME with auth digest (Prop 289) */
-            uint8_t sendme_body[8];
+            /* Send circuit-level SENDME with auth digest (Prop 289).
+             * Must send MOOR_SENDME_AUTH_LEN bytes to match relay's check. */
+            uint8_t sendme_body[MOOR_SENDME_AUTH_LEN];
             memcpy(sendme_body,
-                   circ->hops[circ->num_hops - 1].backward_digest, 8);
+                   circ->hops[circ->num_hops - 1].backward_digest,
+                   MOOR_SENDME_AUTH_LEN);
             moor_cell_t cell;
             moor_cell_relay(&cell, circ->circuit_id, RELAY_SENDME,
-                           0, sendme_body, 8);
-            if (moor_circuit_encrypt_forward(circ, &cell) != 0 || !circ->conn) return -1;
-            moor_connection_send_cell(circ->conn, &cell);
+                           0, sendme_body, MOOR_SENDME_AUTH_LEN);
+            if (moor_circuit_encrypt_forward(circ, &cell) != 0) return -1;
+            if (moor_circuit_queue_cell(circ, &cell, 0) != 0) return -1;
             circ->circ_deliver_window += MOOR_SENDME_INCREMENT;
             LOG_DEBUG("circuit %u: sent circuit SENDME (auth)", circ->circuit_id);
         }
@@ -1766,8 +1921,8 @@ int moor_circuit_maybe_send_sendme(moor_circuit_t *circ, uint16_t stream_id) {
                 moor_cell_t cell;
                 moor_cell_relay(&cell, circ->circuit_id, RELAY_SENDME,
                                stream_id, NULL, 0);
-                if (moor_circuit_encrypt_forward(circ, &cell) != 0 || !circ->conn) return -1;
-                moor_connection_send_cell(circ->conn, &cell);
+                if (moor_circuit_encrypt_forward(circ, &cell) != 0) return -1;
+                if (moor_circuit_queue_cell(circ, &cell, 0) != 0) return -1;
                 stream->deliver_window += MOOR_SENDME_INCREMENT;
                 LOG_DEBUG("stream %u: sent stream SENDME", stream_id);
             }
@@ -1778,70 +1933,56 @@ int moor_circuit_maybe_send_sendme(moor_circuit_t *circ, uint16_t stream_id) {
 
 int moor_circuit_destroy(moor_circuit_t *circ) {
     if (!circ || circ->circuit_id == 0) return -1;
-
-    moor_cell_t cell;
-    moor_cell_destroy(&cell, circ->circuit_id);
-
-    if (circ->conn && circ->conn->state == CONN_STATE_OPEN)
-        moor_connection_send_cell(circ->conn, &cell);
-
-    LOG_INFO("circuit %u destroyed", circ->circuit_id);
-    moor_monitor_notify_circ(circ->circuit_id, "CLOSED");
-
-    /* Save connection pointer and its fd before free wipes circ.
-     * After moor_circuit_free, conn->circuit_refcount is decremented.
-     * Only close the connection if refcount hit 0, it's still open,
-     * and its fd matches what we saved (guards against pool slot reuse
-     * if the connection was already freed and reallocated). */
-    moor_connection_t *conn = circ->conn;
-    int saved_fd = conn ? conn->fd : -1;
-    moor_circuit_free(circ);
-
-    if (conn && conn->circuit_refcount <= 0 &&
-        conn->state == CONN_STATE_OPEN && conn->fd == saved_fd &&
-        saved_fd >= 0) {
-        moor_event_remove(conn->fd);
-        moor_connection_close(conn);
-    }
-
+    /* Tor-aligned: just mark for close.  DESTROY cells, stream cleanup,
+     * and slot free happen in moor_circuit_close_all_marked(). */
+    moor_circuit_mark_for_close(circ, DESTROY_REASON_FINISHED);
     return 0;
 }
 
 void moor_circuit_check_timeouts(void) {
-    if (!g_circuit_pool_init) return;
+    if (!g_circuit_init_done) return;
     uint64_t now = (uint64_t)time(NULL);
 
-    /* Snapshot pool indices under lock to avoid racing with builder thread.
-     * We collect indices, then process outside the lock since destroy
+    /* Snapshot circuit pointers under lock to avoid racing with builder thread.
+     * We collect pointers + ages, then process outside the lock since destroy
      * needs to re-acquire it. */
-    int timeout_indices[MOOR_MAX_CIRCUITS];
-    uint64_t timeout_ages[MOOR_MAX_CIRCUITS];
-    uint32_t timeout_ids[MOOR_MAX_CIRCUITS];
+    circ_pool_lock();
+    int snap_cap = g_circuits_count;
+    circ_pool_unlock();
+    if (snap_cap == 0) return;
+
+    moor_circuit_t **snap_circs = malloc((size_t)snap_cap * sizeof(moor_circuit_t *));
+    uint64_t *snap_ages = malloc((size_t)snap_cap * sizeof(uint64_t));
+    uint32_t *snap_ids = malloc((size_t)snap_cap * sizeof(uint32_t));
+    if (!snap_circs || !snap_ages || !snap_ids) {
+        free(snap_circs); free(snap_ages); free(snap_ids);
+        return;
+    }
     int timeout_count = 0;
 
     circ_pool_lock();
-    for (int i = 0; i < MOOR_MAX_CIRCUITS; i++) {
-        moor_circuit_t *circ = &g_circuit_pool[i];
+    for (int i = 0; i < g_circuits_count && timeout_count < snap_cap; i++) {
+        moor_circuit_t *circ = g_circuits[i];
         if (circ->circuit_id == 0) continue;
         if (now < circ->created_at) continue;
-        timeout_indices[timeout_count] = i;
-        timeout_ages[timeout_count] = now - circ->created_at;
-        timeout_ids[timeout_count] = circ->circuit_id;
+        snap_circs[timeout_count] = circ;
+        snap_ages[timeout_count] = now - circ->created_at;
+        snap_ids[timeout_count] = circ->circuit_id;
         timeout_count++;
     }
     circ_pool_unlock();
 
     for (int ti = 0; ti < timeout_count; ti++) {
-        moor_circuit_t *circ = &g_circuit_pool[timeout_indices[ti]];
-        if (circ->circuit_id == 0) continue; /* already freed by earlier iteration */
-        if (circ->circuit_id != timeout_ids[ti]) continue; /* slot reused since snapshot */
+        moor_circuit_t *circ = snap_circs[ti];
+        if (circ->circuit_id == 0) continue;
+        if (circ->circuit_id != snap_ids[ti]) continue;
 
-        uint64_t age = timeout_ages[ti];
+        uint64_t age = snap_ages[ti];
 
         /* Building-phase timeout: circuit incomplete after CIRCUIT_TIMEOUT */
         if (circ->is_client && circ->num_hops < MOOR_CIRCUIT_HOPS &&
             age > MOOR_CIRCUIT_TIMEOUT) {
-            LOG_WARN("circuit %u timed out during build (age=%llu s)",
+            LOG_WARN("circuit %u: build timed out (%llus)",
                      circ->circuit_id, (unsigned long long)age);
             /* Send DESTROY while connection is still alive --
              * invalidate_circuit closes it, preventing destroy() from
@@ -1882,9 +2023,8 @@ void moor_circuit_check_timeouts(void) {
          * of activity.  Prevents a malicious client from pinning circuit
          * slots indefinitely with periodic keepalive traffic. */
         if (!circ->is_client && age > MOOR_RELAY_CIRCUIT_MAX_AGE) {
-            LOG_INFO("relay circuit %u expired (age=%llu s, max=%d)",
-                     circ->circuit_id, (unsigned long long)age,
-                     MOOR_RELAY_CIRCUIT_MAX_AGE);
+            LOG_INFO("circuit %u: expired (relay, age %llus)",
+                     circ->circuit_id, (unsigned long long)age);
             moor_circuit_destroy(circ);
             continue;
         }
@@ -1903,7 +2043,7 @@ void moor_circuit_check_timeouts(void) {
                 /* Don't rotate -- still has active streams.
                  * Force-kill after 2x rotation interval to prevent leaks. */
                 if (age > MOOR_CIRCUIT_ROTATE_SECS * 2) {
-                    LOG_WARN("force-rotating circuit %u with active streams (age=%llu s)",
+                    LOG_WARN("circuit %u: force-recycled (still had streams, age %llus)",
                              circ->circuit_id, (unsigned long long)age);
                     if (circ->conn && circ->conn->state == CONN_STATE_OPEN) {
                         moor_cell_t dcell;
@@ -1914,7 +2054,7 @@ void moor_circuit_check_timeouts(void) {
                     moor_circuit_destroy(circ);
                 }
             } else {
-                LOG_INFO("rotating idle circuit %u (age=%llu s)",
+                LOG_INFO("circuit %u: recycled (idle %llus)",
                          circ->circuit_id, (unsigned long long)age);
                 if (circ->conn && circ->conn->state == CONN_STATE_OPEN) {
                     moor_cell_t dcell;
@@ -1927,65 +2067,61 @@ void moor_circuit_check_timeouts(void) {
         }
     }
 
-    /* OOM check: if above high-water mark, kill idle circuits */
+    free(snap_circs);
+    free(snap_ages);
+    free(snap_ids);
+
+    /* OOM check: soft threshold — triggers cleanup, never blocks allocation */
     int active = moor_circuit_active_count();
     if (active > MOOR_OOM_HIGH_WATER) {
         int target = active - MOOR_OOM_HIGH_WATER;
-        LOG_WARN("OOM: %d active circuits (high-water %d), killing %d",
+        LOG_WARN("OOM: %d active circuits (soft limit %d), killing %d idle",
                  active, MOOR_OOM_HIGH_WATER, target);
         moor_circuit_oom_kill(target);
     }
 }
 
 int moor_circuit_active_count(void) {
-    if (!g_circuit_pool_init) return 0;
+    if (!g_circuit_init_done) return 0;
     circ_pool_lock();
-    int count = 0;
-    for (int i = 0; i < MOOR_MAX_CIRCUITS; i++) {
-        if (g_circuit_pool[i].circuit_id != 0)
-            count++;
-    }
+    int count = g_circuits_count;
     circ_pool_unlock();
     return count;
 }
 
 int moor_circuit_oom_kill(int target_free) {
-    if (!g_circuit_pool_init || target_free <= 0) return 0;
+    if (!g_circuit_init_done || target_free <= 0) return 0;
 
     uint64_t now = (uint64_t)time(NULL);
     int killed = 0;
 
-    /* Pass 1: kill idle non-client circuits (no cell activity for MOOR_OOM_IDLE_SECS) */
-    for (int i = 0; i < MOOR_MAX_CIRCUITS && killed < target_free; i++) {
-        moor_circuit_t *circ = &g_circuit_pool[i];
+    /* Pass 1: kill idle non-client circuits */
+    for (int i = 0; i < g_circuits_count && killed < target_free; i++) {
+        moor_circuit_t *circ = g_circuits[i];
         if (circ->circuit_id == 0 || circ->is_client) continue;
-        if (now >= circ->last_cell_time &&
-            now - circ->last_cell_time >= MOOR_OOM_IDLE_SECS) {
-            LOG_INFO("OOM: killing idle circuit %u (idle %llu s)",
-                     circ->circuit_id,
-                     (unsigned long long)(now - circ->last_cell_time));
-            if (circ->conn && circ->conn->state == CONN_STATE_OPEN) {
-                moor_cell_t dcell;
-                moor_cell_destroy(&dcell, circ->circuit_id);
-                moor_connection_send_cell(circ->conn, &dcell);
-            }
-            moor_socks5_invalidate_circuit(circ);
-            moor_circuit_destroy(circ);
-            killed++;
-        }
+        if (now < circ->last_cell_time) continue;
+        if (now - circ->last_cell_time < MOOR_OOM_IDLE_SECS) continue;
+
+        uint32_t saved_id = circ->circuit_id;
+        LOG_INFO("circuit %u: recycled by OOM (idle %llus)",
+                 saved_id, (unsigned long long)(now - circ->last_cell_time));
+        moor_socks5_invalidate_circuit(circ);
+        if (circ->circuit_id != saved_id) continue;
+        moor_circuit_destroy(circ);
+        killed++;
     }
 
     /* Pass 2: if still need more, kill oldest non-client circuits */
     while (killed < target_free) {
         moor_circuit_t *oldest = NULL;
-        for (int i = 0; i < MOOR_MAX_CIRCUITS; i++) {
-            moor_circuit_t *circ = &g_circuit_pool[i];
+        for (int i = 0; i < g_circuits_count; i++) {
+            moor_circuit_t *circ = g_circuits[i];
             if (circ->circuit_id == 0 || circ->is_client) continue;
             if (!oldest || circ->created_at < oldest->created_at)
                 oldest = circ;
         }
         if (!oldest) break;
-        LOG_INFO("OOM: killing oldest circuit %u (age %llu s)",
+        LOG_INFO("circuit %u: recycled by OOM (oldest, age %llus)",
                  oldest->circuit_id,
                  (unsigned long long)(now - oldest->created_at));
         if (oldest->conn && oldest->conn->state == CONN_STATE_OPEN) {
@@ -2090,14 +2226,14 @@ int moor_circuit_build(moor_circuit_t *circ,
     /* CREATE with guard — use PQ hybrid if relay supports Kyber768 */
     memcpy(circ->hops[0].node_id, guard->identity_pk, 32);
     if ((guard->features & NODE_FEATURE_PQ) && !sodium_is_zero(guard->kem_pk, 1184)) {
-        if (moor_circuit_create_pq(circ, guard->identity_pk, guard->kem_pk) != 0)
+        if (moor_circuit_create_pq(circ, guard->identity_pk, guard->onion_pk, guard->kem_pk) != 0)
             return -1;
     } else {
         /* R10-ADV2: Warn on possible PQ downgrade */
         if (!sodium_is_zero(guard->kem_pk, 1184))
             LOG_WARN("relay %s:%u lost PQ capability -- possible downgrade attack",
                      guard->address, guard->or_port);
-        if (moor_circuit_create(circ, guard->identity_pk) != 0)
+        if (moor_circuit_create(circ, guard->identity_pk, guard->onion_pk) != 0)
             return -1;
     }
 
@@ -2211,6 +2347,7 @@ int moor_circuit_build_bridge(moor_circuit_t *circ,
         moor_shade_client_params_t       shade;
         moor_mirage_client_params_t      mirage;
         moor_shitstorm_client_params_t   shitstorm;
+        moor_speakeasy_client_params_t   speakeasy;
     } tp_params;
     memset(&tp_params, 0, sizeof(tp_params));
     if (transport) {
@@ -2224,11 +2361,13 @@ int moor_circuit_build_bridge(moor_circuit_t *circ,
                 LOG_WARN("shade: Ed25519->Curve25519 pk conversion failed");
             tp_params.shade.iat_mode = MOOR_SHADE_IAT_NONE;
         } else if (strcmp(transport->name, "mirage") == 0) {
-            tp_params.mirage.sni[0] = '\0'; /* random SNI from local pool */
+            tp_params.mirage.sni[0] = '\0';
             memcpy(tp_params.mirage.node_id, bridge->identity_pk, 32);
         } else if (strcmp(transport->name, "shitstorm") == 0) {
-            tp_params.shitstorm.sni[0] = '\0'; /* random SNI from local pool */
+            tp_params.shitstorm.sni[0] = '\0';
             memcpy(tp_params.shitstorm.identity_pk, bridge->identity_pk, 32);
+        } else if (strcmp(transport->name, "speakeasy") == 0) {
+            memcpy(tp_params.speakeasy.identity_pk, bridge->identity_pk, 32);
         }
     }
 
@@ -2258,9 +2397,13 @@ int moor_circuit_build_bridge(moor_circuit_t *circ,
     }
     bridge_conn->circuit_refcount++;
 
-    /* CREATE with bridge (classical — bridges don't advertise KEM keys yet) */
+    /* CREATE with bridge — bridges don't have onion_pk in their entry,
+     * so derive Curve25519 from Ed25519 identity as fallback. */
+    uint8_t bridge_onion_pk[32];
+    if (moor_crypto_ed25519_to_curve25519_pk(bridge_onion_pk, bridge->identity_pk) != 0)
+        return -1;
     memcpy(circ->hops[0].node_id, bridge->identity_pk, 32);
-    if (moor_circuit_create(circ, bridge->identity_pk) != 0) {
+    if (moor_circuit_create(circ, bridge->identity_pk, bridge_onion_pk) != 0) {
         bridge_conn->circuit_refcount--;
         return -1;
     }
@@ -2586,30 +2729,34 @@ uint64_t moor_padding_next_interval(void) {
 void moor_padding_send_all(void) {
     if (!g_padding_enabled) return;
 
-    for (int i = 0; i < MOOR_MAX_CIRCUITS; i++) {
-        if (g_circuit_pool[i].circuit_id == 0) continue;
-        if (!g_circuit_pool[i].conn) continue;
-        if (g_circuit_pool[i].conn->state != CONN_STATE_OPEN) continue;
+    for (int i = 0; i < g_circuits_count; i++) {
+        moor_circuit_t *circ = g_circuits[i];
+        if (circ->circuit_id == 0) continue;
+        moor_connection_t *c = circ->conn;
+        if (!c || c->state != CONN_STATE_OPEN) continue;
 
         /* M6: Per-circuit random skip to break correlation across circuits */
         uint8_t coin;
         moor_crypto_random(&coin, 1);
         if (coin & 1) continue;
 
+        /* Re-validate after random — send_cell on a prior iteration
+         * could have triggered a teardown that nullified our conn. */
+        if (circ->circuit_id == 0 || circ->conn != c ||
+            c->state != CONN_STATE_OPEN) continue;
+
         /* Send a CELL_PADDING on this circuit */
         uint8_t pad_payload[509];
         moor_crypto_random(pad_payload, 509);
         if (moor_mix_enabled()) {
-            moor_mix_enqueue(g_circuit_pool[i].conn,
-                             g_circuit_pool[i].circuit_id,
-                             CELL_PADDING, pad_payload);
+            moor_mix_enqueue(c, circ->circuit_id, CELL_PADDING, pad_payload);
         } else {
             moor_cell_t cell;
             memset(&cell, 0, sizeof(cell));
-            cell.circuit_id = g_circuit_pool[i].circuit_id;
+            cell.circuit_id = circ->circuit_id;
             cell.command = CELL_PADDING;
             memcpy(cell.payload, pad_payload, 509);
-            moor_connection_send_cell(g_circuit_pool[i].conn, &cell);
+            moor_connection_send_cell(c, &cell);
         }
     }
 }
@@ -3462,12 +3609,11 @@ int moor_dos_cell_check_conn(moor_connection_t *conn) {
  * ================================================================ */
 int moor_circuit_preemptive_count(void) {
     int clean = 0;
-    for (int i = 0; i < MOOR_MAX_CIRCUITS; i++) {
-        if (g_circuit_pool[i].circuit_id != 0 &&
-            g_circuit_pool[i].is_client &&
-            g_circuit_pool[i].num_hops == MOOR_CIRCUIT_HOPS &&
-            g_circuit_pool[i].next_stream_id == 1) {
-            /* Has ID, is client, fully built, no streams opened = clean */
+    for (int i = 0; i < g_circuits_count; i++) {
+        moor_circuit_t *c = g_circuits[i];
+        if (c->circuit_id != 0 && c->is_client &&
+            c->num_hops == MOOR_CIRCUIT_HOPS &&
+            c->next_stream_id == 1) {
             clean++;
         }
     }
@@ -3484,8 +3630,8 @@ void moor_circuit_set_isolation(moor_circuit_t *circ, const char *key) {
 
 /* Find a clean circuit matching the given isolation key */
 moor_circuit_t *moor_circuit_find_by_isolation(const char *key) {
-    for (int i = 0; i < MOOR_MAX_CIRCUITS; i++) {
-        moor_circuit_t *c = &g_circuit_pool[i];
+    for (int i = 0; i < g_circuits_count; i++) {
+        moor_circuit_t *c = g_circuits[i];
         if (c->circuit_id != 0 && c->is_client &&
             c->num_hops == MOOR_CIRCUIT_HOPS &&
             strcmp(c->isolation_key, key) == 0) {
@@ -3526,6 +3672,15 @@ static void cbuild_finish(moor_circuit_t *circ, int status) {
         if (circ->hops[0].node_id[0] != 0)
             moor_guard_mark_unreachable(&g_pathbias_guard_state,
                                          circ->hops[0].node_id);
+        /* Detach from channel mux */
+        if (circ->chan) {
+            moor_circuitmux_detach(circ->chan, circ);
+            /* Mark channel for close if no circuits remain */
+            if (circ->chan->num_circuits == 0 &&
+                circ->chan->state != CHAN_STATE_CLOSED)
+                moor_channel_mark_for_close(circ->chan);
+            circ->chan = NULL;
+        }
         /* Failure: clean up connection refcount safely */
         moor_connection_t *conn = circ->conn;
         moor_circuit_unregister(circ);
@@ -3560,9 +3715,22 @@ static void cbuild_finish(moor_circuit_t *circ, int status) {
 /* Build timeout: kill circuit if build takes too long */
 static void cbuild_timeout_cb(void *arg) {
     moor_circuit_t *circ = (moor_circuit_t *)arg;
+    /* Validate circuit is still alive — with dynamic allocation, the pointer
+     * could be dangling if the circuit was freed before the timer fired.
+     * Check if it's still in the tracking array. */
+    int found = 0;
+    for (int i = 0; i < moor_circuit_iter_count(); i++) {
+        if (moor_circuit_iter_get(i) == circ) { found = 1; break; }
+    }
+    if (!found) return;
     if (!circ->build_ctx) return;
-    LOG_WARN("async circuit %u: build timeout", circ->circuit_id);
-    circ->build_ctx->timeout_timer_id = -1; /* prevent double-remove */
+    LOG_WARN("circuit %u: build timed out", circ->circuit_id);
+    /* Deactivate this timer BEFORE cbuild_finish, which will try to
+     * remove it again (harmless no-op since we set id=-1).
+     * Without this, fire_timers rearms it and it fires on a freed slot. */
+    int tid = circ->build_ctx->timeout_timer_id;
+    circ->build_ctx->timeout_timer_id = -1;
+    if (tid >= 0) moor_event_remove_timer(tid);
     cbuild_finish(circ, -1);
 }
 
@@ -3573,13 +3741,8 @@ static void cbuild_send_create(moor_circuit_t *circ) {
 
     memcpy(circ->hops[0].node_id, guard->identity_pk, 32);
 
-    /* Convert identity to Curve25519 for DH */
-    if (moor_crypto_ed25519_to_curve25519_pk(ctx->relay_curve_pk,
-                                              guard->identity_pk) != 0) {
-        LOG_ERROR("cbuild: curve25519 conversion failed");
-        cbuild_finish(circ, -1);
-        return;
-    }
+    /* Use relay's Curve25519 onion key for static DH */
+    memcpy(ctx->relay_curve_pk, guard->onion_pk, 32);
 
     /* Generate ephemeral keypair (stored in ctx across event loop) */
     moor_crypto_box_keygen(ctx->eph_pk, ctx->eph_sk);
@@ -3741,12 +3904,8 @@ static void cbuild_send_extend(moor_circuit_t *circ, int hop_idx) {
     moor_cbuild_ctx_t *ctx = circ->build_ctx;
     const moor_node_descriptor_t *next = &ctx->path[hop_idx];
 
-    /* Convert identity to Curve25519 */
-    if (moor_crypto_ed25519_to_curve25519_pk(ctx->relay_curve_pk,
-                                              next->identity_pk) != 0) {
-        cbuild_finish(circ, -1);
-        return;
-    }
+    /* Use relay's Curve25519 onion key for static DH */
+    memcpy(ctx->relay_curve_pk, next->onion_pk, 32);
 
     /* Generate ephemeral keypair */
     moor_crypto_box_keygen(ctx->eph_pk, ctx->eph_sk);
@@ -3942,6 +4101,12 @@ static void cbuild_on_connect(moor_connection_t *conn, int status, void *arg) {
         return;
     }
 
+    /* Finish channel setup if this was a new async connection */
+    if (circ->chan && circ->chan->state == CHAN_STATE_OPENING) {
+        moor_channel_open(circ->chan, conn);
+        moor_circuitmux_attach(circ->chan, circ, circ->circuit_id);
+    }
+
     circ->conn = conn;
     conn->circuit_refcount++;
 
@@ -3966,10 +4131,10 @@ int moor_circuit_build_async(moor_circuit_t *circ,
                               const uint8_t our_sk[64],
                               void (*on_complete)(moor_circuit_t *, int, void *),
                               void *arg) {
-    /* Tor-aligned: refuse to build circuits with stale consensus.
-     * Prevents routing through dead/offline relays after DA downtime. */
-    if (!moor_consensus_is_fresh(cons)) {
-        LOG_WARN("consensus too stale for circuit build");
+    /* Use valid_until (3h window) not fresh_until (1h) — keeps routing
+     * alive during DA restarts.  Consensus refresh still uses is_fresh. */
+    if (!moor_consensus_is_valid(cons)) {
+        LOG_WARN("consensus expired (past valid_until) for circuit build");
         return -1;
     }
 
@@ -4033,16 +4198,45 @@ int moor_circuit_build_async(moor_circuit_t *circ,
     if (!middle) { moor_crypto_wipe(ctx, sizeof(*ctx)); free(ctx); circ->build_ctx = NULL; return -1; }
     memcpy(&ctx->path[1], middle, sizeof(moor_node_descriptor_t));
 
-    /* Check for existing connection to guard (multiplexing) */
-    moor_connection_t *existing = moor_connection_find_by_identity(guard->identity_pk);
-    if (existing) {
-        /* Reusing guard connection -- free the caller's unused allocation */
-        if (conn != existing)
+    /* Channel-based multiplexing: reuse existing channel to guard.
+     * Multiple circuits share one channel (= one encrypted connection).
+     * This is the Tor architecture: channel_get_for_extend(). */
+    moor_channel_t *chan = moor_channel_find_by_identity(guard->identity_pk);
+    if (chan && chan->state == CHAN_STATE_OPEN && chan->conn &&
+        chan->conn->state == CONN_STATE_OPEN) {
+        /* Reuse existing OPEN channel — milliseconds instead of seconds */
+        circ->chan = chan;
+        circ->conn = chan->conn;
+        moor_circuitmux_attach(chan, circ, circ->circuit_id);
+        if (conn != chan->conn)
             moor_connection_free(conn);
-        circ->conn = existing;
-        cbuild_on_connect(existing, 0, circ);
+        cbuild_on_connect(chan->conn, 0, circ);
         return 0;
     }
+
+    /* If a channel to this guard is already OPENING, don't open another.
+     * The prebuilt timer will retry in 500ms-2s when that channel is OPEN.
+     * This prevents thundering herd: 7 Firefox requests at startup won't
+     * open 7 parallel TCP+PQ handshakes to the same guard. */
+    if (chan && chan->state == CHAN_STATE_OPENING) {
+        LOG_DEBUG("channel to guard already opening, deferring circuit %u",
+                  circ->circuit_id);
+        moor_connection_free(conn);
+        moor_crypto_wipe(ctx, sizeof(*ctx));
+        free(ctx);
+        circ->build_ctx = NULL;
+        return -1;  /* caller retries via prebuilt timer */
+    }
+
+    /* New channel: allocate in OPENING state, connect async */
+    chan = moor_channel_new_outbound(guard->identity_pk);
+    if (!chan) {
+        moor_crypto_wipe(ctx, sizeof(*ctx));
+        free(ctx);
+        circ->build_ctx = NULL;
+        return -1;
+    }
+    circ->chan = chan;
 
     /* Set peer identity for IK handshake */
     memcpy(conn->peer_identity, guard->identity_pk, 32);
@@ -4051,6 +4245,8 @@ int moor_circuit_build_async(moor_circuit_t *circ,
     if (moor_connection_connect_async(conn, guard->address, guard->or_port,
                                        our_pk, our_sk, NULL, NULL,
                                        cbuild_on_connect, circ) != 0) {
+        moor_channel_mark_for_close(chan);
+        circ->chan = NULL;
         moor_crypto_wipe(ctx, sizeof(*ctx));
         free(ctx);
         circ->build_ctx = NULL;
@@ -4070,4 +4266,14 @@ void moor_circuit_build_cancel(moor_circuit_t *circ) {
 void moor_circuit_build_abort(moor_circuit_t *circ) {
     if (circ->build_ctx)
         cbuild_finish(circ, -1);
+}
+
+/* ---- Iteration API for external consumers (main.c, etc.) ---- */
+int moor_circuit_iter_count(void) {
+    return g_circuits_count;
+}
+
+moor_circuit_t *moor_circuit_iter_get(int idx) {
+    if (idx < 0 || idx >= g_circuits_count) return NULL;
+    return g_circuits[idx];
 }

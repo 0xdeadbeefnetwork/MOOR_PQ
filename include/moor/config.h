@@ -82,8 +82,8 @@ typedef struct {
     /* Exit policy */
     moor_exit_policy_t exit_policy;
 
-    /* Hidden services (multi-HS) */
-    moor_hs_entry_t hidden_services[MOOR_MAX_HIDDEN_SERVICES];
+    /* Hidden services */
+    moor_hs_entry_t hidden_services[64];
     int             num_hidden_services;
 
     /* Bridges */
@@ -192,6 +192,10 @@ typedef struct {
 
     /* Operator contact info (email, URL, etc.) -- displayed in consensus/metrics */
     char            contact_info[128];
+
+    /* Enclave: independent MOOR network with its own DAs.
+     * When set, replaces hardcoded DA list entirely. */
+    char            enclave_file[256];  /* Path to .enclave file */
 } moor_config_t;
 
 /* Fill config with compile-time defaults */
@@ -205,6 +209,9 @@ int moor_config_set(moor_config_t *cfg, const char *key, const char *value);
 
 /* Reload safe config subset from file (bandwidth, exit_policy, padding, verbose) */
 int moor_config_reload(moor_config_t *cfg, const char *path);
+
+/* Load an enclave file: replaces DA list with independent network DAs */
+int moor_enclave_load(moor_config_t *cfg, const char *path);
 
 /* Evaluate exit policy for given IPv4 address string and port.
  * Returns 1 if allowed, 0 if rejected. Empty policy rejects all. */

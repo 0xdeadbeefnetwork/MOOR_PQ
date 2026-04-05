@@ -133,8 +133,8 @@ int moor_mix_enqueue(struct moor_connection *conn,
         if (oldest >= 0) {
             moor_mix_entry_t *victim = &g_mix_pool.entries[oldest];
             if (victim->target_conn &&
-                victim->target_conn->fd == victim->target_fd &&
-                victim->target_conn->state == CONN_STATE_OPEN) {
+                victim->target_conn->state == CONN_STATE_OPEN &&
+                victim->target_conn->fd == victim->target_fd) {
                 moor_cell_t cell;
                 cell.circuit_id = victim->circuit_id;
                 cell.command = victim->command;

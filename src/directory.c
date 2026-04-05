@@ -54,6 +54,32 @@ static void da_unlock(moor_da_config_t *config) {
     pthread_mutex_unlock(&config->consensus_lock);
 }
 
+/* Forward declarations for async thread helpers */
+static void moor_da_propagate_descriptor(moor_da_config_t *config,
+                                          const uint8_t *desc_buf,
+                                          uint32_t desc_len);
+void moor_da_update_published_snapshot(moor_da_config_t *config);
+
+/* Async propagation context for PUBLISH handler — runs descriptor
+ * propagation + vote exchange in a thread so the event loop stays
+ * responsive for new connections. */
+typedef struct {
+    moor_da_config_t *config;
+    uint8_t *desc_buf;
+    uint32_t desc_len;
+} da_propagate_ctx_t;
+
+static void *da_propagate_thread(void *arg) {
+    da_propagate_ctx_t *ctx = arg;
+    if (ctx->config->num_peers > 0)
+        moor_da_propagate_descriptor(ctx->config, ctx->desc_buf, ctx->desc_len);
+    moor_da_exchange_votes(ctx->config);
+    moor_da_update_published_snapshot(ctx->config);
+    free(ctx->desc_buf);
+    free(ctx);
+    return NULL;
+}
+
 /* Forward declarations for _unlocked helpers (defined below, called from
  * moor_da_handle_request which sits between their declaration sites). */
 static int da_add_relay_unlocked(moor_da_config_t *config,
@@ -1767,14 +1793,25 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
             da_unlock(config);
             /* Reply immediately — don't block the client on peer I/O */
             send(client_fd, "OK\n", 3, MSG_NOSIGNAL);
-            /* Propagate + vote exchange AFTER releasing the lock so
-             * outbound TCP to peer DAs (2-5s timeouts each) doesn't
-             * block CONSENSUS/HS requests from other clients. */
-            if (config->num_peers > 0)
-                moor_da_propagate_descriptor(config, desc_buf, (uint32_t)desc_len);
-            moor_da_exchange_votes(config);
-            /* Update snapshot again after votes (now has peer sigs) */
-            moor_da_update_published_snapshot(config);
+            /* Propagate + vote exchange in a background thread so the
+             * event loop stays responsive for PUBLISH/CONSENSUS from
+             * other relays and clients.  Thread owns desc_buf. */
+            {
+                da_propagate_ctx_t *pctx = malloc(sizeof(*pctx));
+                if (pctx) {
+                    pctx->config = config;
+                    pctx->desc_buf = desc_buf;
+                    pctx->desc_len = (uint32_t)desc_len;
+                    desc_buf = NULL; /* thread owns it now */
+                    pthread_t pt;
+                    if (pthread_create(&pt, NULL, da_propagate_thread, pctx) == 0) {
+                        pthread_detach(pt);
+                    } else {
+                        /* Fallback: run inline if thread creation fails */
+                        da_propagate_thread(pctx);
+                    }
+                }
+            }
         } else {
             LOG_WARN("DA: PUBLISH descriptor parse failed (len=%u, desc_len=%d)",
                      len, desc_len);
@@ -3283,6 +3320,18 @@ int moor_consensus_is_fresh(const moor_consensus_t *cons) {
      * valid_until if fresh_until is not set (old consensus format). */
     uint64_t upper = cons->fresh_until > 0 ? cons->fresh_until : cons->valid_until;
     return (now >= lower && now < upper) ? 1 : 0;
+}
+
+/* Like is_fresh but uses valid_until (3 consensus intervals, ~3h) instead
+ * of fresh_until.  Use this for "can I still route traffic?" decisions —
+ * circuit building, cached-consensus acceptance — so the network keeps
+ * working during DA restarts.  Reserve is_fresh for "should I fetch a
+ * new consensus?" decisions. */
+int moor_consensus_is_valid(const moor_consensus_t *cons) {
+    uint64_t now = (uint64_t)time(NULL);
+    uint64_t skew = 5;
+    uint64_t lower = (cons->valid_after > skew) ? cons->valid_after - skew : 0;
+    return (now >= lower && now < cons->valid_until) ? 1 : 0;
 }
 
 /* --- DA Signing Key Cert Operations (Phase 8) --- */

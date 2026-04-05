@@ -1,0 +1,6 @@
+# MOOR Default Network — 0xdeadbeef's enclave
+# This is the default DA set hardcoded in config.c.
+# Use --enclave <file> to run on a different network.
+
+107.174.70.38:9030  7816dfa4e7f1aa637b36a3fb0472983d326766ddc98abe219320b3ea90df28b4
+107.174.70.122:9030 5298f042e5144b741aaccbceebabc0d4cc8febf1f9bae8e3126788ef283d8c06

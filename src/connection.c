@@ -138,10 +138,26 @@ moor_connection_t *moor_connection_alloc(void) {
 
 void moor_connection_free(moor_connection_t *conn) {
     if (!conn) return;
+    /* Idempotent: if already freed (poisoned), don't double-free.
+     * After poison+restore, state=CONN_STATE_NONE and fd=-1.
+     * A connection that was never used also has these values but
+     * generation==0, while a freed connection has generation>0. */
+    if (conn->fd < 0 && conn->state == CONN_STATE_NONE && conn->generation > 0)
+        return;
+    /* Clear ALL external references BEFORE poisoning the slot.
+     * Without this, pointers to 0xDEDE... (non-NULL poison) pass
+     * NULL checks but crash on dereference. */
+    moor_circuit_nullify_conn(conn);
+    moor_channel_nullify_conn(conn);
+    moor_socks5_nullify_conn(conn);
+    moor_hs_nullify_conn(conn);
+    moor_hs_event_nullify_conn(conn);
     conn_pool_lock();
     conn_ht_remove(conn);
-    if (conn->transport && conn->transport_state)
+    if (conn->transport && conn->transport_state) {
         conn->transport->transport_free(conn->transport_state);
+        conn->transport_state = NULL;
+    }
     if (conn->hs_state) {
         moor_crypto_wipe(conn->hs_state, sizeof(moor_hs_state_t));
         free(conn->hs_state);
@@ -152,12 +168,18 @@ void moor_connection_free(moor_connection_t *conn) {
     moor_crypto_wipe(conn->our_kx_sk, 32);
     moor_crypto_wipe(conn->our_kx_pk, 32);
     moor_crypto_wipe(conn->recv_buf, sizeof(conn->recv_buf));
+    moor_queue_clear(&conn->outq);
     if (moor_monitor_stats()->connections_active > 0)
         moor_monitor_stats()->connections_active--;
     uint32_t saved_gen = conn->generation;
-    memset(conn, 0, sizeof(*conn));
+    /* Poison slot: fill with 0xDE so stale pointer derefs crash
+     * immediately with a recognizable address pattern. */
+    moor_poison(conn, sizeof(*conn));
+    /* Restore fields the allocator checks */
     conn->generation = saved_gen;
     conn->fd = -1;
+    conn->state = CONN_STATE_NONE;
+    moor_queue_init(&conn->outq); /* re-init after poison wiped pointers */
     conn_pool_unlock();
 }
 
@@ -1152,7 +1174,10 @@ int moor_connection_accept(moor_connection_t *conn, int listen_fd,
  */
 int moor_connection_send_cell(moor_connection_t *conn,
                               const moor_cell_t *cell) {
-    if (!conn || conn->state != CONN_STATE_OPEN) return -1;
+    MOOR_ASSERT_MSG(conn != NULL,
+        "send_cell: NULL conn (cell cmd=%d circ=%u)",
+        cell ? cell->command : -1, cell ? cell->circuit_id : 0);
+    if (conn->state != CONN_STATE_OPEN) return -1;
 
     /* Check nonce BEFORE encrypt to prevent keystream reuse (#195).
      * Kill the connection -- it can never send again safely. */
@@ -1202,12 +1227,9 @@ int moor_connection_send_cell(moor_connection_t *conn,
         } else if (n == 0 || (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))) {
             /* Socket buffer full — queue remaining bytes */
             if (moor_queue_push(&conn->outq, wire + sent, (uint16_t)(total - sent), cell->circuit_id) != 0) {
-                /* Queue full after partial write: framing is irrecoverable.
-                 * Some bytes are on the wire, the rest are lost. The peer
-                 * will see a truncated frame and fail to decrypt. Kill the
-                 * connection to prevent desync. */
-                LOG_ERROR("output queue full after partial write -- "
-                          "connection framing corrupt, killing fd=%d", conn->fd);
+                /* OOM or global pressure limit — framing irrecoverable */
+                LOG_ERROR("queue push failed (OOM? global=%d) -- "
+                          "killing fd=%d", moor_queue_global_count(), conn->fd);
                 conn->state = CONN_STATE_NONE;
                 return -1;
             }
@@ -1232,7 +1254,8 @@ int moor_connection_send_cell(moor_connection_t *conn,
 }
 
 int moor_connection_recv_cell(moor_connection_t *conn, moor_cell_t *cell) {
-    if (!conn || conn->state != CONN_STATE_OPEN) return -1;
+    MOOR_ASSERT_MSG(conn != NULL, "recv_cell: NULL conn");
+    if (conn->state != CONN_STATE_OPEN) return -1;
 
     /* Check if we already have a complete cell in recv_buf before
      * trying to read more. This avoids blocking on recv() when
@@ -1344,12 +1367,21 @@ void moor_connection_flush_all(void) {
 }
 
 void moor_connection_close(moor_connection_t *conn) {
-    if (!conn) return;
+    MOOR_ASSERT_MSG(conn != NULL, "connection_close: NULL conn");
+    /* Guard against double-close on already-freed (poisoned) connections */
+    if (conn->fd < 0 && conn->state == CONN_STATE_NONE && conn->generation > 0)
+        return;
+    LOG_WARN("connection_close: conn=%p fd=%d state=%d gen=%u",
+             (void*)conn, conn->fd, conn->state, conn->generation);
     /* Purge any pending mix pool entries for this connection */
     moor_mix_purge_conn(conn);
     /* Nullify all circuit pointers to this connection before freeing */
     moor_circuit_nullify_conn(conn);
+    /* Remove from event loop BEFORE close() to prevent fd-reuse race:
+     * close() frees the fd number, a new socket() can reuse it, then
+     * event_remove would accidentally deregister the new socket. */
     if (conn->fd >= 0) {
+        moor_event_remove(conn->fd);
         close(conn->fd);
     }
     moor_connection_free(conn);
@@ -1495,10 +1527,16 @@ static void async_connect_write_cb(int fd, int events, void *arg) {
                 conn->hs_state->on_complete(conn, 0, conn->hs_state->on_complete_arg);
         }
 
-        /* Clean up handshake state */
-        moor_crypto_wipe(conn->hs_state, sizeof(moor_hs_state_t));
-        free(conn->hs_state);
-        conn->hs_state = NULL;
+        /* Clean up handshake state — but on_complete may have freed the
+         * connection (poisoned with 0xDE), making conn->hs_state a poison
+         * value that passes NULL checks.  Use the idempotent guard. */
+        if (conn->fd < 0 && conn->state == CONN_STATE_NONE && conn->generation > 0)
+            return;  /* conn was freed by on_complete */
+        if (conn->hs_state) {
+            moor_crypto_wipe(conn->hs_state, sizeof(moor_hs_state_t));
+            free(conn->hs_state);
+            conn->hs_state = NULL;
+        }
     }
 }
 

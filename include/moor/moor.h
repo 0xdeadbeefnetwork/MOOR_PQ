@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "moor/limits.h"
+#include "moor/debug.h"
 
 #define MOOR_VERSION_MAJOR  0
 #define MOOR_VERSION_MINOR  8
@@ -165,6 +166,7 @@ typedef enum {
 #include "scheduler.h"
 #include "connection.h"
 #include "wfpad.h"
+#include "channel.h"
 #include "circuit.h"
 #include "config.h"
 #include "pow.h"
@@ -190,7 +192,7 @@ typedef enum {
 #include "transport_shade.h"
 #include "transport_mirage.h"
 #include "transport_shitstorm.h"
-#include "crypto_worker.h"
+#include "transport_speakeasy.h"
 #include "dht.h"
 #include "mix.h"
 

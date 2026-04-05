@@ -200,14 +200,22 @@ static int compute_timer_timeout(void) {
     return timeout_ms;
 }
 
-/* Fire all expired timers */
+/* Fire all expired timers.
+ * Re-check active after callback — the callback may have removed this
+ * timer (or the slot may have been reused for a new timer). */
 static void fire_timers(void) {
     uint64_t now = moor_time_ms();
     for (int i = 0; i < MAX_TIMERS; i++) {
         if (!g_timers[i].active) continue;
         if (now >= g_timers[i].next_fire) {
-            g_timers[i].callback(g_timers[i].arg);
-            g_timers[i].next_fire = now + g_timers[i].interval_ms;
+            moor_timer_cb cb = g_timers[i].callback;
+            void *arg = g_timers[i].arg;
+            cb(arg);
+            /* Only re-arm if still active — callback may have removed it,
+             * or the slot may have been reused for a different timer. */
+            if (g_timers[i].active && g_timers[i].callback == cb &&
+                g_timers[i].arg == arg)
+                g_timers[i].next_fire = now + g_timers[i].interval_ms;
         }
     }
 }
@@ -255,8 +263,9 @@ int moor_event_loop(void) {
             moor_handle_sighup();
         }
 
-        fire_timers();
-
+        /* Process I/O events BEFORE timers.  Timers (reaper, OOM killer,
+         * circuit timeouts) can free connections/circuits.  If fired before
+         * event dispatch, stale pointers in the epoll batch cause UAF. */
         for (int i = 0; i < nready; i++) {
             uint32_t idx = ep_events[i].data.u32;
             if (idx >= (uint32_t)MAX_EVENTS || !g_entries[idx].active) continue;
@@ -267,9 +276,24 @@ int moor_event_loop(void) {
             if (ep_events[i].events & EPOLLOUT)
                 events |= MOOR_EVENT_WRITE;
 
-            g_entries[idx].callback(g_entries[idx].fd, events,
-                                   g_entries[idx].arg);
+            MOOR_ASSERT_MSG(g_entries[idx].callback != NULL,
+                "event loop: NULL callback for fd=%d idx=%u",
+                g_entries[idx].fd, idx);
+
+            /* Snapshot entry before callback — callback may deactivate it */
+            moor_event_cb cb = g_entries[idx].callback;
+            int cb_fd = g_entries[idx].fd;
+            void *cb_arg = g_entries[idx].arg;
+            cb(cb_fd, events, cb_arg);
         }
+
+        fire_timers();
+
+        /* Tor-aligned: process deferred circuit closes at END of each
+         * iteration — no circuit is ever freed while a callback is
+         * processing it.  This is Tor's postloop_cleanup_cb pattern. */
+        moor_circuit_close_all_marked();
+        moor_channel_close_all_marked();
     }
 
     /* Tor-aligned: graceful shutdown — flush queues and close circuits */
@@ -321,8 +345,6 @@ int moor_event_loop(void) {
             break;
         }
 
-        fire_timers();
-
         for (int i = 0; i < nfds; i++) {
             int idx = fd_indices[i];
             if (!g_entries[idx].active) continue;
@@ -337,6 +359,10 @@ int moor_event_loop(void) {
                 g_entries[idx].callback(g_entries[idx].fd, events,
                                        g_entries[idx].arg);
         }
+
+        fire_timers();
+        moor_circuit_close_all_marked();
+        moor_channel_close_all_marked();
     }
 
     LOG_INFO("event loop stopped");
@@ -376,8 +402,6 @@ int moor_event_loop(void) {
             break;
         }
 
-        fire_timers();
-
         for (int i = 0; i < nfds; i++) {
             if (pfds[i].revents == 0) continue;
             int idx = fd_map[i];
@@ -389,9 +413,18 @@ int moor_event_loop(void) {
             if (pfds[i].revents & POLLOUT)
                 events |= MOOR_EVENT_WRITE;
 
-            g_entries[idx].callback(g_entries[idx].fd, events,
-                                   g_entries[idx].arg);
+            MOOR_ASSERT_MSG(g_entries[idx].callback != NULL,
+                "event loop: NULL callback for fd=%d idx=%d",
+                g_entries[idx].fd, idx);
+            moor_event_cb cb = g_entries[idx].callback;
+            int cb_fd = g_entries[idx].fd;
+            void *cb_arg = g_entries[idx].arg;
+            cb(cb_fd, events, cb_arg);
         }
+
+        fire_timers();
+        moor_circuit_close_all_marked();
+        moor_channel_close_all_marked();
     }
 
     LOG_INFO("event loop stopped");

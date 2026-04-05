@@ -16,7 +16,7 @@ typedef struct {
     uint8_t  identity_sk[64];
     uint8_t  onion_pk[32];          /* Curve25519 for introduction */
     uint8_t  onion_sk[32];
-    char     moor_address[64];      /* base32(...).moor */
+    char     moor_address[128];     /* base32(Ed25519_pk + KEM_hash).moor */
     uint8_t  blinded_pk[32];       /* Current time-period blinded public key */
     uint8_t  blinded_sk[64];       /* Current time-period blinded secret key */
     uint64_t current_time_period;
@@ -65,9 +65,12 @@ int moor_hs_load_keys(moor_hs_config_t *config);
 /* Save keys to hs_dir */
 int moor_hs_save_keys(const moor_hs_config_t *config);
 
-/* Compute .moor address from public key */
+/* Compute .moor address from Ed25519 pk + Kyber768 pk (PQ-committed).
+ * Format: base32(Ed25519_pk(32) + BLAKE2b_16(Kyber768_pk)(16)) + ".moor"
+ * If kem_pk is NULL, produces a classical-only address (v1 compat). */
 int moor_hs_compute_address(char *out, size_t out_len,
-                            const uint8_t identity_pk[32]);
+                            const uint8_t identity_pk[32],
+                            const uint8_t *kem_pk, size_t kem_pk_len);
 
 /* Initialize hidden service: build intro circuits, publish descriptor */
 int moor_hs_init(moor_hs_config_t *config,
@@ -145,5 +148,16 @@ int moor_hs_load_revision(moor_hs_config_t *config);
 /* Check if any intro points need rotation (age or count) */
 int moor_hs_check_intro_rotation(moor_hs_config_t *config,
                                   const moor_consensus_t *consensus);
+
+/* NULL out intro_circuits[] and rp_circuits[]/rp_connections[] pointing to
+ * a dying circuit or connection.  Called from circ_free_unlocked / conn_free. */
+void moor_hs_invalidate_circuit(moor_circuit_t *circ);
+void moor_hs_nullify_conn(moor_connection_t *conn);
+
+/* NULL out HS event context arrays (g_hs_rp_ctxs, g_hs_intro_ctxs,
+ * g_hs_target_fds) pointing to a dying circuit/connection.
+ * Removes stale event registrations.  Implemented in main.c. */
+void moor_hs_event_invalidate_circuit(moor_circuit_t *circ);
+void moor_hs_event_nullify_conn(moor_connection_t *conn);
 
 #endif /* MOOR_HIDDEN_SERVICE_H */

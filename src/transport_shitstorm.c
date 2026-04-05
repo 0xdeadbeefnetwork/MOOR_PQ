@@ -1253,8 +1253,11 @@ typedef struct moor_transport_state {
     uint8_t  recv_buf[8192];
     size_t   recv_len;
     uint64_t records_sent;
-    /* Key rotation: epoch counter for ratchet (#5) */
-    uint32_t rekey_epoch;
+    /* Key rotation: explicit epoch counters for ratchet (#5).
+     * Both sides track independently so any record counting mismatch
+     * doesn't cause permanent key desync. */
+    uint32_t rekey_epoch;        /* send-side epoch */
+    uint32_t rekey_recv_epoch;   /* recv-side epoch */
     /* Receive-side record counter for symmetric key rotation */
     uint64_t records_received;
     /* HTTP/2 framing (#1): post-handshake content looks like h2 */
@@ -1452,7 +1455,7 @@ static const uint16_t chrome_sigalgs[] = {
 #define CHROME_SIGALG_COUNT  8
 
 /* Extension TLV entry for shuffle-then-serialize */
-#define SS_MAX_EXT_DATA  512    /* ECH GREASE needs ~300 bytes */
+#define SS_MAX_EXT_DATA  1280   /* X25519Kyber768 key_share needs ~1220 bytes */
 #define SS_MAX_EXTENSIONS 24    /* Chrome 130: 16 real + up to 3 GREASE + ECH + PSK */
 
 typedef struct {
@@ -1485,12 +1488,12 @@ static inline void ss_put16(uint8_t *p, uint16_t v) {
 static int ss_build_client_hello(uint8_t *buf, size_t buf_len, const char *sni,
                                   size_t *out_len, uint8_t eph_sk_out[32],
                                   const uint8_t node_id[32]) {
-    if (buf_len < 1024) return -1;
+    if (buf_len < 2560) return -1;
 
     size_t sni_len = strlen(sni);
     if (sni_len > 253) sni_len = 253;
 
-    uint8_t body[1024];
+    uint8_t body[2048];
     size_t pos = 0;
 
     /* client_version = TLS 1.2 (TLS 1.3 via supported_versions) */
@@ -1706,15 +1709,28 @@ static int ss_build_client_hello(uint8_t *buf, size_t buf_len, const char *sni,
          * extension builder and instead add it when serializing.
          * Actually, let's just increase the buffer and keep it simple. */
 
+        /* Chrome 130+: GREASE(5) + X25519Kyber768(1220) + x25519(36) = 1261 bytes.
+         * The X25519Kyber768Draft00 (group 0x6399) share is 1216 bytes:
+         * 32 bytes x25519 + 1184 bytes Kyber768 public key.
+         * We fill it with random — only the standalone x25519 share is used for DH.
+         * The PQ key exchange happens at MOOR's circuit layer, not TLS. */
+
         /* GREASE key_share entry */
         ss_put16(e->data + p, grease_group); p += 2;
         ss_put16(e->data + p, 0x0001); p += 2; /* 1 byte key */
         e->data[p++] = 0x00; /* dummy key byte */
+
+        /* X25519Kyber768Draft00 key_share entry (decorative — matches Chrome 130) */
+        ss_put16(e->data + p, 0x11ec); p += 2; /* X25519MLKEM768 (Chrome 131+) */
+        ss_put16(e->data + p, 1216); p += 2;   /* 1216 bytes */
+        moor_crypto_random(e->data + p, 1216); p += 1216;
+
         /* x25519 key_share entry: Elligator2 representative on wire */
         ss_put16(e->data + p, 0x001d); p += 2; /* x25519 */
         ss_put16(e->data + p, 0x0020); p += 2; /* 32 bytes */
         memcpy(e->data + p, eph_repr, 32); p += 32;
-        /* Total shares so far = 5 + 36 = 41 */
+
+        /* Total shares = 5 + 1220 + 36 = 1261 bytes */
         /* Prepend the total client_shares_length */
         memmove(e->data + 2, e->data, p);
         ss_put16(e->data, (uint16_t)p); /* shares_len */
@@ -1739,16 +1755,17 @@ static int ss_build_client_hello(uint8_t *buf, size_t buf_len, const char *sni,
         moor_crypto_random(e->data + p, 1); p += 1; /* random config_id */
         ss_put16(e->data + p, 0x0020); p += 2; /* enc length = 32 */
         moor_crypto_random(e->data + p, 32); p += 32; /* random enc */
-        uint16_t payload_len = 200 + (e->data[0] % 56); /* 200-255 bytes */
+        uint8_t ech_rand; moor_crypto_random(&ech_rand, 1);
+        uint16_t payload_len = 200 + (ech_rand % 56); /* 200-255 bytes */
         ss_put16(e->data + p, payload_len); p += 2;
         moor_crypto_random(e->data + p, payload_len); p += payload_len;
         e->data_len = p;
     }
 
-    /* Ext 15: application_settings/ALPS (0x4469) - for h2 */
+    /* Ext 15: application_settings/ALPS (0x44cd) - Chrome 134+ new code point */
     {
         ss_ext_entry_t *e = &exts[ext_count++];
-        e->type = 0x4469;
+        e->type = 0x44cd;
         size_t p = 0;
         ss_put16(e->data + p, 0x0002); p += 2; /* length */
         e->data[p++] = 'h'; e->data[p++] = '2';
@@ -1763,30 +1780,46 @@ static int ss_build_client_hello(uint8_t *buf, size_t buf_len, const char *sni,
         e->data_len = 1;
     }
 
-    /* Ext: pre_shared_key (0x0029) -- fake PSK for session resumption fingerprint.
-     * #6: Always-full-handshake is a fingerprint.  Real browsers cache tickets
-     * and send pre_shared_key with a binder.  We generate a fake PSK identity
-     * (looks like a NewSessionTicket from a previous connection) and a fake
-     * binder (random 32 bytes -- server ignores it, but DPI sees the extension).
-     * NOTE: pre_shared_key MUST be the last extension per RFC 8446 4.2.11.
-     * We add it here but mark it to be placed last after shuffle. */
-    int psk_ext_idx = ext_count;
+    /* Ext: pre_shared_key (0x0029) -- conditional: only on "resumed" connections.
+     * Real browsers only send PSK when they have a cached session ticket from a
+     * prior visit. First connection to an SNI has no ticket. Sending PSK on
+     * every first connection is a fingerprint.
+     * Track previously-used SNIs in a simple static cache. */
+    int psk_ext_idx = -1;
     {
-        ss_ext_entry_t *e = &exts[ext_count++];
-        e->type = 0x0029;
-        size_t p = 0;
-        /* PSK identities list: identities_len(2) + [identity_len(2) + identity(N) + obfuscated_ticket_age(4)] */
-        uint16_t ticket_len = 192 + (eph_repr[0] % 64); /* 192-255 bytes, looks like a real ticket */
-        uint16_t identities_len = 2 + ticket_len + 4;
-        ss_put16(e->data + p, identities_len); p += 2;
-        ss_put16(e->data + p, ticket_len); p += 2;
-        moor_crypto_random(e->data + p, ticket_len); p += ticket_len;
-        moor_crypto_random(e->data + p, 4); p += 4; /* obfuscated_ticket_age */
-        /* PSK binders list: binders_len(2) + [binder_len(1) + binder(32)] */
-        ss_put16(e->data + p, 33); p += 2; /* 1 + 32 */
-        e->data[p++] = 32; /* binder length */
-        moor_crypto_random(e->data + p, 32); p += 32; /* fake HMAC binder */
-        e->data_len = p;
+        #define SS_PSK_SNI_CACHE_SIZE 64
+        static char psk_sni_cache[SS_PSK_SNI_CACHE_SIZE][128];
+        static int psk_sni_count = 0;
+        static pthread_mutex_t psk_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+        int seen_before = 0;
+        pthread_mutex_lock(&psk_mutex);
+        for (int s = 0; s < psk_sni_count; s++) {
+            if (strcmp(psk_sni_cache[s], sni) == 0) { seen_before = 1; break; }
+        }
+        if (!seen_before && psk_sni_count < SS_PSK_SNI_CACHE_SIZE) {
+            snprintf(psk_sni_cache[psk_sni_count++], 128, "%s", sni);
+        }
+        pthread_mutex_unlock(&psk_mutex);
+
+        if (seen_before) {
+            /* "Resumed" connection — include fake PSK like a real browser would */
+            psk_ext_idx = ext_count;
+            ss_ext_entry_t *e = &exts[ext_count++];
+            e->type = 0x0029;
+            size_t p = 0;
+            uint8_t psk_rand; moor_crypto_random(&psk_rand, 1);
+            uint16_t ticket_len = 192 + (psk_rand % 64);
+            uint16_t identities_len = 2 + ticket_len + 4;
+            ss_put16(e->data + p, identities_len); p += 2;
+            ss_put16(e->data + p, ticket_len); p += 2;
+            moor_crypto_random(e->data + p, ticket_len); p += ticket_len;
+            moor_crypto_random(e->data + p, 4); p += 4;
+            ss_put16(e->data + p, 33); p += 2;
+            e->data[p++] = 32;
+            moor_crypto_random(e->data + p, 32); p += 32;
+            e->data_len = p;
+        }
     }
 
     /* GREASE extensions (1-2 random, with empty data) */
@@ -1842,12 +1875,16 @@ static int ss_build_client_hello(uint8_t *buf, size_t buf_len, const char *sni,
     /* ---- Shuffle extensions (Fisher-Yates) for Chrome 110+ behavior ----
      * JA4 sorts extensions before hashing, so order doesn't affect the fingerprint.
      * #6: pre_shared_key (0x0029) MUST be last per RFC 8446 4.2.11.
-     * Remove it before shuffle, then append after. */
-    ss_ext_entry_t psk_ext_saved = exts[psk_ext_idx];
-    exts[psk_ext_idx] = exts[ext_count - 1]; /* move last into PSK slot */
-    int shuffle_count = ext_count - 1;        /* exclude PSK from shuffle */
-    ss_shuffle_extensions(exts, shuffle_count);
-    exts[shuffle_count] = psk_ext_saved;       /* PSK goes last */
+     * If PSK is present, remove it before shuffle, then append after. */
+    if (psk_ext_idx >= 0) {
+        ss_ext_entry_t psk_ext_saved = exts[psk_ext_idx];
+        exts[psk_ext_idx] = exts[ext_count - 1];
+        int shuffle_count = ext_count - 1;
+        ss_shuffle_extensions(exts, shuffle_count);
+        exts[shuffle_count] = psk_ext_saved; /* PSK goes last */
+    } else {
+        ss_shuffle_extensions(exts, ext_count);
+    }
 
     /* ---- Serialize extensions into body ---- */
     size_t ext_start = pos;
@@ -1868,7 +1905,7 @@ static int ss_build_client_hello(uint8_t *buf, size_t buf_len, const char *sni,
 
     /* Handshake wrapper: type(1) + length(3) + body */
     size_t hs_len = 1 + 3 + pos;
-    uint8_t hs_msg[1024];
+    uint8_t hs_msg[2560];
     hs_msg[0] = TLS_HS_CLIENT_HELLO;
     hs_msg[1] = 0;
     hs_msg[2] = (uint8_t)(pos >> 8);
@@ -2119,6 +2156,7 @@ static int ss_derive_keys(shitstorm_state_t *st,
     st->records_sent = 0;
     st->records_received = 0;
     st->rekey_epoch = 0;
+    st->rekey_recv_epoch = 0;
     st->h2_sent_preface = 0;
     st->h2_stream_id = 1;  /* client-initiated streams are odd */
 
@@ -2172,13 +2210,14 @@ static void ss_maybe_rekey(shitstorm_state_t *st) {
 }
 
 /* Receiver-side rekey: mirror sender's rotation using records_received.
- * The sender rotates at records_sent % SS_REKEY_INTERVAL == 0.
- * The receiver rotates at records_received % SS_REKEY_INTERVAL == 0.
- * Nonces are NOT reset — only keys change. */
+ * Uses explicit rekey_recv_epoch counter (same as sender uses rekey_epoch)
+ * so both sides always agree on the epoch value regardless of what
+ * record types are/aren't counted. */
 static void ss_maybe_rekey_recv(shitstorm_state_t *st) {
     if (st->records_received > 0 &&
         st->records_received % SS_REKEY_INTERVAL == 0) {
-        uint32_t epoch = (uint32_t)(st->records_received / SS_REKEY_INTERVAL);
+        st->rekey_recv_epoch++;
+        uint32_t epoch = st->rekey_recv_epoch;
         uint8_t ratchet_input[36];
         static const uint8_t rekey_label[] = "shitstorm-rekey";
 
@@ -2302,7 +2341,7 @@ static int shitstorm_client_handshake(int fd, const void *params,
     LOG_INFO("ShitStorm: connecting with SNI '%s'", sni);
 
     /* 1. Build ClientHello with Elligator2-representable key */
-    uint8_t ch_buf[1024];
+    uint8_t ch_buf[2560];
     size_t ch_len;
     uint8_t our_eph_sk[32];
     if (ss_build_client_hello(ch_buf, sizeof(ch_buf), sni, &ch_len,
@@ -2427,6 +2466,62 @@ static int shitstorm_client_handshake(int fd, const void *params,
     return 0;
 }
 
+/* Decoy site proxy: forward a non-MOOR connection to a real web server.
+ * The client (censor probe or real browser) sees a normal TLS website.
+ * This defeats active probing — the bridge is indistinguishable from
+ * the decoy site for unauthenticated connections. */
+static void ss_proxy_to_decoy(int client_fd, const char *addr, uint16_t port,
+                               const uint8_t *ch_hdr, size_t ch_hdr_len,
+                               const uint8_t *ch_body, size_t ch_body_len) {
+    /* Connect to decoy */
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = inet_addr(addr);
+
+    int decoy_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (decoy_fd < 0) return;
+
+    if (connect(decoy_fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+        close(decoy_fd);
+        return;
+    }
+
+    /* Forward the ClientHello we already received */
+    send(decoy_fd, (const char *)ch_hdr, ch_hdr_len, MSG_NOSIGNAL);
+    send(decoy_fd, (const char *)ch_body, ch_body_len, MSG_NOSIGNAL);
+
+    /* Bidirectional relay until one side closes.
+     * This runs synchronously — blocks the caller. Acceptable because
+     * this is a probe/non-MOOR connection, not real relay traffic. */
+    struct pollfd pfds[2];
+    pfds[0].fd = client_fd;  pfds[0].events = POLLIN;
+    pfds[1].fd = decoy_fd;   pfds[1].events = POLLIN;
+
+    uint8_t relay_buf[4096];
+    int running = 1;
+    while (running) {
+        int pr = poll(pfds, 2, 30000);
+        if (pr <= 0) break;
+        if (pfds[0].revents & POLLIN) {
+            ssize_t n = recv(client_fd, (char *)relay_buf, sizeof(relay_buf), 0);
+            if (n <= 0) { running = 0; break; }
+            if (send(decoy_fd, (const char *)relay_buf, n, MSG_NOSIGNAL) != n)
+                { running = 0; break; }
+        }
+        if (pfds[1].revents & POLLIN) {
+            ssize_t n = recv(decoy_fd, (char *)relay_buf, sizeof(relay_buf), 0);
+            if (n <= 0) { running = 0; break; }
+            if (send(client_fd, (const char *)relay_buf, n, MSG_NOSIGNAL) != n)
+                { running = 0; break; }
+        }
+        if ((pfds[0].revents | pfds[1].revents) & (POLLHUP | POLLERR))
+            running = 0;
+    }
+    close(decoy_fd);
+}
+
 /* ================================================================
  * Server handshake
  * ================================================================ */
@@ -2440,9 +2535,9 @@ static int shitstorm_server_handshake(int fd, const void *params,
     if (ss_recv_all(fd, ch_hdr, TLS_RECORD_HEADER) != 0) return -1;
     if (ch_hdr[0] != TLS_HANDSHAKE) return -1;
     uint16_t ch_len = ((uint16_t)ch_hdr[3] << 8) | ch_hdr[4];
-    if (ch_len > 1024 || ch_len < 40) return -1;
+    if (ch_len > 2048 || ch_len < 40) return -1;
 
-    uint8_t ch_body[1024];
+    uint8_t ch_body[2048];
     if (ss_recv_all(fd, ch_body, ch_len) != 0) return -1;
     if (ch_body[0] != TLS_HS_CLIENT_HELLO) return -1;
 
@@ -2451,15 +2546,32 @@ static int shitstorm_server_handshake(int fd, const void *params,
         if (ch_len >= 4 + 2 + 32 + 1 + 32) {
             uint8_t *client_random = ch_body + 4 + 2;
             uint8_t sid_len = ch_body[4 + 34];
-            if (sid_len != 32) return -1;
+            if (sid_len != 32) {
+                if (sp->decoy_addr[0] && sp->decoy_port > 0)
+                    ss_proxy_to_decoy(fd, sp->decoy_addr, sp->decoy_port,
+                                      ch_hdr, TLS_RECORD_HEADER, ch_body, ch_len);
+                return -1;
+            }
             uint8_t expected_sid[32];
             moor_crypto_hash_keyed(expected_sid, client_random, 32, sp->identity_pk);
             if (sodium_memcmp(expected_sid, ch_body + 4 + 35, 32) != 0) {
                 sodium_memzero(expected_sid, 32);
-                return -1; /* Not a ShitStorm client */
+                /* Not a MOOR client — proxy to decoy site instead of
+                 * silent drop.  Active probes see a real website. */
+                if (sp->decoy_addr[0] && sp->decoy_port > 0) {
+                    LOG_INFO("shitstorm: auth failed, proxying to decoy %s:%u",
+                             sp->decoy_addr, sp->decoy_port);
+                    ss_proxy_to_decoy(fd, sp->decoy_addr, sp->decoy_port,
+                                      ch_hdr, TLS_RECORD_HEADER,
+                                      ch_body, ch_len);
+                }
+                return -1;
             }
             sodium_memzero(expected_sid, 32);
         } else {
+            if (sp->decoy_addr[0] && sp->decoy_port > 0)
+                ss_proxy_to_decoy(fd, sp->decoy_addr, sp->decoy_port,
+                                  ch_hdr, TLS_RECORD_HEADER, ch_body, ch_len);
             return -1;
         }
     }

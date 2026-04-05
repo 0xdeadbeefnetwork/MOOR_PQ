@@ -99,6 +99,10 @@ void moor_socks5_resume_reads(moor_circuit_t *circ);
  * Call after moor_circuit_destroy() in timeout/rotation/OOM paths. */
 void moor_socks5_invalidate_circuit(moor_circuit_t *circ);
 
+/* NULL out connection pointers in prebuilt pool, circuit cache, and
+ * HS pending entries.  Called from moor_connection_free() before poisoning. */
+void moor_socks5_nullify_conn(moor_connection_t *conn);
+
 /* Check for streams stuck waiting for RELAY_CONNECTED (30s timeout).
  * Called from the circuit timeout timer. */
 void moor_socks5_check_stream_timeouts(void);

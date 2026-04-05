@@ -49,6 +49,8 @@ A quantum computer that breaks X25519 cannot decrypt any MOOR traffic without al
 - **2-DA network**: Only 2 directory authorities. A compromised majority (both) could forge consensus. Production needs 5-9 DAs.
 - **Flag voting**: Each DA independently computes relay flags from statistical medians rather than majority voting across DAs.
 - **Side channels**: libsodium primitives are constant-time, but surrounding C code has not been formally audited for timing leaks.
+- **Onion key rotation**: Circuit static DH uses Curve25519 onion keys that rotate every 28 days. Compromise of a rotated-out key cannot decrypt past sessions. Identity keys are permanent but only appear in HKDF salt (authentication), never in DH.
+- **PQ .moor addresses**: Hidden service addresses commit to the Kyber768 public key via a 16-byte BLAKE2b hash. Clients verify the descriptor's KEM pk against this commitment. Service impersonation requires breaking both Ed25519 and the hash commitment.
 - **Forward secrecy**: Circuit keys are not rotated during a circuit's lifetime. Circuits rotate every 10 minutes.
 
 ## Responsible disclosure

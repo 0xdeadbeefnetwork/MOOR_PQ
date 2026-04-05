@@ -1108,7 +1108,7 @@ int moor_dht_publish(const uint8_t address_hash[32],
         circ->conn = conn;
         memcpy(circ->hops[0].node_id, relay->identity_pk, 32);
 
-        if (moor_circuit_create(circ, relay->identity_pk) != 0) {
+        if (moor_circuit_create(circ, relay->identity_pk, relay->onion_pk) != 0) {
             moor_circuit_free(circ);
             moor_connection_close(conn);
             moor_crypto_wipe(tmp_sk, 64);
@@ -1290,7 +1290,7 @@ static int dht_connect_relay(const moor_node_descriptor_t *relay,
     circ->conn = conn;
     memcpy(circ->hops[0].node_id, relay->identity_pk, 32);
 
-    if (moor_circuit_create(circ, relay->identity_pk) != 0) {
+    if (moor_circuit_create(circ, relay->identity_pk, relay->onion_pk) != 0) {
         moor_circuit_free(circ);
         moor_connection_close(conn);
         return -1;

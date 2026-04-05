@@ -6,6 +6,7 @@
 
 /* Forward declarations */
 struct moor_connection;
+struct moor_channel;
 struct moor_geoip_db;
 typedef struct moor_geoip_db moor_geoip_db_t;
 struct moor_bridge_entry;  /* from config.h */
@@ -26,8 +27,35 @@ typedef struct {
     uint8_t  end_reason;            /* RELAY_END reason code */
 } moor_stream_t;
 
+/* Destroy reason codes (Tor-aligned) */
+#define DESTROY_REASON_NONE             0
+#define DESTROY_REASON_PROTOCOL         1
+#define DESTROY_REASON_INTERNAL         2
+#define DESTROY_REASON_CONNECTFAILED    3
+#define DESTROY_REASON_RESOURCELIMIT    4
+#define DESTROY_REASON_TIMEOUT          5
+#define DESTROY_REASON_DESTROYED        6   /* received DESTROY from peer */
+#define DESTROY_REASON_FINISHED         7   /* circuit no longer needed */
+
 typedef struct moor_circuit {
     uint32_t circuit_id;
+
+    /* ---- Tor-aligned mark-for-close (prevents ALL use-after-free) ----
+     * Circuits are NEVER freed inline.  Instead, code calls
+     * moor_circuit_mark_for_close() which sets these fields and adds
+     * the circuit to a pending-close list.  The event loop calls
+     * moor_circuit_close_all_marked() at a safe point (end of iteration)
+     * to actually send DESTROY cells, close streams, and free the slot.
+     *
+     * While marked:
+     *  - moor_circuit_find() returns NULL (circuit is invisible)
+     *  - All cell processing skips this circuit
+     *  - The slot is still valid memory, preventing UAF
+     */
+    uint16_t marked_for_close;           /* 0 = alive, >0 = line number where marked */
+    const char *marked_for_close_file;   /* source file that marked it */
+    uint8_t  marked_for_close_reason;    /* DESTROY_REASON_* */
+
     uint8_t  num_hops;
     struct {
         uint8_t forward_key[32];
@@ -39,6 +67,7 @@ typedef struct moor_circuit {
         uint8_t node_id[32];            /* Identity of this hop */
     } hops[3]; /* MOOR_CIRCUIT_HOPS */
     moor_connection_t *conn;            /* Link to first hop (guard) */
+    struct moor_channel *chan;          /* Guard channel (owns conn, mux) */
     moor_stream_t streams[64];          /* MOOR_MAX_STREAMS */
     uint16_t next_stream_id;
     int      is_client;                 /* 1 if we originated this circuit */
@@ -48,6 +77,8 @@ typedef struct moor_circuit {
     uint32_t prev_circuit_id;
     moor_connection_t *next_conn;
     uint32_t next_circuit_id;
+    struct moor_channel *p_chan;        /* Previous hop channel (relay) */
+    struct moor_channel *n_chan;        /* Next hop channel (relay) */
     /* Per-hop key for relay side (only one layer) */
     uint8_t  relay_forward_key[32];
     uint8_t  relay_backward_key[32];
@@ -121,6 +152,9 @@ typedef struct moor_circuit {
     uint16_t e2e_kem_ct_len;      /* Bytes received so far */
     int      e2e_kem_pending;     /* 1 = waiting for KEM CT / ACK */
     uint8_t  e2e_dh_shared[32];   /* Saved DH shared secret for hybrid KDF */
+    /* KIST: per-circuit cell queues (pre-AEAD, relay-encrypted) */
+    moor_circ_cell_queue_t cell_queue_n;  /* cells toward n_chan (forward) */
+    moor_circ_cell_queue_t cell_queue_p;  /* cells toward p_chan (backward) */
     /* DoS cell rate limiting (Prop 305) */
     uint64_t dos_cell_tokens;           /* token bucket for cell rate */
     uint32_t relay_cells_queued;        /* Tor-aligned: per-circuit queue depth */
@@ -308,16 +342,41 @@ void moor_circuit_init_pool(void);
 /* Allocate a circuit */
 moor_circuit_t *moor_circuit_alloc(void);
 
-/* Free a circuit */
+/* Free a circuit slot (internal — prefer mark_for_close in all new code) */
 void moor_circuit_free(moor_circuit_t *circ);
+
+/* ---- Tor-aligned deferred close API ----
+ * NEVER free circuits inline.  Always mark, then the event loop frees.
+ * This eliminates use-after-free: the slot stays valid until no code
+ * can possibly hold a reference to it. */
+
+/* Mark a circuit for deferred close. The circuit becomes invisible to
+ * moor_circuit_find() immediately but is not freed until
+ * moor_circuit_close_all_marked() runs at end of event loop. */
+void moor_circuit_mark_for_close_(moor_circuit_t *circ, uint8_t reason,
+                                   int line, const char *file);
+#define moor_circuit_mark_for_close(circ, reason) \
+    moor_circuit_mark_for_close_((circ), (reason), __LINE__, __FILE__)
+
+/* Check if a circuit is marked for close */
+#define MOOR_CIRCUIT_IS_MARKED(circ) ((circ)->marked_for_close != 0)
+
+/* Process all pending close operations.  Called from event loop
+ * at end of each iteration — sends DESTROY cells, closes streams,
+ * wipes crypto, frees circuit slots.  NEVER call from a callback. */
+void moor_circuit_close_all_marked(void);
+
+/* Mark ALL circuits on a dying connection for close.
+ * Tor-aligned: when a channel dies, every circuit on it gets marked.
+ * This replaces the old teardown_for_conn which freed circuits inline. */
+void moor_circuit_mark_all_for_conn(moor_connection_t *conn, uint8_t reason);
 
 /* NULL out all circuit references to a dying connection */
 void moor_circuit_nullify_conn(moor_connection_t *conn);
 /* Check if any circuit references this connection */
 int moor_circuit_conn_in_use(moor_connection_t *conn);
 
-/* Tear down all circuits using a dying connection: send DESTROY to the
- * other side, close related connections, close exit streams, free circuit */
+/* Legacy teardown — calls mark_all_for_conn now (kept for compatibility) */
 void moor_circuit_teardown_for_conn(moor_connection_t *conn);
 
 /* Register/unregister circuit in the hash table (must call after setting conn/prev_conn/next_conn) */
@@ -353,8 +412,11 @@ int moor_circuit_build_bridge(moor_circuit_t *circ,
                               const struct moor_bridge_entry *bridge,
                               int skip_reuse);
 
-/* Perform CREATE handshake for first hop */
+/* Perform CREATE handshake for first hop.
+ * relay_identity_pk = Ed25519 (for identification + HKDF binding)
+ * relay_onion_pk    = Curve25519 (for static DH — rotatable, forward secrecy) */
 int moor_circuit_create(moor_circuit_t *circ,
+                        const uint8_t relay_identity_pk[32],
                         const uint8_t relay_onion_pk[32]);
 
 /* Perform PQ hybrid CREATE handshake: X25519 + Kyber768.
@@ -362,6 +424,7 @@ int moor_circuit_create(moor_circuit_t *circ,
  * Sends KEM ciphertext after CREATED_PQ for post-quantum key agreement. */
 int moor_circuit_create_pq(moor_circuit_t *circ,
                            const uint8_t relay_identity_pk[32],
+                           const uint8_t relay_onion_pk[32],
                            const uint8_t relay_kem_pk[1184]);
 
 /* Handle incoming CREATED cell */
@@ -428,7 +491,7 @@ int moor_circuit_build_async(moor_circuit_t *circ,
 void moor_circuit_build_cancel(moor_circuit_t *circ);
 void moor_circuit_build_abort(moor_circuit_t *circ);
 
-/* Tear down circuit */
+/* Tear down circuit (now deferred — calls mark_for_close internally) */
 int moor_circuit_destroy(moor_circuit_t *circ);
 
 /* Check all circuits for timeouts (incomplete > 60s, established > 600s) */
@@ -446,8 +509,12 @@ uint64_t moor_padding_next_interval(void); /* Random interval in ms */
 /* OOM circuit killer: kill idle/oldest circuits to free slots */
 int moor_circuit_oom_kill(int target_free);
 
-/* Count active (non-zero circuit_id) circuits in the pool */
+/* Count active circuits (dynamic — no hard cap) */
 int moor_circuit_active_count(void);
+
+/* Iteration API: access circuits by index (for main.c, padding, etc.) */
+int moor_circuit_iter_count(void);
+moor_circuit_t *moor_circuit_iter_get(int idx);
 
 /* Circuit Build Timeout (CBT): adaptive timeout from Pareto distribution */
 #define MOOR_CBT_MAX_SAMPLES   100

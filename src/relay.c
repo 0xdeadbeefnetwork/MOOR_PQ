@@ -288,9 +288,10 @@ static void extend_complete_cb(int fd, int events, void *arg) {
     extend_work_t *w;
     while ((w = extend_pop_result()) != NULL) {
         /* Find the circuit — if prev_conn disconnected, circuit was freed.
-         * Also check connection generation to detect slot reuse (#CWE-362):
-         * if the conn was freed and reallocated, the generation won't match. */
-        if (w->prev_conn->generation != w->prev_conn_generation) {
+         * Check state first: a freed/poisoned connection has state=NONE, fd=-1.
+         * Then check generation to detect slot reuse (#CWE-362). */
+        if (w->prev_conn->state == CONN_STATE_NONE ||
+            w->prev_conn->generation != w->prev_conn_generation) {
             LOG_WARN("EXTEND: prev_conn reused (gen %u != %u), discarding result",
                      w->prev_conn->generation, w->prev_conn_generation);
             if (w->next_conn) moor_connection_close(w->next_conn);
@@ -332,9 +333,17 @@ static void extend_complete_cb(int fd, int events, void *arg) {
         /* Success: set next_conn socket to non-blocking for event loop */
         moor_set_nonblocking(w->next_conn->fd);
 
+        /* Wrap new outbound connection in a channel */
+        moor_channel_t *ext_chan = moor_channel_new_outbound(w->next_identity_pk);
+        if (ext_chan && ext_chan->state == CHAN_STATE_OPENING)
+            moor_channel_open(ext_chan, w->next_conn);
+
         /* Wire up the circuit to the next hop */
+        circ->n_chan = ext_chan;
         circ->next_conn = w->next_conn;
         circ->next_circuit_id = w->next_circuit_id;
+        if (ext_chan)
+            moor_circuitmux_attach(ext_chan, circ, w->next_circuit_id);
         moor_event_add(w->next_conn->fd, MOOR_EVENT_READ,
                         relay_conn_read_cb, w->next_conn);
         moor_circuit_register(circ);
@@ -346,7 +355,7 @@ static void extend_complete_cb(int fd, int events, void *arg) {
                         ext_cmd, 0, w->created_payload, 64);
         moor_relay_set_digest(ext_resp.payload, circ->relay_backward_digest);
         moor_circuit_relay_encrypt(circ, &ext_resp);
-        if (moor_connection_send_cell(circ->prev_conn, &ext_resp) != 0) {
+        if (moor_circuit_queue_cell(circ, &ext_resp, 1) != 0) {
             LOG_WARN("EXTEND: send %s failed on circuit %u",
                      w->pq ? "RELAY_EXTENDED_PQ" : "RELAY_EXTENDED",
                      circ->circuit_id);
@@ -1117,13 +1126,36 @@ static void exit_connect_complete_cb(int fd, int events, void *arg);
  * this callback reads and processes it through moor_relay_process_cell. */
 static void relay_conn_read_cb(int fd, int events, void *arg) {
     (void)fd;
-    (void)events;
     moor_connection_t *conn = (moor_connection_t *)arg;
+    MOOR_ASSERT_MSG(conn != NULL, "relay_conn_read_cb: NULL arg (fd=%d)", fd);
+    MOOR_ASSERT_MSG(conn->state == CONN_STATE_OPEN,
+        "relay_conn_read_cb: conn=%p state=%d fd=%d (expected OPEN)",
+        (void*)conn, conn->state, conn->fd);
+
+    /* Handle write-readiness: flush connection output queue */
+    if (events & MOOR_EVENT_WRITE) {
+        moor_queue_flush(&conn->outq, conn, &conn->write_off);
+        if (moor_queue_is_empty(&conn->outq)) {
+            moor_event_modify(conn->fd, MOOR_EVENT_READ);
+            moor_channel_t *flush_chan = moor_channel_find_by_conn(conn);
+            if (flush_chan && moor_circuitmux_total_queued(flush_chan) > 0)
+                moor_kist_channel_wants_writes(flush_chan);
+        }
+    }
+
     moor_cell_t cell;
     int ret;
     int count = 0;
     while (count < 64 && (ret = moor_connection_recv_cell(conn, &cell)) == 1) {
         moor_relay_process_cell(conn, &cell);
+        /* process_cell may have destroyed circuits on this conn.  If the
+         * conn was freed (state reset, fd=-1) by a destroy cascade, stop
+         * reading immediately — the conn is dead. */
+        if (conn->state != CONN_STATE_OPEN) {
+            LOG_WARN("relay_conn_read_cb: conn died mid-batch (fd=%d state=%d)",
+                     conn->fd, conn->state);
+            return;
+        }
         count++;
     }
     if (ret < 0) {
@@ -1191,7 +1223,7 @@ static void exit_target_read_cb(int fd, int events, void *arg) {
                            stream_id, NULL, 0);
             moor_relay_set_digest(cell.payload, circ->relay_backward_digest);
             moor_circuit_relay_encrypt(circ, &cell);
-            if (moor_connection_send_cell(circ->prev_conn, &cell) != 0)
+            if (moor_circuit_queue_cell(circ, &cell, 1) != 0)
                 LOG_WARN("exit: failed to send RELAY_END for stream %u", stream_id);
 
             stream->target_fd = -1;
@@ -1221,7 +1253,7 @@ static void exit_target_read_cb(int fd, int events, void *arg) {
                    stream_id, buf, (uint16_t)n);
     moor_relay_set_digest(cell.payload, circ->relay_backward_digest);
     moor_circuit_relay_encrypt(circ, &cell);
-    if (moor_connection_send_cell(circ->prev_conn, &cell) != 0) {
+    if (moor_circuit_queue_cell(circ, &cell, 1) != 0) {
         LOG_WARN("exit: failed to send RELAY_DATA for stream %u", stream_id);
     }
 
@@ -1231,7 +1263,7 @@ static void exit_target_read_cb(int fd, int events, void *arg) {
         circ->sendme_auth_cells_sent = 0;
         if (circ->sendme_auth_count < MOOR_SENDME_AUTH_MAX) {
             memcpy(circ->sendme_auth_expected[circ->sendme_auth_head],
-                   circ->relay_backward_digest, 8);
+                   circ->relay_backward_digest, MOOR_SENDME_AUTH_LEN);
             circ->sendme_auth_head =
                 (circ->sendme_auth_head + 1) % MOOR_SENDME_AUTH_MAX;
             circ->sendme_auth_count++;
@@ -1249,6 +1281,8 @@ int moor_relay_init(const moor_relay_config_t *config) {
     memcpy(&g_relay_config, config, sizeof(g_relay_config));
     moor_connection_init_pool();
     moor_circuit_init_pool();
+    moor_channel_init();
+    moor_kist_init();
     moor_dns_cache_init(&g_dns_cache);
     moor_dht_store_init(&g_dht_store);
     g_exit_fd_count = 0;
@@ -1363,31 +1397,24 @@ int moor_relay_handle_create(moor_connection_t *conn,
         return -1;
     }
 
-    /* Convert our Ed25519 identity key to Curve25519 */
-    uint8_t our_curve_sk[32];
-    if (moor_crypto_ed25519_to_curve25519_sk(our_curve_sk, g_relay_config.identity_sk) != 0) {
-        LOG_ERROR("CKE: failed to convert identity sk to Curve25519");
-        return -1;
-    }
-
-    /* Generate ephemeral X25519 keypair */
+    /* Use our Curve25519 onion key for static DH (rotatable, forward
+     * secrecy window).  Identity key stays in HKDF for authentication. */
     uint8_t eph_pk[32], eph_sk[32];
     moor_crypto_box_keygen(eph_pk, eph_sk);
 
     /* Compute DH:
      * dh1 = X25519(y, X) -- eph-eph (forward secrecy)
-     * dh2 = X25519(b, X) -- static-eph (identity binding) */
+     * dh2 = X25519(b, X) -- onion-static-eph (rotatable key binding) */
     uint8_t dh1[32], dh2[32];
     if (moor_crypto_dh(dh1, eph_sk, client_eph_pk) != 0 ||
-        moor_crypto_dh(dh2, our_curve_sk, client_eph_pk) != 0) {
+        moor_crypto_dh(dh2, g_relay_config.onion_sk, client_eph_pk) != 0) {
         moor_crypto_wipe(eph_sk, 32);
-        moor_crypto_wipe(our_curve_sk, 32);
         moor_crypto_wipe(dh1, 32);
         moor_crypto_wipe(dh2, 32);
         return -1;
     }
 
-    /* Derive key_seed + auth_tag */
+    /* Derive key_seed + auth_tag (identity_pk in HKDF for authentication) */
     uint8_t key_seed[32], auth_tag[32];
     relay_cke_derive(key_seed, auth_tag, dh1, dh2,
                       g_relay_config.identity_pk, client_eph_pk, eph_pk);
@@ -1396,7 +1423,6 @@ int moor_relay_handle_create(moor_connection_t *conn,
     moor_circuit_t *circ = moor_circuit_alloc();
     if (!circ) {
         moor_crypto_wipe(eph_sk, 32);
-        moor_crypto_wipe(our_curve_sk, 32);
         moor_crypto_wipe(dh1, 32);
         moor_crypto_wipe(dh2, 32);
         moor_crypto_wipe(key_seed, 32);
@@ -1424,7 +1450,6 @@ int moor_relay_handle_create(moor_connection_t *conn,
     if (moor_connection_send_cell(conn, &resp) != 0) {
         moor_circuit_free(circ);
         moor_crypto_wipe(eph_sk, 32);
-        moor_crypto_wipe(our_curve_sk, 32);
         moor_crypto_wipe(dh1, 32);
         moor_crypto_wipe(dh2, 32);
         moor_crypto_wipe(key_seed, 32);
@@ -1432,7 +1457,6 @@ int moor_relay_handle_create(moor_connection_t *conn,
     }
 
     moor_crypto_wipe(eph_sk, 32);
-    moor_crypto_wipe(our_curve_sk, 32);
     moor_crypto_wipe(dh1, 32);
     moor_crypto_wipe(dh2, 32);
     moor_crypto_wipe(key_seed, 32);
@@ -1474,20 +1498,13 @@ int moor_relay_handle_create_pq(moor_connection_t *conn,
         return -1;
     }
 
-    uint8_t our_curve_sk[32];
-    if (moor_crypto_ed25519_to_curve25519_sk(our_curve_sk, g_relay_config.identity_sk) != 0) {
-        LOG_ERROR("CKE PQ: failed to convert identity sk");
-        return -1;
-    }
-
     uint8_t eph_pk[32], eph_sk[32];
     moor_crypto_box_keygen(eph_pk, eph_sk);
 
     uint8_t dh1[32], dh2[32];
     if (moor_crypto_dh(dh1, eph_sk, client_eph_pk) != 0 ||
-        moor_crypto_dh(dh2, our_curve_sk, client_eph_pk) != 0) {
+        moor_crypto_dh(dh2, g_relay_config.onion_sk, client_eph_pk) != 0) {
         moor_crypto_wipe(eph_sk, 32);
-        moor_crypto_wipe(our_curve_sk, 32);
         moor_crypto_wipe(dh1, 32);
         moor_crypto_wipe(dh2, 32);
         return -1;
@@ -1500,7 +1517,7 @@ int moor_relay_handle_create_pq(moor_connection_t *conn,
     moor_circuit_t *circ = moor_circuit_alloc();
     if (!circ) {
         moor_crypto_wipe(eph_sk, 32);
-        moor_crypto_wipe(our_curve_sk, 32);
+        /* onion_sk is in g_relay_config, not stack — no wipe needed */
         moor_crypto_wipe(dh1, 32);
         moor_crypto_wipe(dh2, 32);
         moor_crypto_wipe(key_seed, 32);
@@ -1522,7 +1539,7 @@ int moor_relay_handle_create_pq(moor_connection_t *conn,
     if (moor_connection_send_cell(conn, &resp) != 0) {
         moor_circuit_free(circ);
         moor_crypto_wipe(eph_sk, 32);
-        moor_crypto_wipe(our_curve_sk, 32);
+        /* onion_sk is in g_relay_config, not stack — no wipe needed */
         moor_crypto_wipe(dh1, 32);
         moor_crypto_wipe(dh2, 32);
         moor_crypto_wipe(key_seed, 32);
@@ -1541,7 +1558,6 @@ int moor_relay_handle_create_pq(moor_connection_t *conn,
 
     /* Cleanup and register circuit */
     moor_crypto_wipe(eph_sk, 32);
-    moor_crypto_wipe(our_curve_sk, 32);
     moor_crypto_wipe(dh1, 32);
     moor_crypto_wipe(dh2, 32);
     moor_crypto_wipe(key_seed, 32);
@@ -1594,11 +1610,18 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                             moor_relay_set_digest(sendme.payload,
                                                   circ->relay_backward_digest);
                             moor_circuit_relay_encrypt(circ, &sendme);
-                            if (moor_connection_send_cell(circ->prev_conn, &sendme) != 0)
+                            if (moor_circuit_queue_cell(circ, &sendme, 1) != 0)
                                 LOG_WARN("RP: failed to send SENDME on circuit %u", circ->circuit_id);
                         }
                         circ->circ_deliver_window += MOOR_SENDME_INCREMENT;
                     }
+                }
+                /* Re-validate rp_partner after potential SENDME side effects */
+                if (!circ->rp_partner || !circ->rp_partner->prev_conn ||
+                    circ->rp_partner->prev_conn->state != CONN_STATE_OPEN) {
+                    LOG_WARN("RP: partner prev_conn gone after SENDME (circuit %u)",
+                             circ->circuit_id);
+                    return 0;
                 }
                 moor_cell_t fwd;
                 moor_cell_relay(&fwd, circ->rp_partner->prev_circuit_id,
@@ -1678,40 +1701,40 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                     return -1;
                 }
 
-                /* Tor-aligned EXTEND: try to reuse an existing connection to
+                /* Tor-aligned EXTEND: try to reuse an existing channel to
                  * the next hop (like Tor's channel_get_for_extend).  This avoids
                  * a full Noise_IK+PQ handshake and eliminates the thread entirely.
                  * Only fall back to async worker for truly new connections. */
                 uint32_t next_circ_id = moor_circuit_gen_id();
 
-                moor_connection_t *existing =
-                    moor_connection_find_by_identity(next_identity_pk);
+                moor_channel_t *n_chan =
+                    moor_channel_find_by_identity(next_identity_pk);
 
-                if (existing && existing->state == CONN_STATE_OPEN) {
-                    /* FAST PATH: reuse existing connection (no thread, no blocking).
+                if (n_chan && n_chan->state == CHAN_STATE_OPEN &&
+                    n_chan->conn && n_chan->conn->state == CONN_STATE_OPEN) {
+                    /* FAST PATH: reuse existing channel (no thread, no blocking).
                      * Send CREATE directly, register event callback for CREATED. */
                     moor_cell_t create_cell;
                     moor_cell_create(&create_cell, next_circ_id,
                                      next_identity_pk, client_eph_pk_ext);
-                    if (moor_connection_send_cell(existing, &create_cell) != 0) {
-                        LOG_WARN("EXTEND: send CREATE on existing conn failed");
+                    if (moor_connection_send_cell(n_chan->conn, &create_cell) != 0) {
+                        LOG_WARN("EXTEND: send CREATE on channel failed");
                         return -1;
                     }
 
-                    /* We need to wait for CREATED asynchronously.  Store the
-                     * circuit extension state so the event loop can complete it
-                     * when CREATED arrives on this connection. */
-                    circ->next_conn = existing;
+                    circ->n_chan = n_chan;
+                    circ->next_conn = n_chan->conn;
                     circ->next_circuit_id = next_circ_id;
                     circ->extend_pending = 1;
-                    existing->circuit_refcount++;
+                    n_chan->conn->circuit_refcount++;
+                    moor_circuitmux_attach(n_chan, circ, next_circ_id);
 
                     /* Register in event loop if not already registered */
-                    moor_event_add(existing->fd, MOOR_EVENT_READ,
-                                    relay_conn_read_cb, existing);
+                    moor_event_add(n_chan->conn->fd, MOOR_EVENT_READ,
+                                    relay_conn_read_cb, n_chan->conn);
                     moor_circuit_register(circ);
 
-                    LOG_INFO("EXTEND: reusing connection to %s:%u (fast path, circ %u)",
+                    LOG_INFO("EXTEND: reusing channel to %s:%u (fast path, circ %u)",
                              next_addr, next_port, circ->circuit_id);
                     return 0;
                 }
@@ -1730,6 +1753,9 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                 w->prev_circuit_id = circ->prev_circuit_id;
                 w->next_circuit_id = next_circ_id;
                 w->prev_conn = circ->prev_conn;
+                MOOR_ASSERT_MSG(circ->prev_conn != NULL,
+                    "EXTEND: prev_conn NULL in forward path (circ %u)",
+                    circ->circuit_id);
                 w->prev_conn_generation = circ->prev_conn->generation;
 
                 circ->extend_pending = 1;
@@ -1862,25 +1888,28 @@ int moor_relay_handle_relay(moor_connection_t *conn,
 
                 /* Same fast-path / slow-path as EXTEND */
                 uint32_t next_circ_id = moor_circuit_gen_id();
-                moor_connection_t *existing =
-                    moor_connection_find_by_identity(next_identity_pk);
+                moor_channel_t *n_chan2 =
+                    moor_channel_find_by_identity(next_identity_pk);
 
-                if (existing && existing->state == CONN_STATE_OPEN) {
+                if (n_chan2 && n_chan2->state == CHAN_STATE_OPEN &&
+                    n_chan2->conn && n_chan2->conn->state == CONN_STATE_OPEN) {
                     moor_cell_t create_cell;
                     moor_cell_create(&create_cell, next_circ_id,
                                      next_identity_pk, client_eph_pk_ext2);
-                    if (moor_connection_send_cell(existing, &create_cell) != 0) {
-                        LOG_WARN("EXTEND2: send CREATE on reused conn failed");
+                    if (moor_connection_send_cell(n_chan2->conn, &create_cell) != 0) {
+                        LOG_WARN("EXTEND2: send CREATE on channel failed");
                         return -1;
                     }
-                    circ->next_conn = existing;
+                    circ->n_chan = n_chan2;
+                    circ->next_conn = n_chan2->conn;
                     circ->next_circuit_id = next_circ_id;
                     circ->extend_pending = 1;
-                    existing->circuit_refcount++;
-                    moor_event_add(existing->fd, MOOR_EVENT_READ,
-                                    relay_conn_read_cb, existing);
+                    n_chan2->conn->circuit_refcount++;
+                    moor_circuitmux_attach(n_chan2, circ, next_circ_id);
+                    moor_event_add(n_chan2->conn->fd, MOOR_EVENT_READ,
+                                    relay_conn_read_cb, n_chan2->conn);
                     moor_circuit_register(circ);
-                    LOG_INFO("EXTEND2: reusing connection to %s:%u (fast path)",
+                    LOG_INFO("EXTEND2: reusing channel to %s:%u (fast path)",
                              next_addr, next_port);
                     return 0;
                 }
@@ -1897,6 +1926,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                 w->prev_circuit_id = circ->prev_circuit_id;
                 w->next_circuit_id = next_circ_id;
                 w->prev_conn = circ->prev_conn;
+                MOOR_ASSERT(circ->prev_conn != NULL);
                 w->prev_conn_generation = circ->prev_conn->generation;
                 circ->extend_pending = 1;
 
@@ -2026,7 +2056,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                                 moor_relay_set_digest(xoff.payload,
                                                       circ->relay_backward_digest);
                                 moor_circuit_relay_encrypt(circ, &xoff);
-                                if (moor_connection_send_cell(circ->prev_conn, &xoff) == 0)
+                                if (moor_circuit_queue_cell(circ, &xoff, 1) == 0)
                                     stream->xoff_sent = 1;
                                 LOG_DEBUG("exit: sent XOFF for stream %u (TCP buffer full)",
                                           relay.stream_id);
@@ -2046,7 +2076,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                             moor_relay_set_digest(end_cell.payload,
                                                   circ->relay_backward_digest);
                             moor_circuit_relay_encrypt(circ, &end_cell);
-                            if (moor_connection_send_cell(circ->prev_conn, &end_cell) != 0)
+                            if (moor_circuit_queue_cell(circ, &end_cell, 1) != 0)
                                 LOG_DEBUG("send_cell failed (line %d)", __LINE__);
                         }
                         moor_event_remove(stream->target_fd);
@@ -2076,7 +2106,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                     moor_relay_set_digest(xon.payload,
                                           circ->relay_backward_digest);
                     moor_circuit_relay_encrypt(circ, &xon);
-                    if (moor_connection_send_cell(circ->prev_conn, &xon) == 0)
+                    if (moor_circuit_queue_cell(circ, &xon, 1) == 0)
                         stream->xoff_sent = 0;
                     LOG_DEBUG("exit: sent XON for stream %u (TCP buffer drained)",
                               relay.stream_id);
@@ -2086,6 +2116,9 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                 stream->deliver_window--;
 
             sendme_check:
+                /* Guard prev_conn — goto from error paths where conn may be dead */
+                if (!circ->prev_conn || circ->prev_conn->state != CONN_STATE_OPEN)
+                    return 0;
                 if (circ->circ_deliver_window <=
                     MOOR_CIRCUIT_WINDOW - MOOR_SENDME_INCREMENT) {
                     /* Cap deliver window to prevent unbounded growth */
@@ -2095,27 +2128,33 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                                  circ->circuit_id);
                         return -1;
                     }
-                    /* SENDME auth (Prop 289): include forward digest */
-                    uint8_t sendme_body[8];
-                    memcpy(sendme_body, circ->relay_forward_digest, 8);
+                    /* SENDME auth (Prop 289): include forward digest.
+                     * Must send MOOR_SENDME_AUTH_LEN bytes — client
+                     * compares the full auth length, not just 8 bytes. */
+                    uint8_t sendme_body[MOOR_SENDME_AUTH_LEN];
+                    memcpy(sendme_body, circ->relay_forward_digest,
+                           MOOR_SENDME_AUTH_LEN);
                     moor_cell_t sendme;
                     moor_cell_relay(&sendme, circ->prev_circuit_id,
-                                   RELAY_SENDME, 0, sendme_body, 8);
+                                   RELAY_SENDME, 0, sendme_body,
+                                   MOOR_SENDME_AUTH_LEN);
                     moor_relay_set_digest(sendme.payload,
                                           circ->relay_backward_digest);
                     moor_circuit_relay_encrypt(circ, &sendme);
-                    if (moor_connection_send_cell(circ->prev_conn, &sendme) == 0)
+                    if (moor_circuit_queue_cell(circ, &sendme, 1) == 0)
                         circ->circ_deliver_window += MOOR_SENDME_INCREMENT;
                 }
                 if (stream && stream->deliver_window <=
                     MOOR_STREAM_WINDOW - MOOR_SENDME_INCREMENT) {
+                    if (!circ->prev_conn || circ->prev_conn->state != CONN_STATE_OPEN)
+                        return 0;
                     moor_cell_t sendme;
                     moor_cell_relay(&sendme, circ->prev_circuit_id,
                                    RELAY_SENDME, relay.stream_id, NULL, 0);
                     moor_relay_set_digest(sendme.payload,
                                           circ->relay_backward_digest);
                     moor_circuit_relay_encrypt(circ, &sendme);
-                    if (moor_connection_send_cell(circ->prev_conn, &sendme) == 0)
+                    if (moor_circuit_queue_cell(circ, &sendme, 1) == 0)
                         stream->deliver_window += MOOR_SENDME_INCREMENT;
                 }
                 return 0;
@@ -2195,7 +2234,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                     moor_relay_set_digest(resolved.payload,
                                           circ->relay_backward_digest);
                     moor_circuit_relay_encrypt(circ, &resolved);
-                    if (moor_connection_send_cell(circ->prev_conn, &resolved) != 0)
+                    if (moor_circuit_queue_cell(circ, &resolved, 1) != 0)
                         LOG_DEBUG("send_cell failed (line %d)", __LINE__);
                 }
                 return 0;
@@ -2445,7 +2484,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                 moor_relay_set_digest(rp_est.payload,
                                       circ->relay_backward_digest);
                 moor_circuit_relay_encrypt(circ, &rp_est);
-                if (moor_connection_send_cell(circ->prev_conn, &rp_est) != 0)
+                if (moor_circuit_queue_cell(circ, &rp_est, 1) != 0)
                     LOG_DEBUG("send_cell failed (line %d)", __LINE__);
                 LOG_DEBUG("ESTABLISH_RENDEZVOUS: stored cookie (circ %u)",
                          circ->circuit_id);
@@ -2565,26 +2604,29 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                             return -1;
                         }
 
-                        /* Fast path / slow path — same pattern as fragmented EXTEND_PQ */
+                        /* Fast path / slow path — channel-based */
                         uint32_t next_circ_id_uf = moor_circuit_gen_id();
-                        moor_connection_t *existing_pq = moor_connection_find_by_identity(next_identity_pk);
+                        moor_channel_t *n_chan_uf = moor_channel_find_by_identity(next_identity_pk);
 
-                        if (existing_pq && existing_pq->state == CONN_STATE_OPEN) {
-                            /* FAST PATH: reuse connection */
+                        if (n_chan_uf && n_chan_uf->state == CHAN_STATE_OPEN &&
+                            n_chan_uf->conn && n_chan_uf->conn->state == CONN_STATE_OPEN) {
+                            /* FAST PATH: reuse channel */
                             moor_cell_t create_cell;
                             moor_cell_create(&create_cell, next_circ_id_uf,
                                              next_identity_pk, client_eph_pk_ext);
                             create_cell.command = CELL_CREATE_PQ;
-                            if (moor_connection_send_cell(existing_pq, &create_cell) != 0) {
+                            if (moor_connection_send_cell(n_chan_uf->conn, &create_cell) != 0) {
                                 g_extend_pq_inflight--;
                                 return -1;
                             }
-                            circ->next_conn = existing_pq;
+                            circ->n_chan = n_chan_uf;
+                            circ->next_conn = n_chan_uf->conn;
                             circ->next_circuit_id = next_circ_id_uf;
                             circ->extend_pending = 1;
-                            existing_pq->circuit_refcount++;
-                            moor_event_add(existing_pq->fd, MOOR_EVENT_READ,
-                                           relay_conn_read_cb, existing_pq);
+                            n_chan_uf->conn->circuit_refcount++;
+                            moor_circuitmux_attach(n_chan_uf, circ, next_circ_id_uf);
+                            moor_event_add(n_chan_uf->conn->fd, MOOR_EVENT_READ,
+                                           relay_conn_read_cb, n_chan_uf->conn);
                             moor_circuit_register(circ);
                             g_extend_pq_inflight--;
                             LOG_INFO("EXTEND_PQ (unfrag): fast path to %s:%u", next_addr, next_port);
@@ -2602,6 +2644,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                             w->prev_circuit_id = circ->prev_circuit_id;
                             w->next_circuit_id = next_circ_id_uf;
                             w->prev_conn = circ->prev_conn;
+                            MOOR_ASSERT(circ->prev_conn != NULL);
                             w->prev_conn_generation = circ->prev_conn->generation;
                             w->pq = 1;
                             circ->extend_pending = 1;
@@ -2696,30 +2739,33 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                     return -1;
                 }
 
-                /* Try to reuse existing connection to next hop.
+                /* Try to reuse existing channel to next hop.
                  * FAST PATH: send CREATE_PQ directly, set extend_pending,
                  * CREATED_PQ handled by moor_relay_process_cell fast-path.
                  * SLOW PATH: dispatch to async worker thread (no event loop blocking). */
                 uint32_t next_circ_id_pq = moor_circuit_gen_id();
-                moor_connection_t *existing_pq2 = moor_connection_find_by_identity(next_identity_pk_pq);
+                moor_channel_t *n_chan_pq = moor_channel_find_by_identity(next_identity_pk_pq);
 
-                if (existing_pq2 && existing_pq2->state == CONN_STATE_OPEN) {
-                    /* FAST PATH: reuse connection */
+                if (n_chan_pq && n_chan_pq->state == CHAN_STATE_OPEN &&
+                    n_chan_pq->conn && n_chan_pq->conn->state == CONN_STATE_OPEN) {
+                    /* FAST PATH: reuse channel */
                     moor_cell_t create_cell;
                     moor_cell_create(&create_cell, next_circ_id_pq,
                                      next_identity_pk_pq, client_eph_pk_ext);
                     create_cell.command = CELL_CREATE_PQ;
-                    if (moor_connection_send_cell(existing_pq2, &create_cell) != 0) {
-                        LOG_WARN("EXTEND_PQ: send CREATE_PQ on existing conn failed");
+                    if (moor_connection_send_cell(n_chan_pq->conn, &create_cell) != 0) {
+                        LOG_WARN("EXTEND_PQ: send CREATE_PQ on channel failed");
                         g_extend_pq_inflight--;
                         return -1;
                     }
-                    circ->next_conn = existing_pq2;
+                    circ->n_chan = n_chan_pq;
+                    circ->next_conn = n_chan_pq->conn;
                     circ->next_circuit_id = next_circ_id_pq;
                     circ->extend_pending = 1;
-                    existing_pq2->circuit_refcount++;
-                    moor_event_add(existing_pq2->fd, MOOR_EVENT_READ,
-                                   relay_conn_read_cb, existing_pq2);
+                    n_chan_pq->conn->circuit_refcount++;
+                    moor_circuitmux_attach(n_chan_pq, circ, next_circ_id_pq);
+                    moor_event_add(n_chan_pq->conn->fd, MOOR_EVENT_READ,
+                                   relay_conn_read_cb, n_chan_pq->conn);
                     moor_circuit_register(circ);
                     LOG_INFO("EXTEND_PQ: fast path (channel reuse) to %s:%u",
                              next_addr, next_port);
@@ -2741,6 +2787,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                     w->prev_circuit_id = circ->prev_circuit_id;
                     w->next_circuit_id = next_circ_id_pq;
                     w->prev_conn = circ->prev_conn;
+                    MOOR_ASSERT(circ->prev_conn != NULL);
                     w->prev_conn_generation = circ->prev_conn->generation;
                     w->pq = 1;
 
@@ -2802,6 +2849,8 @@ int moor_relay_handle_relay(moor_connection_t *conn,
             case RELAY_CONFLUX_LINK: {
                 /* Exit-side: client wants to link this circuit to a conflux set */
                 LOG_INFO("CONFLUX_LINK on circuit %u", circ->circuit_id);
+                if (!circ->prev_conn || circ->prev_conn->state != CONN_STATE_OPEN)
+                    return 0;
                 /* Send CONFLUX_LINKED acknowledgment */
                 moor_cell_t linked;
                 moor_cell_relay(&linked, circ->prev_circuit_id,
@@ -2809,7 +2858,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                 moor_relay_set_digest(linked.payload,
                                       circ->relay_backward_digest);
                 moor_circuit_relay_encrypt(circ, &linked);
-                if (moor_connection_send_cell(circ->prev_conn, &linked) != 0)
+                if (moor_circuit_queue_cell(circ, &linked, 1) != 0)
                     LOG_DEBUG("send_cell failed (line %d)", __LINE__);
                 return 0;
             }
@@ -2905,12 +2954,9 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                 moor_mix_enqueue(circ->next_conn, work.circuit_id,
                                  work.command, work.payload) == 0) {
                 /* Cell queued in mix pool -- will be sent after random delay */
-            } else if (moor_connection_send_cell(circ->next_conn, &work) != 0) {
-                LOG_WARN("forward send failed, closing next_conn (circuit %u)",
-                         circ->circuit_id);
-                moor_event_remove(circ->next_conn->fd);
-                moor_connection_close(circ->next_conn);
-                circ->next_conn = NULL;
+            } else if (moor_circuit_queue_cell(circ, &work, 0) != 0) {
+                LOG_WARN("forward queue failed (circuit %u)", circ->circuit_id);
+                moor_circuit_mark_for_close(circ, DESTROY_REASON_RESOURCELIMIT);
             }
         } else {
             LOG_WARN("cannot forward: next_conn=%p state=%d",
@@ -2931,23 +2977,9 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                 moor_mix_enqueue(circ->prev_conn, work.circuit_id,
                                  work.command, work.payload) == 0) {
                 /* Cell queued in mix pool */
-            } else if (moor_connection_send_cell(circ->prev_conn, &work) != 0) {
-                LOG_WARN("backward send failed, closing prev_conn (circuit %u)",
-                         circ->circuit_id);
-                moor_connection_t *dead_conn = circ->prev_conn;
-                circ->prev_conn = NULL;
-                if (!moor_circuit_conn_in_use(dead_conn)) {
-                    moor_event_remove(dead_conn->fd);
-                    moor_connection_close(dead_conn);
-                }
-                /* Propagate DESTROY downstream so next hop tears down too.
-                 * Without this, next_conn's circuit leaks resources. */
-                if (circ->next_conn && circ->next_conn->state == CONN_STATE_OPEN) {
-                    moor_cell_t destroy;
-                    moor_cell_destroy(&destroy, circ->next_circuit_id);
-                    if (moor_connection_send_cell(circ->next_conn, &destroy) != 0)
-                        LOG_DEBUG("send_cell failed (line %d)", __LINE__);
-                }
+            } else if (moor_circuit_queue_cell(circ, &work, 1) != 0) {
+                LOG_WARN("backward queue failed (circuit %u)", circ->circuit_id);
+                moor_circuit_mark_for_close(circ, DESTROY_REASON_RESOURCELIMIT);
             }
         }
     }
@@ -2960,93 +2992,13 @@ int moor_relay_handle_destroy(moor_connection_t *conn,
     moor_circuit_t *circ = moor_circuit_find(cell->circuit_id, conn);
     if (!circ) return -1;
 
-    LOG_DEBUG("DESTROY handler: circ %u from conn=%p fd=%d "
-              "prev=%p next=%p next_fd=%d",
-              circ->circuit_id, (void*)conn, conn->fd,
-              (void*)circ->prev_conn, (void*)circ->next_conn,
-              circ->next_conn ? circ->next_conn->fd : -1);
+    LOG_INFO("DESTROY received: circ %u from conn=%p fd=%d",
+             circ->circuit_id, (void*)conn, conn->fd);
 
-    /* Flush any queued mix pool cells before propagating DESTROY.
-     * Without this, DESTROY (sent immediately) can overtake delayed
-     * relay cells still in the mix pool, causing the next hop to
-     * destroy the circuit before those cells arrive. */
-    if (moor_mix_enabled()) {
-        if (circ->next_conn && circ->next_conn != conn)
-            moor_mix_flush_circuit(circ->next_conn, circ->next_circuit_id);
-        if (circ->prev_conn && circ->prev_conn != conn)
-            moor_mix_flush_circuit(circ->prev_conn, circ->prev_circuit_id);
-    }
-
-    /* Send DESTROY downstream */
-    if (circ->next_conn && circ->next_conn != conn) {
-        moor_connection_t *nc = circ->next_conn;
-        if (nc->state == CONN_STATE_OPEN) {
-            moor_cell_t destroy;
-            moor_cell_destroy(&destroy, circ->next_circuit_id);
-            if (moor_connection_send_cell(nc, &destroy) != 0)
-                LOG_DEBUG("send_cell failed (line %d)", __LINE__);
-        }
-        circ->next_conn = NULL;
-        /* Only close if no other circuit uses this connection */
-        int in_use = moor_circuit_conn_in_use(nc);
-        LOG_DEBUG("DESTROY: closing next_conn=%p fd=%d in_use=%d",
-                  (void*)nc, nc->fd, in_use);
-        if (!in_use) {
-            moor_event_remove(nc->fd);
-            moor_connection_close(nc);
-        }
-    }
-
-    /* Send DESTROY upstream (if not the source) */
-    if (circ->prev_conn && circ->prev_conn != conn) {
-        moor_connection_t *pc = circ->prev_conn;
-        if (pc->state == CONN_STATE_OPEN) {
-            moor_cell_t destroy;
-            moor_cell_destroy(&destroy, circ->prev_circuit_id);
-            if (moor_connection_send_cell(pc, &destroy) != 0)
-                LOG_DEBUG("send_cell failed (line %d)", __LINE__);
-        }
-        circ->prev_conn = NULL;
-        /* Only close if no other circuit uses this connection */
-        if (!moor_circuit_conn_in_use(pc)) {
-            moor_event_remove(pc->fd);
-            moor_connection_close(pc);
-        }
-    }
-
-    /* Close exit streams and remove from event loop */
-    for (int i = 0; i < MOOR_MAX_STREAMS; i++) {
-        if (circ->streams[i].target_fd >= 0) {
-            moor_event_remove(circ->streams[i].target_fd);
-            exit_fd_remove(circ->streams[i].target_fd);
-            close(circ->streams[i].target_fd);
-        }
-    }
-
-    /* Propagate DESTROY to RP partner (rendezvous teardown) */
-    if (circ->rp_partner) {
-        moor_circuit_t *partner = circ->rp_partner;
-        if (partner->prev_conn && partner->prev_conn->state == CONN_STATE_OPEN) {
-            moor_cell_t destroy_cell;
-            moor_cell_destroy(&destroy_cell, partner->prev_circuit_id);
-            if (moor_connection_send_cell(partner->prev_conn, &destroy_cell) != 0)
-                LOG_DEBUG("send_cell failed (line %d)", __LINE__);
-        }
-        if (partner->prev_conn) {
-            moor_connection_t *pc = partner->prev_conn;
-            partner->prev_conn = NULL;
-            if (!moor_circuit_conn_in_use(pc)) {
-                moor_event_remove(pc->fd);
-                moor_connection_close(pc);
-            }
-        }
-        circ->rp_partner = NULL;
-        partner->rp_partner = NULL;
-        moor_circuit_free(partner);
-    }
-
-    LOG_INFO("circuit %u destroyed by peer", cell->circuit_id);
-    moor_circuit_free(circ);
+    /* Tor-aligned: just mark for close.  All the DESTROY propagation,
+     * stream cleanup, and slot free happens in close_all_marked() at
+     * end of event loop.  No inline free, no cascade, no UAF. */
+    moor_circuit_mark_for_close(circ, DESTROY_REASON_DESTROYED);
     return 0;
 }
 
@@ -3058,19 +3010,19 @@ static void exit_send_relay_end(moor_circuit_t *circ, uint16_t stream_id) {
                    NULL, 0);
     moor_relay_set_digest(cell.payload, circ->relay_backward_digest);
     moor_circuit_relay_encrypt(circ, &cell);
-    if (moor_connection_send_cell(circ->prev_conn, &cell) != 0)
+    if (moor_circuit_queue_cell(circ, &cell, 1) != 0)
         LOG_DEBUG("send_cell failed (line %d)", __LINE__);
 }
 
 /* Helper: send RELAY_CONNECTED for a stream */
 static void exit_send_relay_connected(moor_circuit_t *circ, uint16_t stream_id) {
-    if (!circ->prev_conn) return;
+    if (!circ->prev_conn || circ->prev_conn->state != CONN_STATE_OPEN) return;
     moor_cell_t cell;
     moor_cell_relay(&cell, circ->prev_circuit_id, RELAY_CONNECTED,
                    stream_id, NULL, 0);
     moor_relay_set_digest(cell.payload, circ->relay_backward_digest);
     moor_circuit_relay_encrypt(circ, &cell);
-    if (moor_connection_send_cell(circ->prev_conn, &cell) != 0)
+    if (moor_circuit_queue_cell(circ, &cell, 1) != 0)
         LOG_DEBUG("send_cell failed (line %d)", __LINE__);
 }
 
@@ -3319,7 +3271,7 @@ int moor_relay_exit_read(moor_circuit_t *circ, moor_stream_t *stream) {
                        stream->stream_id, NULL, 0);
         moor_relay_set_digest(cell.payload, circ->relay_backward_digest);
         moor_circuit_relay_encrypt(circ, &cell);
-        if (moor_connection_send_cell(circ->prev_conn, &cell) != 0)
+        if (moor_circuit_queue_cell(circ, &cell, 1) != 0)
             LOG_DEBUG("send_cell failed (line %d)", __LINE__);
         moor_event_remove(stream->target_fd);
         exit_fd_remove(stream->target_fd);
@@ -3334,7 +3286,7 @@ int moor_relay_exit_read(moor_circuit_t *circ, moor_stream_t *stream) {
                    stream->stream_id, buf, (uint16_t)n);
     moor_relay_set_digest(cell.payload, circ->relay_backward_digest);
     moor_circuit_relay_encrypt(circ, &cell);
-    if (moor_connection_send_cell(circ->prev_conn, &cell) != 0)
+    if (moor_circuit_queue_cell(circ, &cell, 1) != 0)
         LOG_DEBUG("send_cell failed (line %d)", __LINE__);
     return 0;
 }
@@ -3399,7 +3351,7 @@ int moor_relay_process_cell(moor_connection_t *conn,
                         ext_cmd, 0, cell->payload, 64);
         moor_relay_set_digest(ext_resp.payload, circ->relay_backward_digest);
         moor_circuit_relay_encrypt(circ, &ext_resp);
-        if (moor_connection_send_cell(circ->prev_conn, &ext_resp) != 0)
+        if (moor_circuit_queue_cell(circ, &ext_resp, 1) != 0)
             LOG_WARN("CREATED: send %s failed on circuit %u",
                      ext_cmd == RELAY_EXTENDED_PQ ? "RELAY_EXTENDED_PQ" : "RELAY_EXTENDED",
                      circ->circuit_id);
@@ -3531,8 +3483,8 @@ static int relay_register_single(const moor_relay_config_t *config,
     int fd = moor_tcp_connect_simple(da_addr, da_port);
     if (fd < 0) return -1;
 
-    moor_setsockopt_timeo(fd, SO_SNDTIMEO, 2);
-    moor_setsockopt_timeo(fd, SO_RCVTIMEO, 2);
+    moor_setsockopt_timeo(fd, SO_SNDTIMEO, 10);
+    moor_setsockopt_timeo(fd, SO_RCVTIMEO, 10);
 
     /* Send command + length + descriptor + pow_nonce(8) + pow_timestamp(8) */
     uint32_t payload_len = (uint32_t)wire_len + 16;
@@ -3572,11 +3524,19 @@ static int relay_register_single(const moor_relay_config_t *config,
     }
 
     char resp[64];
-    ssize_t rn = recv(fd, resp, sizeof(resp), 0);
+    memset(resp, 0, sizeof(resp));
+    ssize_t rn = recv(fd, resp, sizeof(resp) - 1, 0);
     close(fd);
 
     if (rn >= 3 && memcmp(resp, "OK\n", 3) == 0)
         return 0;
+    /* Log the actual response for debugging */
+    if (rn > 0)
+        LOG_WARN("relay_register: DA responded \"%.*s\" (%zd bytes)",
+                 (int)(rn > 32 ? 32 : rn), resp, rn);
+    else
+        LOG_WARN("relay_register: no response from DA (recv=%zd errno=%d)",
+                 rn, errno);
     return -1;
 }
 

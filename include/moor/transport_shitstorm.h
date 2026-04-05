@@ -38,6 +38,8 @@ typedef struct {
 typedef struct {
     uint8_t  identity_pk[32];  /* Our Ed25519 public key */
     uint8_t  identity_sk[64];  /* Our Ed25519 secret key */
+    char     decoy_addr[128];  /* Decoy web server address (e.g. "127.0.0.1") */
+    uint16_t decoy_port;       /* Decoy web server port (e.g. 8443) */
 } moor_shitstorm_server_params_t;
 
 /* Pluggable transport instance */

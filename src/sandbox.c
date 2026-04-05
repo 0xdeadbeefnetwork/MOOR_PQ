@@ -60,18 +60,48 @@ static int install_seccomp_filter(void) {
         SC_ALLOW(__NR_getdents64),
         SC_ALLOW(__NR_fcntl),
         SC_ALLOW(__NR_dup),
+        /* Some syscalls are x86-only; aarch64 uses *at variants */
+#ifdef __NR_unlink
         SC_ALLOW(__NR_unlink),
+#endif
         SC_ALLOW(__NR_unlinkat),
+#ifdef __NR_mkdir
         SC_ALLOW(__NR_mkdir),
+#endif
+#ifdef __NR_mkdirat
+        SC_ALLOW(__NR_mkdirat),
+#endif
         SC_ALLOW(__NR_fchmod),
+#ifdef __NR_newfstatat
         SC_ALLOW(__NR_newfstatat),
+#endif
+#ifdef __NR_statx
+        SC_ALLOW(__NR_statx),
+#endif
         SC_ALLOW(__NR_writev),
         SC_ALLOW(__NR_pread64),
         SC_ALLOW(__NR_pwrite64),
+#ifdef __NR_access
         SC_ALLOW(__NR_access),
+#endif
+#ifdef __NR_faccessat
+        SC_ALLOW(__NR_faccessat),
+#endif
+#ifdef __NR_stat
         SC_ALLOW(__NR_stat),
+#endif
+#ifdef __NR_lstat
         SC_ALLOW(__NR_lstat),
+#endif
+#ifdef __NR_rename
         SC_ALLOW(__NR_rename),
+#endif
+#ifdef __NR_renameat
+        SC_ALLOW(__NR_renameat),
+#endif
+#ifdef __NR_renameat2
+        SC_ALLOW(__NR_renameat2),
+#endif
 
         /* Network */
         SC_ALLOW(__NR_socket),
@@ -91,15 +121,32 @@ static int install_seccomp_filter(void) {
         SC_ALLOW(__NR_shutdown),
         SC_ALLOW(__NR_socketpair),
         SC_ALLOW(__NR_pipe2),
+#ifdef __NR_pipe
         SC_ALLOW(__NR_pipe),
+#endif
 
         /* Event loop */
         SC_ALLOW(__NR_epoll_create1),
         SC_ALLOW(__NR_epoll_ctl),
+#ifdef __NR_epoll_wait
         SC_ALLOW(__NR_epoll_wait),
+#endif
         SC_ALLOW(__NR_epoll_pwait),
+#ifdef __NR_epoll_pwait2
+        SC_ALLOW(__NR_epoll_pwait2),
+#endif
+#ifdef __NR_poll
         SC_ALLOW(__NR_poll),
+#endif
+#ifdef __NR_ppoll
+        SC_ALLOW(__NR_ppoll),
+#endif
+#ifdef __NR_select
         SC_ALLOW(__NR_select),
+#endif
+#ifdef __NR_pselect6
+        SC_ALLOW(__NR_pselect6),
+#endif
 
         /* Time */
         SC_ALLOW(__NR_clock_gettime),

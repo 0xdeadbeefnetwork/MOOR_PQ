@@ -92,8 +92,8 @@ Client -> Guard (raw bytes over link):
 
 Both sides:
   dh1 = X25519(client_eph, guard_eph)           Forward secrecy
-  dh2 = X25519(client_eph, guard_identity)      Identity binding
-  key_seed = CKE_HKDF(dh1, dh2, pks)
+  dh2 = X25519(client_eph, guard_onion_pk)      Onion key binding (rotates every 28 days)
+  key_seed = CKE_HKDF(dh1, dh2, identity_pk)   Identity in HKDF salt (authentication)
   kem_ss = KEM_Decap(kem_ct, guard_kem_sk)      PQ shared secret
 
   hybrid = BLAKE2b(key_seed || kem_ss)
@@ -180,4 +180,6 @@ DA peers must be configured with each other's identity fingerprints for trust ve
 6. Client receives RENDEZVOUS2, derives e2e keys
 7. Bidirectional data flows through 6 total hops
 
-HS addresses: base32(BLAKE2b(service_pk)).moor
+HS addresses: base32(Ed25519_pk(32) + BLAKE2b_16(Kyber768_pk)(16)).moor
+
+The 16-byte truncated hash of the Kyber768 public key is baked into the address. Clients verify the KEM pk from the descriptor matches the commitment in the address. Prevents service impersonation even if Ed25519 is broken.

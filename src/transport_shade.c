@@ -293,21 +293,44 @@ static int shade_client_handshake(int fd, const void *params,
     }
     free(msg);
 
-    /* Receive server response: server_repr(32) + mark(16) + mac(32) = 80 bytes min */
-    uint8_t resp[80];
-    if (shade_recv_all(fd, resp, 80) != 0) {
+    /* Receive server response: server_repr(32) + pad(32-256) + mark(16) + mac(32).
+     * Read up to max, then scan for mark at all valid positions. */
+    uint8_t resp[336]; /* 32 + 256 + 16 + 32 = 336 max */
+    if (shade_recv_all(fd, resp, 80) != 0) { /* read minimum first */
         moor_crypto_wipe(eph_sk, 32);
         moor_crypto_wipe(shared, 32);
         return -1;
     }
+    size_t resp_got = 80;
+    /* Read remaining with short timeout */
+    {
+        struct timeval tv = { 0, 200000 }; /* 200ms */
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
+    while (resp_got < sizeof(resp)) {
+        ssize_t n = recv(fd, (char *)resp + resp_got, sizeof(resp) - resp_got, 0);
+        if (n <= 0) break;
+        resp_got += (size_t)n;
+    }
+    moor_setsockopt_timeo(fd, SO_RCVTIMEO, 10);
 
-    /* Verify server mark (computed over the representative, which is what's on wire) */
+    /* Compute expected mark from server repr (first 32 bytes) */
     uint8_t expected_mark[16];
     uint8_t server_repr[32];
     memcpy(server_repr, resp, 32);
-    server_repr[31] &= 0x3f; /* clear random high bits before mark computation */
+    server_repr[31] &= 0x3f;
     moor_shade_compute_mark(expected_mark, p->node_id, server_repr);
-    if (sodium_memcmp(expected_mark, resp + 32, 16) != 0) {
+
+    /* Constant-time scan for mark at all valid positions */
+    int found = 0;
+    size_t mark_off = 0;
+    for (size_t i = 32; i + 48 <= resp_got; i++) {
+        int eq = (sodium_memcmp(expected_mark, resp + i, 16) == 0);
+        int take = eq & (!found);
+        mark_off = take ? i : mark_off;
+        found |= eq;
+    }
+    if (!found) {
         LOG_ERROR("shade: server mark verification failed");
         moor_crypto_wipe(eph_sk, 32);
         moor_crypto_wipe(shared, 32);
@@ -482,12 +505,18 @@ static int shade_server_handshake(int fd, const void *params,
     moor_shade_compute_mark(server_mark, p->node_id, server_repr);
     shade_compute_mac(server_mac, shared, server_mark, server_repr);
 
-    /* Send: server_repr(32) + server_mark(16) + server_mac(32) */
-    uint8_t resp[80];
+    /* Send: server_repr(32) + random_pad(32-256) + server_mark(16) + server_mac(32).
+     * Variable padding prevents fingerprinting by fixed 80-byte response size. */
+    uint8_t pad_rand;
+    moor_crypto_random(&pad_rand, 1);
+    size_t pad_len = 32 + (pad_rand % 225); /* 32-256 bytes */
+    size_t resp_len = 32 + pad_len + 16 + 32;
+    uint8_t resp[32 + 256 + 16 + 32]; /* max size */
     memcpy(resp, server_repr, 32);
-    memcpy(resp + 32, server_mark, 16);
-    memcpy(resp + 48, server_mac, 32);
-    if (shade_send_all(fd, resp, 80) != 0) {
+    moor_crypto_random(resp + 32, pad_len);
+    memcpy(resp + 32 + pad_len, server_mark, 16);
+    memcpy(resp + 32 + pad_len + 16, server_mac, 32);
+    if (shade_send_all(fd, resp, resp_len) != 0) {
         moor_crypto_wipe(shared, 32);
         moor_crypto_wipe(server_eph_sk, 32);
         return -1;
