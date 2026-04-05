@@ -21,8 +21,8 @@
 
 #define MOOR_VERSION_MAJOR  0
 #define MOOR_VERSION_MINOR  8
-#define MOOR_VERSION_PATCH  0
-#define MOOR_VERSION_STRING "0.8.0"
+#define MOOR_VERSION_PATCH  1
+#define MOOR_VERSION_STRING "0.8.1"
 
 /* Identity / key lengths (protocol-fixed, crypto algorithm sizes) */
 #define MOOR_ID_LEN             32      /* Ed25519 public key */
