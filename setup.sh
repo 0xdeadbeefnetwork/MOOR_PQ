@@ -1,23 +1,19 @@
 #!/bin/bash
-# MOOR Setup
-# One command to fetch, build, configure, and start a MOOR relay or hidden service.
+# MOOR Relay Setup v0.8.1
+# One command to fetch, build, configure, and start a MOOR node.
 #
 # Usage:
-#   curl -sL https://raw.githubusercontent.com/0xdeadbeefnetwork/MOOR_PQ/main/setup.sh | sudo bash
+#   curl -sL https://moor.afflicted.sh/install.sh | sudo bash
 #
-# Or non-interactive:
-#   curl -sL .../setup.sh | sudo bash -s -- --role exit --nickname MYRELAY --ip 1.2.3.4
-#   curl -sL .../setup.sh | sudo bash -s -- --role hs --hs-port 8080
+# Non-interactive:
+#   curl -sL .../install.sh | sudo bash -s -- --role exit --nickname MYRELAY --ip 1.2.3.4
+#   curl -sL .../install.sh | sudo bash -s -- --role bridge --nickname MYBRIDGE --ip 1.2.3.4 --transport shitstorm
+#   curl -sL .../install.sh | sudo bash -s -- --role relay --enclave /path/to/mynet.enclave
 
-# Wrap in a function so the entire script is downloaded before execution.
-# Without this, `curl | bash` feeds the script line-by-line and tools
-# like make/git can consume lines from stdin, breaking the script.
 main() {
 
 set -euo pipefail
 
-# When run via `curl | bash`, stdin is the script itself.
-# Redirect interactive reads from /dev/tty so prompts work.
 if [[ ! -t 0 ]]; then
     exec 3</dev/tty || { echo "Error: cannot read from terminal (use --role/--nickname flags for non-interactive)"; exit 1; }
     STDIN_FD=3
@@ -30,12 +26,13 @@ ROLE=""
 NICKNAME=""
 ADVERTISE=""
 OR_PORT="9001"
-HS_PORT=""
-HS_DIR=""
 CONF_DIR="/etc/moor"
 DATA_DIR="/var/lib/moor"
 BUILD_DIR="/opt/moor"
 MOOR_USER="moor"
+TRANSPORT=""
+ENCLAVE=""
+CONTACT_INFO=""
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -48,21 +45,29 @@ detect_ip() {
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --role)     ROLE="$2"; shift 2 ;;
-        --nickname) NICKNAME="$2"; shift 2 ;;
-        --ip)       ADVERTISE="$2"; shift 2 ;;
-        --port)     OR_PORT="$2"; shift 2 ;;
-        --hs-port)  HS_PORT="$2"; shift 2 ;;
-        --hs-dir)   HS_DIR="$2"; shift 2 ;;
+        --role)      ROLE="$2"; shift 2 ;;
+        --nickname)  NICKNAME="$2"; shift 2 ;;
+        --ip)        ADVERTISE="$2"; shift 2 ;;
+        --port)      OR_PORT="$2"; shift 2 ;;
+        --transport) TRANSPORT="$2"; shift 2 ;;
+        --enclave)   ENCLAVE="$2"; shift 2 ;;
+        --contact)   CONTACT_INFO="$2"; shift 2 ;;
         --help|-h)
-            echo "Usage: sudo $0 [--role exit|middle|guard|relay|hs] [--nickname NAME] [--ip ADDR] [--port PORT]"
-            echo "       sudo $0 --role hs --hs-port 8080 [--hs-dir /path]"
+            echo "Usage: sudo $0 [OPTIONS]"
+            echo ""
+            echo "  --role <type>       relay|middle|exit|guard|bridge"
+            echo "  --nickname <name>   Node nickname"
+            echo "  --ip <addr>         Public IP address"
+            echo "  --port <port>       OR port (default: 9001)"
+            echo "  --transport <name>  Bridge transport: shitstorm|mirage|shade|scramble|speakeasy"
+            echo "  --enclave <file>    Use independent network (enclave file with DA list)"
+            echo "  --contact <info>    Contact email/URL (optional)"
             exit 0 ;;
         *) die "Unknown option: $1" ;;
     esac
 done
 
-[[ "$(id -u)" -eq 0 ]] || die "Run with: curl -sL .../setup.sh | sudo bash"
+[[ "$(id -u)" -eq 0 ]] || die "Run with: curl -sL .../install.sh | sudo bash"
 
 cat << 'BANNER'
 
@@ -72,20 +77,20 @@ cat << 'BANNER'
  | |  | | |_| | |_| |  _ <
  |_|  |_|\___/ \___/|_| \_\
 
- Post-Quantum Anonymous Network Setup
+ Post-Quantum Anonymous Network — v0.8.1
 
 BANNER
 
 # ---- interactive prompts ----
 
 if [[ -z "$ROLE" ]]; then
-    echo " What do you want to run?"
+    echo " What kind of node do you want to run?"
     echo ""
     echo "   1) relay     - General relay, DA assigns flags based on performance"
     echo "   2) middle    - Middle-only relay (never guard or exit)"
     echo "   3) exit      - Exit relay (forwards traffic to the internet)"
     echo "   4) guard     - Guard relay (entry point for circuits)"
-    echo "   5) hs        - Hidden service (host a .moor site)"
+    echo "   5) bridge    - Bridge relay (unlisted, censorship circumvention)"
     echo ""
     read -rp " Choose [1-5] (default: 1): " choice <&$STDIN_FD
     case "${choice:-1}" in
@@ -93,74 +98,77 @@ if [[ -z "$ROLE" ]]; then
         2|middle) ROLE="middle" ;;
         3|exit)   ROLE="exit" ;;
         4|guard)  ROLE="guard" ;;
-        5|hs)     ROLE="hs" ;;
+        5|bridge) ROLE="bridge" ;;
         *) die "Invalid choice." ;;
     esac
 fi
 
-IS_HS=0
-if [[ "$ROLE" == "hs" ]]; then
-    IS_HS=1
+if [[ "$ROLE" == "bridge" && -z "$TRANSPORT" ]]; then
+    echo ""
+    echo " Which pluggable transport?"
+    echo ""
+    echo "   1) shitstorm  - Chrome TLS 1.3 fingerprint (recommended, hardest to block)"
+    echo "   2) mirage     - TLS 1.3 record framing with configurable SNI"
+    echo "   3) shade      - Elligator2 statistical evasion"
+    echo "   4) scramble   - Entropy evasion with HTTP prefix"
+    echo "   5) speakeasy  - SSH protocol camouflage"
+    echo ""
+    read -rp " Choose [1-5] (default: 1): " tchoice <&$STDIN_FD
+    case "${tchoice:-1}" in
+        1|shitstorm) TRANSPORT="shitstorm" ;;
+        2|mirage)    TRANSPORT="mirage" ;;
+        3|shade)     TRANSPORT="shade" ;;
+        4|scramble)  TRANSPORT="scramble" ;;
+        5|speakeasy) TRANSPORT="speakeasy" ;;
+        *) die "Invalid transport." ;;
+    esac
 fi
 
-if [[ $IS_HS -eq 0 ]]; then
-    # ---- relay prompts ----
-    if [[ -z "$NICKNAME" ]]; then
-        echo ""
-        read -rp " Relay nickname: " NICKNAME <&$STDIN_FD
-        [[ -n "$NICKNAME" ]] || die "Nickname required."
-    fi
-    NICKNAME=$(echo "$NICKNAME" | tr -cd 'A-Za-z0-9_')
-    [[ -n "$NICKNAME" ]] || die "Nickname must contain at least one alphanumeric character."
+if [[ -z "$NICKNAME" ]]; then
+    echo ""
+    read -rp " Node nickname: " NICKNAME <&$STDIN_FD
+    [[ -n "$NICKNAME" ]] || die "Nickname required."
+fi
+NICKNAME=$(echo "$NICKNAME" | tr -cd 'A-Za-z0-9_')
+[[ -n "$NICKNAME" ]] || die "Nickname must contain at least one alphanumeric character."
 
-    if [[ -z "$ADVERTISE" ]]; then
-        echo ""
-        echo -n " Detecting public IP... "
-        ADVERTISE=$(detect_ip)
-        if [[ -n "$ADVERTISE" ]]; then
-            echo "$ADVERTISE"
-            read -rp " Use this IP? [Y/n]: " yn <&$STDIN_FD
-            if [[ "${yn:-y}" =~ ^[Nn] ]]; then
-                read -rp " Enter your public IP: " ADVERTISE <&$STDIN_FD
-            fi
-        else
-            echo "couldn't detect"
+if [[ -z "$ADVERTISE" ]]; then
+    echo ""
+    echo -n " Detecting public IP... "
+    ADVERTISE=$(detect_ip)
+    if [[ -n "$ADVERTISE" ]]; then
+        echo "$ADVERTISE"
+        read -rp " Use this IP? [Y/n]: " yn <&$STDIN_FD
+        if [[ "${yn:-y}" =~ ^[Nn] ]]; then
             read -rp " Enter your public IP: " ADVERTISE <&$STDIN_FD
         fi
-        [[ -n "$ADVERTISE" ]] || die "Public IP required."
+    else
+        echo "couldn't detect"
+        read -rp " Enter your public IP: " ADVERTISE <&$STDIN_FD
     fi
-
-    echo ""
-    read -rp " Contact info (email/URL, optional, press Enter to skip): " CONTACT_INFO <&$STDIN_FD
-
-    echo ""
-    echo " ----------------------------------------"
-    echo "  Role:     $ROLE"
-    echo "  Nickname: $NICKNAME"
-    echo "  Address:  $ADVERTISE:$OR_PORT"
-    if [[ -n "${CONTACT_INFO:-}" ]]; then
-    echo "  Contact:  $CONTACT_INFO"
-    fi
-    echo " ----------------------------------------"
-else
-    # ---- hidden service prompts ----
-    if [[ -z "$HS_PORT" ]]; then
-        echo ""
-        read -rp " Local service port to proxy (e.g. 8080, 80, 443): " HS_PORT <&$STDIN_FD
-        [[ -n "$HS_PORT" ]] || die "Service port required."
-    fi
-    [[ "$HS_PORT" =~ ^[0-9]+$ ]] || die "Port must be a number."
-
-    HS_DIR="${HS_DIR:-$DATA_DIR/hs_keys}"
-
-    echo ""
-    echo " ----------------------------------------"
-    echo "  Role:     hidden service"
-    echo "  Proxying: localhost:$HS_PORT"
-    echo "  Keys:     $HS_DIR"
-    echo " ----------------------------------------"
+    [[ -n "$ADVERTISE" ]] || die "Public IP required."
 fi
 
+if [[ -z "$CONTACT_INFO" ]]; then
+    echo ""
+    read -rp " Contact info (email/URL, optional, press Enter to skip): " CONTACT_INFO <&$STDIN_FD
+fi
+
+# Ask about enclave if not specified
+if [[ -z "$ENCLAVE" ]]; then
+    echo ""
+    read -rp " Use an enclave file? (path, or Enter for default network): " ENCLAVE <&$STDIN_FD
+fi
+
+echo ""
+echo " ----------------------------------------"
+echo "  Role:      $ROLE"
+echo "  Nickname:  $NICKNAME"
+echo "  Address:   $ADVERTISE:$OR_PORT"
+[[ -n "$TRANSPORT" ]]    && echo "  Transport: $TRANSPORT"
+[[ -n "$ENCLAVE" ]]      && echo "  Enclave:   $ENCLAVE"
+[[ -n "$CONTACT_INFO" ]] && echo "  Contact:   $CONTACT_INFO"
+echo " ----------------------------------------"
 echo ""
 read -rp " Look good? [Y/n]: " confirm <&$STDIN_FD
 [[ "${confirm:-y}" =~ ^[Yy]|^$ ]] || { echo " Aborted."; exit 0; }
@@ -182,7 +190,6 @@ else
     die "Unsupported OS. Install manually: gcc make libsodium-dev zlib1g-dev pkg-config git"
 fi
 
-# Check libsodium >= 1.0.18
 if pkg-config --exists libsodium 2>/dev/null; then
     SODIUM_VER=$(pkg-config --modversion libsodium)
     if [[ "$(printf '%s\n' "1.0.18" "$SODIUM_VER" | sort -V | head -1)" != "1.0.18" ]]; then
@@ -231,7 +238,6 @@ echo "  installed /usr/local/bin/moor"
 
 echo "[4/5] Configuring..."
 
-# Create system user
 if ! id "$MOOR_USER" &>/dev/null; then
     useradd -r -m -d /home/$MOOR_USER -s /usr/sbin/nologin "$MOOR_USER"
 fi
@@ -239,40 +245,31 @@ fi
 mkdir -p "$DATA_DIR" "$CONF_DIR"
 chown "$MOOR_USER:$MOOR_USER" "$DATA_DIR"
 
-if [[ $IS_HS -eq 1 ]]; then
-    # ---- hidden service config ----
-    mkdir -p "$HS_DIR"
-    chown "$MOOR_USER:$MOOR_USER" "$HS_DIR"
-    chmod 700 "$HS_DIR"
+# Build config
+ROLE_LINE=""
+BRIDGE_LINES=""
+ENCLAVE_LINE=""
+case "$ROLE" in
+    relay)  ;;
+    middle) ROLE_LINE="MiddleOnly 1" ;;
+    exit)   ROLE_LINE="Exit 1" ;;
+    guard)  ROLE_LINE="Guard 1" ;;
+    bridge)
+        BRIDGE_LINES="# Bridge configuration
+IsBridge 1
+BridgeTransport ${TRANSPORT:-shitstorm}"
+        ;;
+esac
 
-    cat > "$CONF_DIR/moor.conf" << EOF
-# MOOR Hidden Service Configuration
-# Generated $(date -u +%Y-%m-%d) by setup.sh
-# Edit and restart: sudo systemctl restart moor
+if [[ -n "$ENCLAVE" && -f "$ENCLAVE" ]]; then
+    cp "$ENCLAVE" "$CONF_DIR/network.enclave"
+    chown "$MOOR_USER:$MOOR_USER" "$CONF_DIR/network.enclave"
+    ENCLAVE_LINE="Enclave $CONF_DIR/network.enclave"
+fi
 
-Mode hs
-HiddenServiceDir $HS_DIR
-HiddenServicePort $HS_PORT
-Verbose 1
-
-# Directory authorities (default MOOR network)
-DAAddress 107.174.70.38
-DAPort 9030
-EOF
-else
-    # ---- relay config ----
-    ROLE_LINE=""
-    case "$ROLE" in
-        relay)  ;; # no extra flag, DA decides
-        middle) ROLE_LINE="MiddleOnly 1" ;;
-        exit)   ROLE_LINE="Exit 1" ;;
-        guard)  ROLE_LINE="Guard 1" ;;
-    esac
-
-    cat > "$CONF_DIR/moor.conf" << EOF
-# MOOR Relay Configuration
-# Generated $(date -u +%Y-%m-%d) by setup.sh
-# Edit and restart: sudo systemctl restart moor
+cat > "$CONF_DIR/moor.conf" << EOF
+# MOOR Node Configuration
+# Generated $(date -u +%Y-%m-%d) by setup.sh v0.8.1
 
 Mode relay
 ORPort $OR_PORT
@@ -281,12 +278,10 @@ AdvertiseAddress $ADVERTISE
 Nickname $NICKNAME
 DataDirectory $DATA_DIR
 ${ROLE_LINE}
+${BRIDGE_LINES}
+${ENCLAVE_LINE}
 Verbose 1
-$(if [[ -n "${CONTACT_INFO:-}" ]]; then echo "ContactInfo $CONTACT_INFO"; fi)
-
-# Directory authorities (default MOOR network)
-DAAddress 107.174.70.38
-DAPort 9030
+$(if [[ -n "$CONTACT_INFO" ]]; then echo "ContactInfo $CONTACT_INFO"; fi)
 
 # Bandwidth (auto-detected, uncomment to override)
 #BandwidthRate 10000000
@@ -296,9 +291,10 @@ ExitPolicy reject *:25
 ExitPolicy reject *:135-139
 ExitPolicy reject *:445
 ExitPolicy reject *:6881-6999
-#ExitPolicy accept *:*
 EOF
-fi
+
+# Clean up empty lines from unset variables
+sed -i '/^$/d' "$CONF_DIR/moor.conf"
 
 echo "  wrote $CONF_DIR/moor.conf"
 
@@ -306,15 +302,9 @@ echo "  wrote $CONF_DIR/moor.conf"
 
 echo "[5/5] Starting..."
 
-if [[ $IS_HS -eq 1 ]]; then
-    SVC_DESC="MOOR Hidden Service (port $HS_PORT)"
-else
-    SVC_DESC="MOOR Relay ($NICKNAME)"
-fi
-
 cat > /etc/systemd/system/moor.service << EOF
 [Unit]
-Description=$SVC_DESC
+Description=MOOR Node ($NICKNAME)
 After=network-online.target
 Wants=network-online.target
 
@@ -325,6 +315,7 @@ ExecStart=/usr/local/bin/moor --config $CONF_DIR/moor.conf
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
+LimitCORE=infinity
 
 [Install]
 WantedBy=multi-user.target
@@ -339,33 +330,22 @@ sleep 3
 if systemctl is-active --quiet moor; then
     echo ""
     echo " ========================================"
-    if [[ $IS_HS -eq 1 ]]; then
-        # Wait a moment for keys to generate
-        sleep 5
-        MOOR_ADDR=""
-        if [[ -f "$HS_DIR/hostname" ]]; then
-            MOOR_ADDR=$(cat "$HS_DIR/hostname")
-        fi
-        echo "  MOOR hidden service is live!"
-        echo " ========================================"
+    echo "  MOOR node is live!"
+    echo " ========================================"
+    echo ""
+    echo "  $NICKNAME ($ROLE) @ $ADVERTISE:$OR_PORT"
+    if [[ "$ROLE" == "bridge" ]]; then
         echo ""
-        if [[ -n "$MOOR_ADDR" ]]; then
-        echo "  Address:  $MOOR_ADDR"
-        else
-        echo "  Address:  (generating... check $HS_DIR/hostname)"
-        fi
-        echo "  Proxying: localhost:$HS_PORT"
-        echo "  Keys:     $HS_DIR"
-        echo ""
-        echo "  PQ hybrid e2e: X25519 + Kyber768 (automatic)"
-        echo ""
-    else
-        echo "  MOOR relay is live!"
-        echo " ========================================"
-        echo ""
-        echo "  $NICKNAME ($ROLE) @ $ADVERTISE:$OR_PORT"
-        echo ""
+        echo "  Bridge transport: $TRANSPORT"
+        echo "  Bridge line will appear in: journalctl -u moor | grep 'bridge line'"
+        echo "  Give the bridge line to users who need censorship circumvention."
     fi
+    if [[ -n "$ENCLAVE_LINE" ]]; then
+        echo "  Network: custom enclave ($CONF_DIR/network.enclave)"
+    else
+        echo "  Network: default MOOR network"
+    fi
+    echo ""
     echo "  Config:   sudo nano $CONF_DIR/moor.conf"
     echo "  Logs:     journalctl -u moor -f"
     echo "  Restart:  sudo systemctl restart moor"
@@ -373,7 +353,7 @@ if systemctl is-active --quiet moor; then
     echo ""
 else
     echo ""
-    echo " Service failed to start. Check:"
+    echo " Node failed to start. Check:"
     echo "   journalctl -u moor --no-pager -n 30"
     exit 1
 fi
