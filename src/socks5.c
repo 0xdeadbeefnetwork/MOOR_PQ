@@ -695,8 +695,10 @@ static circuit_cache_entry_t *get_circuit_for_domain(const char *domain,
          * would hit the dead entry and fail immediately. */
         LOG_DEBUG("evicting dead cache entry for %s", domain);
         if (e->circuit) {
-            moor_socks5_invalidate_circuit(e->circuit);
-            moor_circuit_free(e->circuit);
+            if (!MOOR_CIRCUIT_IS_MARKED(e->circuit))
+                moor_circuit_mark_for_close(e->circuit,
+                                            DESTROY_REASON_FINISHED);
+            e->circuit = NULL;
         }
         g_circuit_cache[i] = g_circuit_cache[--g_circuit_cache_count];
         i--; /* re-check swapped entry */
@@ -817,24 +819,25 @@ static int process_circuit_cell(moor_connection_t *conn, moor_cell_t *cell) {
                     c->stream_id = 0;
                 }
             }
-            /* Remove cache entry (swap with last).
-             * Do NOT let moor_circuit_destroy close the connection --
-             * we're inside circuit_read_cb processing cells on it.
-             * Decrement refcount manually, free circuit without sending
-             * DESTROY back (we received DESTROY, don't echo it). */
+            /* Remove cache entry and mark circuit for deferred close.
+             * We MUST NOT call moor_circuit_free() here — it triggers
+             * moor_socks5_invalidate_circuit() which does swap-with-last
+             * compaction on g_circuit_cache, the same corruption that
+             * caused the SIGABRT double-free in the conn-loss handler.
+             * Deferred close via mark_for_close is safe: cleanup and
+             * DESTROY cells happen in close_all_marked() at end of
+             * event loop (we already received DESTROY so won't echo). */
             e->circuit = NULL;
             e->conn = NULL;
+            if (e->conflux) {
+                moor_conflux_free(e->conflux);
+                e->conflux = NULL;
+            }
             g_circuit_cache[ci] = g_circuit_cache[--g_circuit_cache_count];
 
-            moor_connection_t *dconn = dead->conn;
-            moor_circuit_free(dead); /* decrements refcount, zeroes slot */
-
-            if (dconn && dconn->circuit_refcount <= 0) {
-                /* Last circuit on this connection -- close it */
-                moor_event_remove(dconn->fd);
-                moor_connection_close(dconn);
-                return 1; /* connection freed, caller must stop */
-            }
+            if (!MOOR_CIRCUIT_IS_MARKED(dead))
+                moor_circuit_mark_for_close(dead,
+                                            DESTROY_REASON_FINISHED);
             break;
         }
 
@@ -1184,29 +1187,35 @@ static void circuit_read_cb(int fd, int events, void *arg) {
     if (ret < 0) {
         LOG_ERROR("guard connection lost (fd=%d)", conn->fd);
 
-        /* Connection is dead -- clean up all circuits and SOCKS5 clients
-         * using it.  Do NOT call moor_socks5_invalidate_circuit here —
-         * it does swap-with-last compaction on g_circuit_cache which
-         * corrupts our iteration.  Clean up inline instead. */
+        /* Connection is dead -- mark all circuits on it for deferred close.
+         * We MUST NOT call moor_circuit_free() here because it triggers
+         * moor_socks5_invalidate_circuit() which does swap-with-last
+         * compaction on g_circuit_cache, corrupting our iteration and
+         * causing double-free (the SIGABRT crash).  mark_for_close is
+         * safe: it just sets a flag and adds to the pending list.
+         * close_all_marked() handles cleanup at end of event loop. */
         for (int i = g_circuit_cache_count - 1; i >= 0; i--) {
             circuit_cache_entry_t *e = &g_circuit_cache[i];
             int affected = 0;
 
             if (e->conn == conn) {
-                if (e->circuit) {
-                    moor_circuit_free(e->circuit);
-                    e->circuit = NULL;
+                if (e->circuit && !MOOR_CIRCUIT_IS_MARKED(e->circuit)) {
+                    moor_circuit_mark_for_close(e->circuit,
+                                                DESTROY_REASON_CONNECTFAILED);
                 }
+                e->circuit = NULL;
                 e->conn = NULL;
                 affected = 1;
             }
 
             for (int j = 0; j < e->num_extra; j++) {
                 if (e->extra_conns[j] == conn) {
-                    if (e->extra_circuits[j]) {
-                        moor_circuit_free(e->extra_circuits[j]);
-                        e->extra_circuits[j] = NULL;
+                    if (e->extra_circuits[j] &&
+                        !MOOR_CIRCUIT_IS_MARKED(e->extra_circuits[j])) {
+                        moor_circuit_mark_for_close(e->extra_circuits[j],
+                                                    DESTROY_REASON_CONNECTFAILED);
                     }
+                    e->extra_circuits[j] = NULL;
                     e->extra_conns[j] = NULL;
                     affected = 1;
                 }
@@ -1243,10 +1252,12 @@ static void circuit_read_cb(int fd, int events, void *arg) {
         /* Also clean HS pending entries using this connection */
         for (int i = 0; i < MAX_HS_PENDING; i++) {
             if (g_hs_pending[i].active && g_hs_pending[i].rp_conn == conn) {
-                if (g_hs_pending[i].rp_circ) {
-                    moor_circuit_free(g_hs_pending[i].rp_circ);
-                    g_hs_pending[i].rp_circ = NULL;
+                if (g_hs_pending[i].rp_circ &&
+                    !MOOR_CIRCUIT_IS_MARKED(g_hs_pending[i].rp_circ)) {
+                    moor_circuit_mark_for_close(g_hs_pending[i].rp_circ,
+                                                DESTROY_REASON_CONNECTFAILED);
                 }
+                g_hs_pending[i].rp_circ = NULL;
                 g_hs_pending[i].rp_conn = NULL;
                 g_hs_pending[i].active = 0;
             }

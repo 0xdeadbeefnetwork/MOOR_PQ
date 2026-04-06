@@ -569,6 +569,10 @@ int moor_hs_establish_intro(moor_hs_config_t *config,
             moor_connection_send_cell(circ->conn, &cell) != 0) {
             LOG_WARN("HS: failed to send ESTABLISH_INTRO");
             moor_circuit_free(circ);
+            if (conn->fd >= 0)
+                moor_connection_close(conn);
+            else
+                moor_connection_free(conn);
             continue;
         }
 

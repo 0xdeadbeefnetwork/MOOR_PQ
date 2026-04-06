@@ -1506,7 +1506,7 @@ static void async_connect_write_cb(int fd, int events, void *arg) {
             close(fd);
             conn->fd = -1;
             conn->state = CONN_STATE_NONE;
-            if (conn->hs_state->on_complete)
+            if (conn->hs_state && conn->hs_state->on_complete)
                 conn->hs_state->on_complete(conn, -1, conn->hs_state->on_complete_arg);
         } else {
             conn->state = CONN_STATE_OPEN;
@@ -1523,7 +1523,7 @@ static void async_connect_write_cb(int fd, int events, void *arg) {
             setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE,
                        (const char *)&keepalive, sizeof(keepalive));
 
-            if (conn->hs_state->on_complete)
+            if (conn->hs_state && conn->hs_state->on_complete)
                 conn->hs_state->on_complete(conn, 0, conn->hs_state->on_complete_arg);
         }
 

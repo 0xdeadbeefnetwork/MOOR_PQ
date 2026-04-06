@@ -1710,6 +1710,7 @@ typedef struct {
 #define MAX_HS_RP_CTXS 64
 static hs_rp_ctx_t g_hs_rp_ctxs[MAX_HS_RP_CTXS];
 static int g_num_hs_rp_ctxs = 0;
+static void hs_rp_read_cb(int fd, int events, void *arg);
 
 /* Map local target FDs back to HS RP circuit+stream for data return */
 typedef struct {
@@ -1757,13 +1758,23 @@ void moor_hs_event_invalidate_circuit(moor_circuit_t *circ) {
         }
     }
 
-    /* g_hs_rp_ctxs: NULL circuit, remove event if conn present */
+    /* g_hs_rp_ctxs: remove event and reclaim slot so the array
+     * doesn't fill with dead entries that block new registrations. */
     for (int i = 0; i < g_num_hs_rp_ctxs; i++) {
         if (g_hs_rp_ctxs[i].circ == circ) {
             if (g_hs_rp_ctxs[i].conn && g_hs_rp_ctxs[i].conn->fd >= 0)
                 moor_event_remove(g_hs_rp_ctxs[i].conn->fd);
-            g_hs_rp_ctxs[i].circ = NULL;
-            g_hs_rp_ctxs[i].conn = NULL;
+            if (i < g_num_hs_rp_ctxs - 1) {
+                g_hs_rp_ctxs[i] = g_hs_rp_ctxs[g_num_hs_rp_ctxs - 1];
+                /* Re-register moved entry so event arg tracks new slot */
+                if (g_hs_rp_ctxs[i].conn &&
+                    g_hs_rp_ctxs[i].conn->fd >= 0)
+                    moor_event_add(g_hs_rp_ctxs[i].conn->fd,
+                                   MOOR_EVENT_READ, hs_rp_read_cb,
+                                   &g_hs_rp_ctxs[i]);
+            }
+            g_num_hs_rp_ctxs--;
+            i--; /* re-check swapped entry */
         }
     }
 }
@@ -2100,11 +2111,17 @@ static void hs_rp_read_cb(int fd, int events, void *arg) {
                 }
             }
         }
-        /* Close the dead fd and free pool entries */
-        int dead_fd = ctx->conn->fd;
-        moor_connection_free(ctx->conn);  /* returns pool entry (sets fd=-1) */
-        if (dead_fd >= 0) close(dead_fd);
-        moor_circuit_free(ctx->circ);     /* returns pool entry */
+        /* Defer circuit close to end of event loop — inline
+         * moor_circuit_free() during a callback triggers
+         * moor_socks5_invalidate_circuit() compaction which can
+         * corrupt caches and cause double-free (same class of bug
+         * as the socks5.c CELL_DESTROY crash). */
+        if (!MOOR_CIRCUIT_IS_MARKED(ctx->circ))
+            moor_circuit_mark_for_close(ctx->circ,
+                                        DESTROY_REASON_CONNECTFAILED);
+        /* Connection close is safe (pool-based, not heap) */
+        moor_event_remove(ctx->conn->fd);
+        moor_connection_close(ctx->conn);
         /* Clear the config slot so it can be reused */
         for (int i = 0; i < 8; i++) {
             if (ctx->config->rp_circuits[i] == ctx->circ) {
