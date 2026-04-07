@@ -246,10 +246,10 @@ echo -e "${YELLOW}[5/5] Summary${NC}"
     echo " TOTAL: ${TOTAL}"
     echo ""
     if [[ $TOTAL -eq 0 ]]; then
-        echo "STATUS: ✅ CLEAN"
+        echo "STATUS: [:)] CLEAN"
         touch "$AUDIT_DIR/CLEAN"
     else
-        echo "STATUS: ❌ ${TOTAL} findings need review"
+        echo "STATUS: [!] ${TOTAL} findings need review"
         rm -f "$AUDIT_DIR/CLEAN"
     fi
 } > "$AUDIT_DIR/summary.txt"
