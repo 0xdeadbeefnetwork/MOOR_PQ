@@ -32,6 +32,7 @@ typedef struct {
     int      paused;        /* 1 if reads paused due to cwnd exhaustion */
     uint8_t  sendbuf[4096]; /* unsent data from partial circuit send */
     size_t   sendbuf_len;   /* bytes remaining in sendbuf */
+    int      sendbuf_needs_encrypt; /* 1 = plaintext needing e2e encrypt on retry */
     uint64_t begin_sent_at; /* timestamp when RELAY_BEGIN was sent (for stream timeout) */
 } moor_socks5_client_t;
 

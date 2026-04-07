@@ -51,6 +51,8 @@ typedef struct {
     const moor_consensus_t *cached_consensus;
     /* Descriptor revision counter (persisted) */
     uint64_t desc_revision;
+    /* Skip DHT publish (set after event loop starts to avoid blocking) */
+    int      skip_dht_publish;
     /* PQ hybrid e2e: Kyber768 keypair for post-handshake KEM */
     uint8_t  kem_pk[1184];          /* MOOR_KEM_PK_LEN */
     uint8_t  kem_sk[2400];          /* MOOR_KEM_SK_LEN */

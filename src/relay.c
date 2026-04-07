@@ -1285,6 +1285,15 @@ int moor_relay_init(const moor_relay_config_t *config) {
     moor_kist_init();
     moor_dns_cache_init(&g_dns_cache);
     moor_dht_store_init(&g_dht_store);
+    /* Load persisted DHT store so descriptors survive relay restarts */
+    {
+        extern moor_config_t g_config;
+        char dht_path[512];
+        snprintf(dht_path, sizeof(dht_path), "%s/dht_store.dat",
+                 g_config.data_dir[0] ? g_config.data_dir : "/var/lib/moor");
+        if (moor_dht_store_load(&g_dht_store, dht_path) == 0)
+            LOG_INFO("DHT: restored %u descriptors from disk", g_dht_store.num_entries);
+    }
     g_exit_fd_count = 0;
     LOG_INFO("relay initialized (OR port %u)", config->or_port);
     return 0;
@@ -2353,6 +2362,17 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                 return 0;
             }
             case RELAY_INTRODUCE1: {
+                /* INTRODUCE1 payload:
+                 *   blinded_pk(32) + pow_flag(1) + [nonce(8) if PoW] + sealed_box
+                 * The blinded_pk lets us route to the correct ESTABLISH_INTRO circuit. */
+                if (relay.data_length < 33) {
+                    LOG_WARN("INTRODUCE1: payload too short (%u)", relay.data_length);
+                    return -1;
+                }
+                const uint8_t *intro1_blinded_pk = relay.data;
+                const uint8_t *intro1_body = relay.data + 32;
+                uint16_t intro1_body_len = relay.data_length - 32;
+
                 /* Rate limit INTRODUCE1 per peer */
                 struct sockaddr_storage isa;
                 socklen_t islen = sizeof(isa);
@@ -2371,23 +2391,30 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                         return -1;
                     }
                 }
-                /* H2: PoW verification -- reject empty payloads when PoW required */
-                if (circ->intro_pow_difficulty > 0) {
-                    if (relay.data_length < 9) {
-                        LOG_WARN("INTRODUCE1: PoW required but payload too short (%u bytes)",
-                                 relay.data_length);
+                /* Find the matching ESTABLISH_INTRO circuit by blinded_pk */
+                moor_circuit_t *intro_circ =
+                    moor_circuit_find_by_intro_pk(circ, intro1_blinded_pk);
+                if (!intro_circ) {
+                    LOG_WARN("INTRODUCE1: no ESTABLISH_INTRO circuit for pk=%02x%02x...",
+                             intro1_blinded_pk[0], intro1_blinded_pk[1]);
+                    return -1;
+                }
+                /* H2: PoW verification -- use matched circuit's pow params */
+                if (intro_circ->intro_pow_difficulty > 0) {
+                    if (intro1_body_len < 9) {
+                        LOG_WARN("INTRODUCE1: PoW required but body too short (%u bytes)",
+                                 intro1_body_len);
                         return -1;
                     }
-                    uint8_t pow_flag = relay.data[0];
-                    if (pow_flag == 0x01 && relay.data_length >= 9) {
-                        /* Extract nonce from big-endian */
+                    uint8_t pow_flag = intro1_body[0];
+                    if (pow_flag == 0x01 && intro1_body_len >= 9) {
                         uint64_t pow_nonce = 0;
                         for (int b = 0; b < 8; b++)
-                            pow_nonce = (pow_nonce << 8) | relay.data[1 + b];
-                        if (moor_pow_verify_hs(circ->intro_pow_seed,
-                                                circ->intro_service_pk,
+                            pow_nonce = (pow_nonce << 8) | intro1_body[1 + b];
+                        if (moor_pow_verify_hs(intro_circ->intro_pow_seed,
+                                                intro_circ->intro_service_pk,
                                                 pow_nonce,
-                                                circ->intro_pow_difficulty,
+                                                intro_circ->intro_pow_difficulty,
                                                 0) != 0) {
                             LOG_WARN("INTRODUCE1: PoW verification failed");
                             return -1;
@@ -2398,34 +2425,24 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                         return -1;
                     }
                 }
-                /* Forward INTRODUCE1 as INTRODUCE2 to the HS via ESTABLISH_INTRO circuit.
-                 * Find the circuit with matching intro_service_pk and forward. */
+                /* Strip blinded_pk + PoW prefix to get the sealed box for INTRODUCE2 */
                 {
-                    moor_circuit_t *intro_circ = moor_circuit_find_by_intro_pk(circ);
-                    if (!intro_circ) {
-                        LOG_WARN("INTRODUCE1: no ESTABLISH_INTRO circuit found");
-                        return -1;
-                    }
-                    /* Strip PoW prefix to get just the sealed box.
-                     * INTRODUCE1 payload: pow_flag(1) [+ nonce(8) if PoW] + sealed_box */
-                    if (relay.data_length < 1) {
-                        LOG_WARN("INTRODUCE1: empty payload");
+                    if (intro1_body_len < 1) {
+                        LOG_WARN("INTRODUCE1: empty body after blinded_pk");
                         return -1;
                     }
                     const uint8_t *sealed;
                     uint16_t sealed_len;
-                    if (relay.data[0] == 0x01 && relay.data_length > 9) {
-                        sealed = relay.data + 9;
-                        sealed_len = relay.data_length - 9;
-                    } else if (relay.data[0] != 0x01 && relay.data_length > 1) {
-                        sealed = relay.data + 1;
-                        sealed_len = relay.data_length - 1;
+                    if (intro1_body[0] == 0x01 && intro1_body_len > 9) {
+                        sealed = intro1_body + 9;
+                        sealed_len = intro1_body_len - 9;
+                    } else if (intro1_body[0] != 0x01 && intro1_body_len > 1) {
+                        sealed = intro1_body + 1;
+                        sealed_len = intro1_body_len - 1;
                     } else {
-                        LOG_WARN("INTRODUCE1: payload too short for sealed box");
+                        LOG_WARN("INTRODUCE1: body too short for sealed box");
                         return -1;
                     }
-                    /* Build INTRODUCE2 and send backward through intro circuit
-                     * (fix #175: null check prev_conn) */
                     if (!intro_circ->prev_conn ||
                         intro_circ->prev_conn->state != CONN_STATE_OPEN) {
                         LOG_WARN("INTRODUCE1: intro circuit prev_conn gone");
@@ -2440,7 +2457,8 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                     moor_circuit_relay_encrypt(intro_circ, &intro2);
                     if (moor_connection_send_cell(intro_circ->prev_conn, &intro2) != 0)
                         LOG_DEBUG("send_cell failed (line %d)", __LINE__);
-                    LOG_INFO("INTRODUCE1: forwarded as INTRODUCE2 to HS");
+                    LOG_INFO("INTRODUCE1: forwarded as INTRODUCE2 to HS (pk=%02x%02x...)",
+                             intro1_blinded_pk[0], intro1_blinded_pk[1]);
                 }
                 return 0;
             }
@@ -2892,7 +2910,18 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                         return -1;
                     }
                 }
-                return moor_dht_handle_store(circ, relay.data, relay.data_length);
+                {
+                    int ret = moor_dht_handle_store(circ, relay.data, relay.data_length);
+                    if (ret == 0) {
+                        /* Persist to disk so descriptors survive relay restarts */
+                        extern moor_config_t g_config;
+                        char dht_path[512];
+                        snprintf(dht_path, sizeof(dht_path), "%s/dht_store.dat",
+                                 g_config.data_dir[0] ? g_config.data_dir : "/var/lib/moor");
+                        moor_dht_store_save(&g_dht_store, dht_path);
+                    }
+                    return ret;
+                }
             }
             case RELAY_DHT_FETCH:
                 return moor_dht_handle_fetch(circ, relay.data, relay.data_length);

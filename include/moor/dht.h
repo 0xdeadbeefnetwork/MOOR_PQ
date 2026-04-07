@@ -92,6 +92,10 @@ const moor_dht_entry_t *moor_dht_store_get(const moor_dht_store_t *store,
 /* Expire old entries (older than MOOR_DHT_EPOCH_TTL). */
 void moor_dht_store_expire(moor_dht_store_t *store);
 
+/* Persist DHT store to disk so descriptors survive relay restarts. */
+int moor_dht_store_save(const moor_dht_store_t *store, const char *path);
+int moor_dht_store_load(moor_dht_store_t *store, const char *path);
+
 /* --- Relay command handlers --- */
 
 /* Handle RELAY_DHT_STORE: verify responsibility, store, send ack */

@@ -1844,10 +1844,15 @@ static void hs_target_read_cb(int fd, int events, void *arg) {
     uint8_t e2e_enc_buf[MOOR_RELAY_DATA];
     if (map->circ->e2e_active) {
         size_t enc_len;
+        LOG_DEBUG("HS e2e encrypt: stream=%u len=%zd nonce=%llu",
+                  map->stream_id, n,
+                  (unsigned long long)map->circ->e2e_send_nonce);
         if (moor_crypto_aead_encrypt(e2e_enc_buf, &enc_len, buf, (size_t)n,
                                       NULL, 0, map->circ->e2e_send_key,
                                       map->circ->e2e_send_nonce++) != 0) {
-            LOG_ERROR("e2e encrypt failed");
+            LOG_ERROR("HS e2e encrypt FAILED: stream=%u nonce=%llu",
+                      map->stream_id,
+                      (unsigned long long)(map->circ->e2e_send_nonce - 1));
             return;
         }
         send_data = e2e_enc_buf;
@@ -1893,12 +1898,19 @@ static void hs_rp_read_cb(int fd, int events, void *arg) {
     int count = 0;
     while (count < 64 && (ret = moor_connection_recv_cell(ctx->conn, &cell)) == 1) {
         count++;
+        LOG_DEBUG("HS RP recv: cell cmd=%u circ_id=%u", cell.command, cell.circuit_id);
         /* Handle DESTROY cell -- RP circuit torn down by peer */
         if (cell.command == CELL_DESTROY) {
             LOG_INFO("HS: received DESTROY on RP circuit (circ_id=%u)",
                      cell.circuit_id);
             ret = -1;
             break;
+        }
+        /* Skip non-relay cells — same nonce desync bug as intro circuits */
+        if (cell.command == CELL_PADDING) continue;
+        if (cell.command != CELL_RELAY) {
+            LOG_DEBUG("HS RP: skipping non-relay cell cmd=%u", cell.command);
+            continue;
         }
 
         moor_circuit_t *circ = moor_circuit_find(cell.circuit_id, ctx->conn);
@@ -1908,11 +1920,18 @@ static void hs_rp_read_cb(int fd, int events, void *arg) {
             continue;
         }
 
-        moor_circuit_decrypt_backward(circ, &cell);
+        if (moor_circuit_decrypt_backward(circ, &cell) != 0) {
+            LOG_WARN("HS RP: backward decrypt failed on circuit %u",
+                     circ->circuit_id);
+            continue;
+        }
 
         moor_relay_payload_t relay;
         moor_relay_unpack(&relay, cell.payload);
 
+        LOG_DEBUG("HS RP relay: cmd=%u stream=%u recognized=%u dlen=%u",
+                  relay.relay_command, relay.stream_id,
+                  relay.recognized, relay.data_length);
         if (relay.recognized != 0) continue;
 
         switch (relay.relay_command) {
@@ -1992,11 +2011,18 @@ static void hs_rp_read_cb(int fd, int events, void *arg) {
             if (circ->e2e_active && relay.data_length > 16) {
                 uint8_t dec_buf[MOOR_RELAY_DATA];
                 size_t dec_len;
+                LOG_DEBUG("HS e2e decrypt: stream=%u dlen=%u nonce=%llu",
+                          relay.stream_id, relay.data_length,
+                          (unsigned long long)circ->e2e_recv_nonce);
                 if (moor_crypto_aead_decrypt(dec_buf, &dec_len,
                                               relay.data, relay.data_length,
                                               NULL, 0, circ->e2e_recv_key,
                                               circ->e2e_recv_nonce++) != 0) {
-                    LOG_ERROR("e2e decrypt failed");
+                    LOG_ERROR("HS e2e decrypt FAILED: stream=%u dlen=%u nonce=%llu "
+                              "send_nonce=%llu",
+                              relay.stream_id, relay.data_length,
+                              (unsigned long long)(circ->e2e_recv_nonce - 1),
+                              (unsigned long long)circ->e2e_send_nonce);
                     break;
                 }
                 memcpy(relay.data, dec_buf, dec_len);
@@ -2012,8 +2038,18 @@ static void hs_rp_read_cb(int fd, int events, void *arg) {
                 }
             }
             if (map && map->fd >= 0) {
-                send(map->fd, (const char *)relay.data,
+                ssize_t sent = send(map->fd, (const char *)relay.data,
                      relay.data_length, MSG_NOSIGNAL);
+                LOG_DEBUG("HS: forwarded %zd/%u bytes to local service fd=%d stream=%u "
+                          "(first bytes: %02x %02x %02x %02x)",
+                          sent, relay.data_length, map->fd, relay.stream_id,
+                          relay.data_length > 0 ? relay.data[0] : 0,
+                          relay.data_length > 1 ? relay.data[1] : 0,
+                          relay.data_length > 2 ? relay.data[2] : 0,
+                          relay.data_length > 3 ? relay.data[3] : 0);
+            } else {
+                LOG_WARN("HS: RELAY_DATA but no target fd for stream %u (map=%p count=%d)",
+                         relay.stream_id, (void*)map, g_hs_target_fd_count);
             }
             break;
         }
@@ -2209,12 +2245,42 @@ static void hs_intro_read_cb(int fd, int events, void *arg) {
     int count = 0;
     while (count < 64 && (ret = moor_connection_recv_cell(ctx->conn, &cell)) == 1) {
         count++;
+
+        /* Skip non-relay cells — decrypting CELL_PADDING or CELL_DESTROY
+         * as relay onion layers increments backward nonces without updating
+         * the digest, permanently desyncing the circuit's crypto state.
+         * Every subsequent real cell then fails to decrypt. */
+        if (cell.command == CELL_PADDING) continue;
+        if (cell.command == CELL_DESTROY) {
+            LOG_WARN("HS: DESTROY on intro circuit (circ_id=%u)", cell.circuit_id);
+            /* Find and kill the matching intro circuit */
+            for (int j = 0; j < ctx->config->num_intro_circuits; j++) {
+                if (ctx->config->intro_circuits[j] &&
+                    ctx->config->intro_circuits[j]->circuit_id == cell.circuit_id) {
+                    moor_circuit_free(ctx->config->intro_circuits[j]);
+                    ctx->config->intro_circuits[j] = NULL;
+                    ctx->config->intro_established_at[j] = 0;
+                    ctx->config->intros_need_reestablish = 1;
+                    break;
+                }
+            }
+            continue;
+        }
+        if (cell.command != CELL_RELAY) {
+            LOG_DEBUG("HS intro: skipping non-relay cell cmd=%u", cell.command);
+            continue;
+        }
+
         /* Find the circuit for this cell */
         moor_circuit_t *circ = moor_circuit_find(cell.circuit_id, ctx->conn);
         if (!circ) continue;
 
         /* Decrypt all onion layers (we are the circuit origin) */
-        moor_circuit_decrypt_backward(circ, &cell);
+        if (moor_circuit_decrypt_backward(circ, &cell) != 0) {
+            LOG_WARN("HS: backward decrypt failed on intro circuit %u",
+                     circ->circuit_id);
+            continue;
+        }
 
         /* Parse relay payload */
         moor_relay_payload_t relay;
@@ -2231,7 +2297,11 @@ static void hs_intro_read_cb(int fd, int events, void *arg) {
     if (ret < 0) {
         if (!ctx->conn) return;
         moor_event_remove(ctx->conn->fd);
-        LOG_WARN("HS: intro circuit connection lost");
+        LOG_WARN("HS: intro circuit connection lost (fd=%d state=%d recv_nonce=%llu "
+                 "recv_len=%zu errno=%d)",
+                 ctx->conn->fd, ctx->conn->state,
+                 (unsigned long long)ctx->conn->recv_nonce,
+                 ctx->conn->recv_len, errno);
         /* Clean up circuit and connection, mark slot for re-establishment */
         int dead_fd = ctx->conn->fd;
         for (int j = 0; j < ctx->config->num_intro_circuits; j++) {
@@ -2300,6 +2370,29 @@ static void hs_blinded_key_rotation_cb(void *arg) {
     }
 }
 
+/* Send PADDING cells on intro circuit connections to keep NAT mappings alive.
+ * Without this, the Pi's NAT router drops the TCP mapping after ~4 minutes
+ * and intro circuits silently die. TCP keepalive doesn't help because many
+ * NAT routers ignore keepalive-only ACKs. */
+static void hs_intro_padding_cb(void *arg) {
+    (void)arg;
+    int hs_count = g_config.num_hidden_services;
+    if (hs_count == 0) hs_count = 1;
+    for (int h = 0; h < hs_count; h++) {
+        for (int i = 0; i < g_hs_configs[h].num_intro_circuits; i++) {
+            moor_circuit_t *circ = g_hs_configs[h].intro_circuits[i];
+            if (!circ || !circ->conn || circ->conn->state != CONN_STATE_OPEN)
+                continue;
+            moor_cell_t pad;
+            memset(&pad, 0, sizeof(pad));
+            pad.circuit_id = circ->circuit_id;
+            pad.command = CELL_PADDING;
+            if (moor_circuit_encrypt_forward(circ, &pad) == 0)
+                moor_connection_send_cell(circ->conn, &pad);
+        }
+    }
+}
+
 static void hs_intro_rotation_cb(void *arg) {
     (void)arg;
     if (!g_hs_consensus) return;
@@ -2313,10 +2406,17 @@ static void hs_intro_rotation_cb(void *arg) {
             g_hs_configs[h].intros_need_reestablish = 0;
             LOG_INFO("HS %d: deferred intro re-establishment triggered", h);
             moor_hs_establish_intro(&g_hs_configs[h], g_hs_consensus);
+            moor_hs_publish_descriptor(&g_hs_configs[h]);
+            /* Fall through to register new intro circuits with event loop */
         }
         if (moor_hs_check_intro_rotation(&g_hs_configs[h], g_hs_consensus) > 0) {
             LOG_INFO("HS %d: intro points rotated, re-registering", h);
-            /* Re-register new intro circuits with event loop */
+        }
+        /* Always scan for unregistered intro circuits — both the deferred
+         * re-establishment path and the rotation path create new circuits
+         * that need event registration.  Without this, rebuilt intro
+         * circuits never receive INTRODUCE2 and the HS is unreachable. */
+        {
             for (int i = 0; i < g_hs_configs[h].num_intro_circuits; i++) {
                 moor_circuit_t *circ = g_hs_configs[h].intro_circuits[i];
                 if (circ && circ->conn && circ->conn->fd >= 0) {
@@ -2471,11 +2571,20 @@ static int run_hs(void) {
         printf("Hidden service %d address: %s\n", h, hs_config.moor_address);
     }
 
+    /* After init (which does DHT publish synchronously before the event
+     * loop starts), set skip_dht_publish so periodic republish only does
+     * the fast DA publish.  DHT publish builds synchronous circuits to
+     * 6 relays, blocking the event loop for 20-30s and killing all intro
+     * and RP circuits via connection timeout. */
+    for (int h = 0; h < hs_count; h++)
+        g_hs_configs[h].skip_dht_publish = 1;
+
     /* R10-CC3: Register periodic timers for HS maintenance */
     moor_event_add_timer(10 * 60 * 1000, hs_consensus_refresh_cb, NULL);
     moor_event_add_timer(5 * 60 * 1000, hs_blinded_key_rotation_cb, NULL);
     moor_event_add_timer(30 * 1000, hs_intro_rotation_cb, NULL);
-    moor_event_add_timer(30 * 60 * 1000, hs_desc_republish_cb, NULL);
+    moor_event_add_timer(45 * 1000, hs_intro_padding_cb, NULL);
+    moor_event_add_timer(5 * 60 * 1000, hs_desc_republish_cb, NULL);
 
 #ifndef _WIN32
     if (maybe_drop_privileges() != 0) return -1;

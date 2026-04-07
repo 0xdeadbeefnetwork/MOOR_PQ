@@ -251,6 +251,104 @@ void moor_dht_store_expire(moor_dht_store_t *store) {
 }
 
 /* ================================================================
+ * DHT store persistence
+ * ================================================================ */
+
+int moor_dht_store_save(const moor_dht_store_t *store, const char *path) {
+    if (!store || !path) return -1;
+
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return -1;
+
+    /* Header: magic(4) + version(1) + num_entries(4) */
+    const uint8_t magic[4] = { 'M', 'D', 'H', 'T' };
+    const uint8_t version = 1;
+    uint32_t n = store->num_entries;
+
+    if (fwrite(magic, 4, 1, f) != 1 ||
+        fwrite(&version, 1, 1, f) != 1 ||
+        fwrite(&n, 4, 1, f) != 1) {
+        fclose(f); remove(tmp);
+        return -1;
+    }
+
+    for (uint32_t i = 0; i < n; i++) {
+        const moor_dht_entry_t *e = &store->entries[i];
+        if (fwrite(e->address_hash, 32, 1, f) != 1 ||
+            fwrite(&e->data_len, 2, 1, f) != 1 ||
+            fwrite(e->data, e->data_len, 1, f) != 1 ||
+            fwrite(&e->stored_at, 8, 1, f) != 1 ||
+            fwrite(&e->epoch, 8, 1, f) != 1) {
+            fclose(f); remove(tmp);
+            return -1;
+        }
+    }
+
+    fclose(f);
+    rename(tmp, path);
+    LOG_DEBUG("DHT: saved %u entries to %s", n, path);
+    return 0;
+}
+
+int moor_dht_store_load(moor_dht_store_t *store, const char *path) {
+    if (!store || !path) return -1;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+
+    uint8_t magic[4], version;
+    uint32_t n;
+    if (fread(magic, 4, 1, f) != 1 || fread(&version, 1, 1, f) != 1 ||
+        fread(&n, 4, 1, f) != 1) {
+        fclose(f); return -1;
+    }
+    if (magic[0] != 'M' || magic[1] != 'D' || magic[2] != 'H' ||
+        magic[3] != 'T' || version != 1 || n > MOOR_DHT_MAX_STORED) {
+        fclose(f); return -1;
+    }
+
+    uint64_t now = (uint64_t)time(NULL);
+    uint32_t loaded = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint8_t addr[32];
+        uint16_t dlen;
+        uint64_t stored_at, epoch;
+
+        if (fread(addr, 32, 1, f) != 1 || fread(&dlen, 2, 1, f) != 1 ||
+            dlen > MOOR_DHT_MAX_DESC_DATA) {
+            break;
+        }
+        uint8_t data[MOOR_DHT_MAX_DESC_DATA];
+        if (fread(data, dlen, 1, f) != 1 ||
+            fread(&stored_at, 8, 1, f) != 1 ||
+            fread(&epoch, 8, 1, f) != 1) {
+            break;
+        }
+
+        /* Skip expired entries */
+        if (now - stored_at > MOOR_DHT_EPOCH_TTL)
+            continue;
+
+        moor_dht_entry_t *e = &store->entries[loaded];
+        memcpy(e->address_hash, addr, 32);
+        memcpy(e->data, data, dlen);
+        e->data_len = dlen;
+        e->received_bytes = dlen;
+        e->stored_at = stored_at;
+        e->epoch = epoch;
+        loaded++;
+    }
+    store->num_entries = loaded;
+
+    fclose(f);
+    LOG_INFO("DHT: loaded %u entries from %s", loaded, path);
+    return 0;
+}
+
+/* ================================================================
  * Relay command handlers
  * ================================================================ */
 

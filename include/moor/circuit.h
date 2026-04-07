@@ -387,8 +387,11 @@ void moor_circuit_unregister(moor_circuit_t *circ);
 moor_circuit_t *moor_circuit_find(uint32_t circuit_id,
                                   const moor_connection_t *conn);
 
-/* Find a circuit with ESTABLISH_INTRO (intro_service_pk set), excluding one */
-moor_circuit_t *moor_circuit_find_by_intro_pk(const moor_circuit_t *exclude);
+/* Find the ESTABLISH_INTRO circuit matching the given blinded_pk.
+ * If blinded_pk is NULL, falls back to finding any circuit with
+ * intro_service_pk set (legacy compat).  Excludes the given circuit. */
+moor_circuit_t *moor_circuit_find_by_intro_pk(const moor_circuit_t *exclude,
+                                               const uint8_t *blinded_pk);
 
 /* Build a 3-hop circuit through the network.
  * Selects guard, middle, exit from consensus.

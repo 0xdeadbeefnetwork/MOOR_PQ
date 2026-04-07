@@ -372,6 +372,7 @@ int moor_hs_build_circuit(moor_circuit_t *circ,
                                     our_pk, our_sk, NULL, NULL) != 0)
             return -1;
     }
+    guard_conn->circuit_refcount++;
 
     memcpy(circ->hops[0].node_id, guard->identity_pk, 32);
     if (moor_circuit_create(circ, guard->identity_pk, guard->onion_pk) != 0)
@@ -472,6 +473,7 @@ static int moor_hs_build_circuit_to_rp(moor_circuit_t *circ,
                                     our_pk, our_sk, NULL, NULL) != 0)
             return -1;
     }
+    guard_conn->circuit_refcount++;
 
     memcpy(circ->hops[0].node_id, guard->identity_pk, 32);
     if (moor_circuit_create(circ, guard->identity_pk, guard->onion_pk) != 0)
@@ -510,17 +512,36 @@ static int moor_hs_build_circuit_to_rp(moor_circuit_t *circ,
 int moor_hs_establish_intro(moor_hs_config_t *config,
                             const moor_consensus_t *consensus) {
     /* Build circuits to introduction points and establish them.
-     * Tor-aligned: configurable 3-10 intro points (default 3). */
-    int num_intros = config->num_intro_circuits; /* preserve existing live intros */
+     * Tor-aligned: configurable 3-10 intro points (default 3).
+     *
+     * Backfill: iterate ALL slots 0..desired-1 and rebuild any NULL
+     * entries.  Previous code only appended past num_intro_circuits,
+     * so dead slots at lower indices were never re-established and
+     * the HS became permanently unreachable once all slots died. */
     int desired = config->desired_intro_points > 0 ?
                   config->desired_intro_points : MOOR_DEFAULT_INTRO_POINTS;
     if (desired > MOOR_MAX_INTRO_POINTS) desired = MOOR_MAX_INTRO_POINTS;
 
-    for (int i = num_intros; i < desired && i < (int)consensus->num_relays; i++) {
-        /* Select a relay as intro point */
-        const moor_node_descriptor_t *intro_relay =
-            moor_node_select_relay(consensus, NODE_FLAG_RUNNING, NULL, 0);
-        if (!intro_relay) break;
+    /* Cap desired by available relays — can't have more intro points
+     * than relays. Without this, unfillable slots are permanently NULL
+     * and the rotation timer keeps re-triggering re-establishment. */
+    int max_intros = (int)consensus->num_relays;
+    if (desired > max_intros) desired = max_intros;
+
+    /* Set num_intro_circuits to desired so rotation checks all slots */
+    if (config->num_intro_circuits < desired)
+        config->num_intro_circuits = desired;
+    /* Shrink if desired decreased (e.g., relays left the network) */
+    if (config->num_intro_circuits > desired)
+        config->num_intro_circuits = desired;
+
+    int established = 0;
+    for (int i = 0; i < desired; i++) {
+        /* Skip slots that already have a live circuit */
+        if (config->intro_circuits[i]) {
+            established++;
+            continue;
+        }
 
         /* Build a circuit to the intro point (retry up to 5 times) */
         moor_circuit_t *circ = NULL;
@@ -576,16 +597,16 @@ int moor_hs_establish_intro(moor_hs_config_t *config,
             continue;
         }
 
-        config->intro_circuits[num_intros] = circ;
-        config->intro_established_at[num_intros] = (uint64_t)time(NULL);
-        num_intros++;
+        config->intro_circuits[i] = circ;
+        config->intro_established_at[i] = (uint64_t)time(NULL);
+        config->intro_count[i] = 0;
+        established++;
 
-        LOG_INFO("HS: established intro point %d at relay", i);
+        LOG_INFO("HS: established intro point at slot %d", i);
     }
 
-    config->num_intro_circuits = num_intros;
-    LOG_INFO("HS: %d introduction points established", num_intros);
-    return (num_intros > 0) ? 0 : -1;
+    LOG_INFO("HS: %d introduction points established", established);
+    return (established > 0) ? 0 : -1;
 }
 
 int moor_hs_publish_descriptor(moor_hs_config_t *config) {
@@ -616,19 +637,24 @@ int moor_hs_publish_descriptor(moor_hs_config_t *config) {
     memcpy(desc.service_pk, config->identity_pk, 32);
     memcpy(desc.onion_pk, config->onion_pk, 32);
     memcpy(desc.blinded_pk, config->blinded_pk, 32);
-    desc.num_intro_points = config->num_intro_circuits;
-    /* Cap to 3 intro points per spec -- more would leak topology info
-     * and the descriptor format only supports 3 slots */
-    if (desc.num_intro_points > 3)
-        desc.num_intro_points = 3;
-
-    for (int i = 0; i < (int)desc.num_intro_points; i++) {
+    /* Collect only LIVE intro circuits into the descriptor.
+     * Previous code used num_intro_circuits (the desired count) which
+     * included dead/NULL slots, publishing zero node_ids that clients
+     * can't look up in their consensus — making the HS unreachable. */
+    desc.num_intro_points = 0;
+    for (int i = 0; i < config->num_intro_circuits && desc.num_intro_points < 3; i++) {
         moor_circuit_t *circ = config->intro_circuits[i];
-        if (circ && circ->num_hops > 0) {
+        if (circ && circ->num_hops > 0 &&
+            circ->conn && circ->conn->state == CONN_STATE_OPEN) {
             int last = circ->num_hops - 1;
-            memcpy(desc.intro_points[i].node_id,
+            int slot = desc.num_intro_points++;
+            memcpy(desc.intro_points[slot].node_id,
                    circ->hops[last].node_id, 32);
         }
+    }
+    if (desc.num_intro_points == 0) {
+        LOG_ERROR("HS: no live intro circuits — cannot publish descriptor");
+        return -1;
     }
 
     /* Populate PoW fields if enabled */
@@ -850,11 +876,12 @@ int moor_hs_publish_descriptor(moor_hs_config_t *config) {
     }
 
     /* Publish to DHT for decentralized storage.
-     * Dual time-period spread: publish to replicas for BOTH current and
-     * previous time periods (6 total replicas). This ensures clients can
-     * find the descriptor during time period transitions when hash ring
-     * positions shift. */
-    if (config->cached_consensus &&
+     * SKIP when called from the event loop (periodic republish / intro
+     * re-establishment) because the synchronous DHT circuit builds block
+     * the event loop for 20-30 seconds, killing intro and RP circuits.
+     * DHT publish only happens at init time (before event loop starts). */
+    if (!config->skip_dht_publish &&
+        config->cached_consensus &&
         config->cached_consensus->num_relays > 0) {
         uint64_t tp = current_time_period();
         const moor_consensus_t *cons = config->cached_consensus;
@@ -1410,7 +1437,12 @@ verify_descriptor:
     moor_connection_t *rp_conn = moor_connection_alloc();
     if (!rp_conn) { moor_circuit_free(rp_circ); return -1; }
 
-    if (moor_circuit_build(rp_circ, rp_conn, consensus, our_pk, our_sk, 0) != 0) {
+    /* skip_guard_reuse=1: HS RP circuit MUST use its own guard connection,
+     * not the shared channel used by clearnet circuits.  Without this,
+     * the synchronous HS connect blocks the event loop for ~8s while
+     * Firefox's concurrent clearnet traffic starves on the shared guard,
+     * the guard closes the stalled connection (EPIPE), and everything dies. */
+    if (moor_circuit_build(rp_circ, rp_conn, consensus, our_pk, our_sk, 1) != 0) {
         moor_circuit_free(rp_circ);
         /* Close (not just free) if connection was actually opened (#126) */
         if (rp_conn->fd >= 0)
@@ -1572,9 +1604,15 @@ verify_descriptor:
         return -1;
     }
 
-    /* Build INTRODUCE1 payload: [pow_flag(1)] [nonce(8) if pow] [sealed_box] */
-    uint8_t intro_payload[1 + 8 + 84 + MOOR_SEAL_OVERHEAD];
+    /* Build INTRODUCE1 payload:
+     *   blinded_pk(32) + pow_flag(1) + [nonce(8) if pow] + sealed_box
+     * The blinded_pk prefix lets the intro relay route the cell to the
+     * correct ESTABLISH_INTRO circuit when it serves multiple services. */
+    uint8_t intro_payload[32 + 1 + 8 + 84 + MOOR_SEAL_OVERHEAD];
     size_t intro_payload_len = 0;
+
+    memcpy(intro_payload, hs_desc.blinded_pk, 32);
+    intro_payload_len = 32;
 
     if (hs_desc.pow_difficulty > 0) {
         uint64_t pow_nonce;
@@ -1590,15 +1628,15 @@ verify_descriptor:
             return -1;
         }
         LOG_INFO("HS: PoW solved (difficulty %u)", hs_desc.pow_difficulty);
-        intro_payload[0] = 0x01; /* pow_flag = 1 */
+        intro_payload[32] = 0x01; /* pow_flag = 1 */
         for (int b = 7; b >= 0; b--)
-            intro_payload[1 + (7 - b)] = (uint8_t)(pow_nonce >> (b * 8));
-        memcpy(intro_payload + 9, intro_sealed, sizeof(intro_sealed));
-        intro_payload_len = 9 + sizeof(intro_sealed);
+            intro_payload[33 + (7 - b)] = (uint8_t)(pow_nonce >> (b * 8));
+        memcpy(intro_payload + 41, intro_sealed, sizeof(intro_sealed));
+        intro_payload_len = 41 + sizeof(intro_sealed);
     } else {
-        intro_payload[0] = 0x00; /* pow_flag = 0 */
-        memcpy(intro_payload + 1, intro_sealed, sizeof(intro_sealed));
-        intro_payload_len = 1 + sizeof(intro_sealed);
+        intro_payload[32] = 0x00; /* pow_flag = 0 */
+        memcpy(intro_payload + 33, intro_sealed, sizeof(intro_sealed));
+        intro_payload_len = 33 + sizeof(intro_sealed);
     }
 
     moor_cell_t intro_cell;
@@ -1768,9 +1806,13 @@ int moor_hs_check_intro_rotation(moor_hs_config_t *config,
             missing++;
     }
     if (rotated > 0 || missing > 0) {
-        LOG_INFO("HS: %d rotated, %d dead — re-establishing intro points",
+        LOG_INFO("HS: %d rotated, %d dead — flagging for deferred re-establishment",
                  rotated, missing);
-        moor_hs_establish_intro(config, consensus);
+        /* Don't call moor_hs_establish_intro inline — the synchronous
+         * circuit build reuses connection pool slots, corrupting live
+         * intro circuits' connections. Set the flag and let the deferred
+         * handler in hs_intro_rotation_cb rebuild them safely. */
+        config->intros_need_reestablish = 1;
     }
 
     return rotated;

@@ -1070,10 +1070,20 @@ int moor_connection_connect(moor_connection_t *conn,
     /* Clear handshake timeout -- must not persist on data-path sockets */
     moor_set_socket_timeout(fd, 0);
 
-    /* Enable TCP keepalive to survive NAT/firewall idle timeouts */
+    /* Aggressive TCP keepalive to survive NAT/firewall idle timeouts.
+     * Without short intervals, NAT routers drop the mapping after ~4 min
+     * and intro circuit connections silently die. */
     int keepalive = 1;
     setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE,
                (const char *)&keepalive, sizeof(keepalive));
+#ifdef TCP_KEEPIDLE
+    int keepidle = 60;   /* first probe after 60s idle */
+    int keepintvl = 20;  /* probe every 20s after that */
+    int keepcnt = 3;     /* 3 missed probes = dead */
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
+#endif
 
     LOG_DEBUG("connected to %s:%u", address, port);
     moor_bootstrap_report(BOOT_HANDSHAKE_DONE);
@@ -1595,7 +1605,8 @@ int moor_connection_reap_idle(int max_idle_sec) {
         moor_connection_t *c = &g_conn_pool[i];
         if (c->fd < 0 || c->state != CONN_STATE_OPEN) continue;
         if (c->last_activity == 0) continue; /* never stamped = just opened */
-        if ((int64_t)(now - c->last_activity) > max_idle_sec) {
+        if ((int64_t)(now - c->last_activity) > max_idle_sec &&
+            c->circuit_refcount <= 0) {
             LOG_DEBUG("reaper: closing idle connection fd=%d (idle %lus)",
                       c->fd, (unsigned long)(now - c->last_activity));
             conn_pool_unlock();

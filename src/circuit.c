@@ -680,7 +680,8 @@ moor_circuit_t *moor_circuit_find(uint32_t circuit_id,
     return NULL;
 }
 
-moor_circuit_t *moor_circuit_find_by_intro_pk(const moor_circuit_t *exclude) {
+moor_circuit_t *moor_circuit_find_by_intro_pk(const moor_circuit_t *exclude,
+                                               const uint8_t *blinded_pk) {
     circ_pool_lock();
     moor_circuit_t *found = NULL;
     for (int i = 0; i < g_circuits_count; i++) {
@@ -688,6 +689,12 @@ moor_circuit_t *moor_circuit_find_by_intro_pk(const moor_circuit_t *exclude) {
         if (c->circuit_id != 0 && c != exclude &&
             c->intro_service_pk[0] != 0 &&
             c->prev_conn && c->prev_conn->state == CONN_STATE_OPEN) {
+            /* Match by blinded_pk if provided (Tor-aligned routing).
+             * Without this, the first ESTABLISH_INTRO circuit is returned
+             * regardless of which service the INTRODUCE1 targets. */
+            if (blinded_pk &&
+                sodium_memcmp(c->intro_service_pk, blinded_pk, 32) != 0)
+                continue;
             found = c;
             break;
         }

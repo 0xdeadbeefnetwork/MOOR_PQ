@@ -161,6 +161,10 @@ int moor_da_store_hs(moor_da_config_t *config,
 const moor_hs_stored_entry_t *moor_da_lookup_hs(
     const moor_da_config_t *config, const uint8_t address_hash[32]);
 
+/* Persist/restore HS descriptors (encrypted blobs, DA can't decrypt) */
+void moor_da_save_hs(const moor_da_config_t *config);
+int  moor_da_load_hs(moor_da_config_t *config);
+
 /* Set trusted DA public keys for consensus signature verification.
  * Call once before fetching consensus. Keys come from config. */
 void moor_set_trusted_da_keys(const moor_da_entry_t *da_list, int num_das);

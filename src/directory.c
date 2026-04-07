@@ -399,6 +399,8 @@ int moor_da_init(moor_da_config_t *config) {
     moor_consensus_init(&config->consensus, 256);
     config->num_hs_entries = 0;
     pthread_mutex_init(&config->consensus_lock, NULL);
+    /* Restore HS descriptors from disk (encrypted blobs, DA can't read them) */
+    moor_da_load_hs(config);
     LOG_INFO("directory authority initialized");
     return 0;
 }
@@ -441,6 +443,56 @@ static int da_add_relay_unlocked(moor_da_config_t *config,
     if (da_is_private_address(desc->address)) {
         LOG_WARN("DA: rejecting descriptor with private address %s", desc->address);
         return -1;
+    }
+
+    /* Reject banned relays: check $data_dir/banned_relays file.
+     * Format: one entry per line — nickname or hex identity prefix.
+     * Example: "darkhorse" or "3672a0cf" */
+    {
+        extern moor_config_t g_config;
+        if (g_config.data_dir[0]) {
+            char ban_path[512];
+            snprintf(ban_path, sizeof(ban_path), "%s/banned_relays", g_config.data_dir);
+            FILE *bf = fopen(ban_path, "r");
+            if (bf) {
+                char line[128];
+                while (fgets(line, sizeof(line), bf)) {
+                    /* Strip newline */
+                    size_t ll = strlen(line);
+                    while (ll > 0 && (line[ll-1] == '\n' || line[ll-1] == '\r'))
+                        line[--ll] = '\0';
+                    if (ll == 0 || line[0] == '#') continue;
+
+                    /* Match by nickname (case-insensitive) */
+                    if (strcasecmp(line, desc->nickname) == 0) {
+                        LOG_WARN("DA: rejecting banned relay '%s' (%s:%u)",
+                                 desc->nickname, desc->address, desc->or_port);
+                        fclose(bf);
+                        return -1;
+                    }
+                    /* Match by IP address or address prefix */
+                    if (strncmp(line, desc->address, ll) == 0) {
+                        LOG_WARN("DA: rejecting banned relay at %s (%s)",
+                                 desc->address, desc->nickname);
+                        fclose(bf);
+                        return -1;
+                    }
+                    /* Match by hex identity prefix */
+                    if (ll >= 8) {
+                        char id_hex[65];
+                        for (int b = 0; b < 32; b++)
+                            sprintf(id_hex + b*2, "%02x", desc->identity_pk[b]);
+                        if (strncasecmp(line, id_hex, ll) == 0) {
+                            LOG_WARN("DA: rejecting banned relay '%s' (id match)",
+                                     desc->nickname);
+                            fclose(bf);
+                            return -1;
+                        }
+                    }
+                }
+                fclose(bf);
+            }
+        }
     }
 
     /* Check if we already have this relay (update if so) */
@@ -1141,6 +1193,67 @@ int moor_da_store_hs(moor_da_config_t *config,
     memcpy(config->hs_entries[idx].data, data, data_len);
     config->hs_entries[idx].data_len = data_len;
     LOG_INFO("DA: stored HS entry #%u", idx);
+
+    /* Persist to disk so HS descriptors survive DA restarts */
+    moor_da_save_hs(config);
+    return 0;
+}
+
+void moor_da_save_hs(const moor_da_config_t *config) {
+    (void)config;
+    extern moor_config_t g_config;
+    if (!g_config.data_dir[0]) return;
+    char path[512], tmp[520];
+    snprintf(path, sizeof(path), "%s/hs_store.dat", g_config.data_dir);
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return;
+    const uint8_t magic[4] = { 'M', 'H', 'S', 'D' };
+    const uint8_t ver = 1;
+    uint32_t n = config->num_hs_entries;
+    fwrite(magic, 4, 1, f);
+    fwrite(&ver, 1, 1, f);
+    fwrite(&n, 4, 1, f);
+    for (uint32_t i = 0; i < n; i++) {
+        fwrite(config->hs_entries[i].address_hash, 32, 1, f);
+        fwrite(&config->hs_entries[i].data_len, 4, 1, f);
+        fwrite(config->hs_entries[i].data, config->hs_entries[i].data_len, 1, f);
+    }
+    fclose(f);
+    rename(tmp, path);
+    LOG_DEBUG("DA: saved %u HS entries to disk", n);
+}
+
+int moor_da_load_hs(moor_da_config_t *config) {
+    extern moor_config_t g_config;
+    if (!g_config.data_dir[0]) return -1;
+    char path[512];
+    snprintf(path, sizeof(path), "%s/hs_store.dat", g_config.data_dir);
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    uint8_t magic[4], ver;
+    uint32_t n;
+    if (fread(magic, 4, 1, f) != 1 || fread(&ver, 1, 1, f) != 1 ||
+        fread(&n, 4, 1, f) != 1) { fclose(f); return -1; }
+    if (magic[0] != 'M' || magic[1] != 'H' || magic[2] != 'S' ||
+        magic[3] != 'D' || ver != 1 || n > 64) { fclose(f); return -1; }
+    uint32_t loaded = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint8_t addr[32]; uint32_t dlen;
+        if (fread(addr, 32, 1, f) != 1 || fread(&dlen, 4, 1, f) != 1 ||
+            dlen > 4096) break;
+        uint8_t data[4096];
+        if (fread(data, dlen, 1, f) != 1) break;
+        if (loaded < 64) {
+            memcpy(config->hs_entries[loaded].address_hash, addr, 32);
+            memcpy(config->hs_entries[loaded].data, data, dlen);
+            config->hs_entries[loaded].data_len = dlen;
+            loaded++;
+        }
+    }
+    config->num_hs_entries = loaded;
+    fclose(f);
+    LOG_INFO("DA: loaded %u HS entries from disk", loaded);
     return 0;
 }
 

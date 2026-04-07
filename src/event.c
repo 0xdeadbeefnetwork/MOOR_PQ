@@ -27,7 +27,7 @@ volatile sig_atomic_t g_shutdown_requested = 0;
 volatile sig_atomic_t g_sighup_requested = 0;
 
 #define MAX_EVENTS  MOOR_MAX_FDS
-#define MAX_TIMERS  32
+#define MAX_TIMERS  256
 
 static moor_event_entry_t g_entries[MAX_EVENTS];
 static moor_timer_t       g_timers[MAX_TIMERS];

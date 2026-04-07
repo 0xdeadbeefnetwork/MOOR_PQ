@@ -395,7 +395,10 @@ static void hs_pending_complete(hs_pending_connect_t *pending) {
         }
     }
 
-    LOG_INFO("HS: rendezvous complete");
+    LOG_INFO("HS: rendezvous complete (e2e=%d send_nonce=%llu recv_nonce=%llu)",
+             pending->rp_circ->e2e_active,
+             (unsigned long long)pending->rp_circ->e2e_send_nonce,
+             (unsigned long long)pending->rp_circ->e2e_recv_nonce);
     pending->active = 0;
 }
 
@@ -987,11 +990,18 @@ static int process_circuit_cell(moor_connection_t *conn, moor_cell_t *cell) {
             uint8_t dec_buf[MOOR_RELAY_DATA];
             size_t dec_len;
             uint64_t nonce = circ->e2e_recv_nonce;
+            LOG_DEBUG("e2e decrypt: stream=%u dlen=%u nonce=%llu",
+                      relay.stream_id, relay.data_length,
+                      (unsigned long long)nonce);
             if (moor_crypto_aead_decrypt(dec_buf, &dec_len,
                                           relay.data, relay.data_length,
                                           NULL, 0, circ->e2e_recv_key,
                                           nonce) != 0) {
-                LOG_ERROR("e2e decrypt failed");
+                LOG_ERROR("e2e decrypt FAILED: stream=%u dlen=%u nonce=%llu "
+                          "send_nonce=%llu",
+                          relay.stream_id, relay.data_length,
+                          (unsigned long long)nonce,
+                          (unsigned long long)circ->e2e_send_nonce);
                 break;
             }
             if (dec_len > MOOR_RELAY_DATA) {
@@ -1643,7 +1653,17 @@ int moor_socks5_handle_request(moor_socks5_client_t *client,
                 return 0;
             }
 
-            /* Start async HS connect: build circuits + send INTRODUCE1 */
+            /* Start HS connect: build circuits + send INTRODUCE1.
+             *
+             * This is synchronous and blocks the event loop for ~8s.
+             * To prevent Firefox's concurrent connections from starving
+             * (which kills the shared guard connection with EPIPE), we
+             * use skip_guard_reuse=1 so the RP circuit gets its OWN
+             * connection to the guard, independent of the channel used
+             * by clearnet circuits.  The event loop is still blocked
+             * during the HS connect, but the clearnet guard connection
+             * isn't multiplexed with the HS traffic, so Firefox's
+             * connections survive. */
             moor_circuit_t *rp_circ = NULL;
             uint8_t hs_kem_pk_tmp[1184];
             int hs_kem_avail = 0;
@@ -1845,26 +1865,63 @@ int moor_socks5_forward_to_circuit(moor_socks5_client_t *client,
     LOG_DEBUG("forwarding %zu bytes from SOCKS5 client to circuit (stream %u)",
               len, client->stream_id);
 
-    /* E2e encrypt for HS rendezvous circuits (#197) */
-    uint8_t e2e_enc_buf[MOOR_RELAY_DATA];
+    /* E2e encrypt for HS rendezvous circuits (#197).
+     * Must loop: a single recv from Firefox can be >482 bytes (the e2e
+     * plaintext max per cell).  Without the loop, bytes past 482 are
+     * silently dropped, truncating HTTP headers and causing nginx 400. */
+    if (client->circuit->e2e_active) {
+        size_t max_pt = MOOR_RELAY_DATA - 16;
+        size_t offset = 0;
+        while (offset < len) {
+            size_t chunk = len - offset;
+            if (chunk > max_pt) chunk = max_pt;
+            uint8_t e2e_enc_buf[MOOR_RELAY_DATA];
+            size_t enc_len;
+            uint64_t nonce = client->circuit->e2e_send_nonce;
+            LOG_DEBUG("e2e encrypt: stream=%u len=%zu nonce=%llu (offset=%zu/%zu)",
+                      client->stream_id, chunk, (unsigned long long)nonce,
+                      offset, len);
+            if (moor_crypto_aead_encrypt(e2e_enc_buf, &enc_len,
+                                          data + offset, chunk,
+                                          NULL, 0, client->circuit->e2e_send_key,
+                                          nonce) != 0) {
+                LOG_ERROR("e2e encrypt FAILED: stream=%u nonce=%llu",
+                          client->stream_id, (unsigned long long)nonce);
+                return -1;
+            }
+            client->circuit->e2e_send_nonce = nonce + 1;
+            int ret = moor_circuit_send_data(client->circuit,
+                                              client->stream_id,
+                                              e2e_enc_buf, enc_len);
+            if (ret < 0) {
+                /* cwnd exhausted — save PLAINTEXT remainder for retry.
+                 * Next call will re-encrypt from where we left off. */
+                size_t unsent = len - offset;
+                if (unsent <= sizeof(client->sendbuf)) {
+                    memcpy(client->sendbuf, data + offset, unsent);
+                    client->sendbuf_len = unsent;
+                    client->sendbuf_needs_encrypt = 1;
+                }
+                return -1;
+            }
+            if (ret > 0 && (size_t)ret < enc_len) {
+                /* Partial — save encrypted remainder */
+                size_t left = enc_len - (size_t)ret;
+                if (left <= sizeof(client->sendbuf)) {
+                    memcpy(client->sendbuf, e2e_enc_buf + ret, left);
+                    client->sendbuf_len = left;
+                    client->sendbuf_needs_encrypt = 0;
+                }
+                return -1;
+            }
+            offset += chunk;
+        }
+        return 0;
+    }
+
+    /* Non-e2e path (clearnet circuits) */
     const uint8_t *send_data = data;
     size_t send_len = len;
-    if (client->circuit->e2e_active) {
-        /* Clamp to max plaintext that fits in a cell with AEAD MAC.
-         * Caller (moor_circuit_send_data) already chunks at RELAY_DATA,
-         * but e2e MAC overhead means effective max is 16 bytes less. */
-        size_t max_pt = MOOR_RELAY_DATA - 16;
-        if (len > max_pt) len = max_pt;
-        size_t enc_len;
-        uint64_t nonce = client->circuit->e2e_send_nonce;
-        if (moor_crypto_aead_encrypt(e2e_enc_buf, &enc_len, data, len,
-                                      NULL, 0, client->circuit->e2e_send_key,
-                                      nonce) != 0)
-            return -1;
-        client->circuit->e2e_send_nonce = nonce + 1;
-        send_data = e2e_enc_buf;
-        send_len = enc_len;
-    }
 
     /* Route through conflux set if available */
     if (client->circuit->conflux) {
@@ -1879,17 +1936,13 @@ int moor_socks5_forward_to_circuit(moor_socks5_client_t *client,
                                       send_data, send_len);
     if (ret == 0) return 0; /* all sent */
     if (ret < 0) {
-        /* cwnd exhausted before any data sent -- save all data for retry.
-         * Use send_data/send_len (may be e2e-encrypted) since the retry path
-         * calls moor_circuit_send_data directly without re-encrypting. */
         if (send_len <= sizeof(client->sendbuf)) {
             memcpy(client->sendbuf, send_data, send_len);
             client->sendbuf_len = send_len;
         }
         return -1; /* caller will pause */
     }
-    /* Partial send: ret = bytes actually sent. Save only the unsent remainder.
-     * Offset into send_data (encrypted) buffer, not plaintext data. */
+    /* Partial send: ret = bytes actually sent. Save only the unsent remainder. */
     size_t unsent = send_len - (size_t)ret;
     if (unsent > 0 && unsent <= sizeof(client->sendbuf)) {
         memcpy(client->sendbuf, send_data + ret, unsent);
