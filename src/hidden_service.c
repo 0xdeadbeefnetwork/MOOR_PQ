@@ -1758,9 +1758,18 @@ int moor_hs_check_intro_rotation(moor_hs_config_t *config,
         }
     }
 
-    /* Re-establish any missing intro points */
-    if (rotated > 0) {
-        LOG_INFO("HS: rotated %d intro points, re-establishing", rotated);
+    /* Re-establish any missing intro points — covers both rotation
+     * (aged out / max count) AND dead circuits (connection lost).
+     * Without this, intro circuits that die from network issues are
+     * never re-established and the HS becomes permanently unreachable. */
+    int missing = 0;
+    for (int i = 0; i < config->num_intro_circuits; i++) {
+        if (!config->intro_circuits[i])
+            missing++;
+    }
+    if (rotated > 0 || missing > 0) {
+        LOG_INFO("HS: %d rotated, %d dead — re-establishing intro points",
+                 rotated, missing);
         moor_hs_establish_intro(config, consensus);
     }
 

@@ -29,6 +29,7 @@ typedef struct {
     /* Intro point circuits (Tor: 3-10, configurable) */
     moor_circuit_t *intro_circuits[MOOR_MAX_INTRO_POINTS];
     int      num_intro_circuits;
+    int      intros_need_reestablish; /* set when intros die, cleared after rebuild */
     int      desired_intro_points;  /* configurable, default MOOR_DEFAULT_INTRO_POINTS */
     /* Vanguards: restricted middle hops to prevent guard discovery */
     moor_vanguard_set_t vanguards;

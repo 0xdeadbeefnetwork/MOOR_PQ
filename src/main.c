@@ -57,6 +57,7 @@ static moor_da_entry_t g_da_list[9];
 static int g_num_das = 0;
 static char g_hs_dir[256] = "./hs_keys";
 static uint16_t g_hs_local_port = 8080;
+static moor_consensus_t *g_hs_consensus = NULL;
 static char g_advertise_addr[64] = "";
 static uint32_t g_relay_flags = NODE_FLAG_RUNNING | NODE_FLAG_STABLE;
 static volatile uint64_t g_bandwidth = 1000000; /* 1 MB/s default */
@@ -1811,8 +1812,15 @@ static void hs_target_read_cb(int fd, int events, void *arg) {
         return;
     }
 
+    /* Limit recv to max plaintext that fits in a cell after e2e AEAD
+     * encryption.  Without this, each cell silently truncates 16 bytes
+     * (the MAC overhead), losing 16 * num_cells bytes per response. */
+    size_t recv_max = MOOR_RELAY_DATA;
+    if (map->circ->e2e_active)
+        recv_max = MOOR_RELAY_DATA - 16; /* room for AEAD MAC */
+
     uint8_t buf[MOOR_RELAY_DATA];
-    ssize_t n = recv(fd, (char *)buf, sizeof(buf), 0);
+    ssize_t n = recv(fd, (char *)buf, recv_max, 0);
     if (n <= 0) {
         /* Local service closed or error -- send RELAY_END back */
         if (map->circ->conn && map->circ->conn->state == CONN_STATE_OPEN) {
@@ -1835,8 +1843,6 @@ static void hs_target_read_cb(int fd, int events, void *arg) {
     uint16_t send_len = (uint16_t)n;
     uint8_t e2e_enc_buf[MOOR_RELAY_DATA];
     if (map->circ->e2e_active) {
-        size_t max_pt = MOOR_RELAY_DATA - 16; /* room for AEAD MAC */
-        if ((size_t)n > max_pt) n = (ssize_t)max_pt;
         size_t enc_len;
         if (moor_crypto_aead_encrypt(e2e_enc_buf, &enc_len, buf, (size_t)n,
                                       NULL, 0, map->circ->e2e_send_key,
@@ -2240,10 +2246,18 @@ static void hs_intro_read_cb(int fd, int events, void *arg) {
         moor_connection_free(ctx->conn);
         if (dead_fd >= 0) close(dead_fd);
         ctx->conn = NULL;
+
+        /* Flag for deferred intro re-establishment.  We cannot rebuild
+         * intros inline here because the synchronous circuit build
+         * reuses connection pool slots, and other RP circuits still
+         * hold pointers to those slots — causing state corruption
+         * (conn->state goes from OPEN to HANDSHAKING under the RP
+         * circuit's feet).  The timer-based approach is safe. */
+        ctx->config->intros_need_reestablish = 1;
     }
 }
 
-static moor_consensus_t *g_hs_consensus = NULL; /* heap-allocated HS consensus */
+/* g_hs_consensus declared at top of file */
 
 /* R10-CC3: Periodic timer callbacks for HS mode */
 static void hs_consensus_refresh_cb(void *arg) {
@@ -2292,6 +2306,14 @@ static void hs_intro_rotation_cb(void *arg) {
     int hs_count = g_config.num_hidden_services;
     if (hs_count == 0) hs_count = 1;
     for (int h = 0; h < hs_count; h++) {
+        /* Check deferred re-establishment flag (set when intros die
+         * during hs_intro_read_cb — can't rebuild inline due to
+         * connection pool reuse corrupting live RP circuits). */
+        if (g_hs_configs[h].intros_need_reestablish) {
+            g_hs_configs[h].intros_need_reestablish = 0;
+            LOG_INFO("HS %d: deferred intro re-establishment triggered", h);
+            moor_hs_establish_intro(&g_hs_configs[h], g_hs_consensus);
+        }
         if (moor_hs_check_intro_rotation(&g_hs_configs[h], g_hs_consensus) > 0) {
             LOG_INFO("HS %d: intro points rotated, re-registering", h);
             /* Re-register new intro circuits with event loop */
@@ -2452,7 +2474,7 @@ static int run_hs(void) {
     /* R10-CC3: Register periodic timers for HS maintenance */
     moor_event_add_timer(10 * 60 * 1000, hs_consensus_refresh_cb, NULL);
     moor_event_add_timer(5 * 60 * 1000, hs_blinded_key_rotation_cb, NULL);
-    moor_event_add_timer(5 * 60 * 1000, hs_intro_rotation_cb, NULL);
+    moor_event_add_timer(30 * 1000, hs_intro_rotation_cb, NULL);
     moor_event_add_timer(30 * 60 * 1000, hs_desc_republish_cb, NULL);
 
 #ifndef _WIN32

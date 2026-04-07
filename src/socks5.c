@@ -1850,7 +1850,10 @@ int moor_socks5_forward_to_circuit(moor_socks5_client_t *client,
     const uint8_t *send_data = data;
     size_t send_len = len;
     if (client->circuit->e2e_active) {
-        size_t max_pt = MOOR_RELAY_DATA - 16; /* room for AEAD MAC */
+        /* Clamp to max plaintext that fits in a cell with AEAD MAC.
+         * Caller (moor_circuit_send_data) already chunks at RELAY_DATA,
+         * but e2e MAC overhead means effective max is 16 bytes less. */
+        size_t max_pt = MOOR_RELAY_DATA - 16;
         if (len > max_pt) len = max_pt;
         size_t enc_len;
         uint64_t nonce = client->circuit->e2e_send_nonce;
