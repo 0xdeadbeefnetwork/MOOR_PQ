@@ -360,9 +360,12 @@ int moor_dht_store_load(moor_dht_store_t *store, const char *path) {
  * (up to 462 bytes of data per cell) and also support the full 1024
  * via the offset mechanism.
  */
-/* Per-address store rate limit: max 1 store per address per 60 seconds */
+/* Per-address store rate limit.  10s cooldown between different circuits
+ * publishing the same descriptor.  Was 60s which blocked legitimate
+ * multi-replica HS descriptor publish (HS uses a fresh 1-hop circuit
+ * per replica, each with a different circuit_id). */
 #define DHT_STORE_RATE_SLOTS 256
-#define DHT_STORE_RATE_INTERVAL 60
+#define DHT_STORE_RATE_INTERVAL 10
 static struct {
     uint8_t  address_hash[32];
     uint64_t last_store;
