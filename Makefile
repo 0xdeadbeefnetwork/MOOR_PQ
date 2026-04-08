@@ -73,6 +73,7 @@ SOURCES = $(SRCDIR)/log.c \
           $(SRCDIR)/transport_mirage.c \
           $(SRCDIR)/transport_shitstorm.c \
           $(SRCDIR)/transport_speakeasy.c \
+          $(SRCDIR)/transport_nether.c \
           $(SRCDIR)/dht.c \
           $(SRCDIR)/sig.c \
           $(SRCDIR)/mix.c \

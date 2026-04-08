@@ -4,6 +4,7 @@
 #include "moor/mix.h"
 #include "moor/transport_shade.h"
 #include "moor/transport_mirage.h"
+#include "moor/transport_nether.h"
 #include <sodium.h>
 #include <string.h>
 #include <stdlib.h>
@@ -861,14 +862,54 @@ int moor_circuit_create(moor_circuit_t *circ,
     cke_derive(key_seed, expected_auth, dh1, dh2,
                relay_identity_pk, eph_pk, relay_eph_pk);
 
-    /* Verify auth tag -- proves relay knows its identity secret key */
+    /* Verify auth tag -- proves relay knows its identity secret key.
+     * Bridge clients may have the wrong onion_pk (identity-derived
+     * instead of the relay's actual rotatable onion key).  If the
+     * primary verification fails, retry with the relay's actual
+     * onion_pk from the consensus before giving up. */
     if (sodium_memcmp(recv_auth_tag, expected_auth, 32) != 0) {
-        LOG_ERROR("CKE: auth tag mismatch -- relay identity not proven");
-        moor_crypto_wipe(eph_sk, 32);
-        moor_crypto_wipe(dh1, 32);
-        moor_crypto_wipe(dh2, 32);
-        moor_crypto_wipe(key_seed, 32);
-        return -1;
+        /* Try all relay descriptors in the consensus for a matching
+         * onion_pk — the one we were given might be wrong. */
+        int found_alt = 0;
+        extern moor_consensus_t *moor_socks5_get_consensus(void);
+        moor_consensus_t *cons = moor_socks5_get_consensus();
+        if (cons && cons->relays) {
+            for (uint32_t ri = 0; ri < cons->num_relays; ri++) {
+                if (sodium_memcmp(cons->relays[ri].identity_pk,
+                                  relay_identity_pk, 32) != 0)
+                    continue;
+                if (sodium_is_zero(cons->relays[ri].onion_pk, 32))
+                    continue;
+                if (sodium_memcmp(cons->relays[ri].onion_pk,
+                                  relay_curve_pk, 32) == 0)
+                    continue; /* same key we already tried */
+                /* Try with consensus onion_pk */
+                uint8_t dh2_alt[32];
+                if (moor_crypto_dh(dh2_alt, eph_sk,
+                                   cons->relays[ri].onion_pk) == 0) {
+                    uint8_t ks_alt[32], ea_alt[32];
+                    cke_derive(ks_alt, ea_alt, dh1, dh2_alt,
+                               relay_identity_pk, eph_pk, relay_eph_pk);
+                    if (sodium_memcmp(recv_auth_tag, ea_alt, 32) == 0) {
+                        memcpy(key_seed, ks_alt, 32);
+                        found_alt = 1;
+                        LOG_INFO("CKE: bridge fallback — used consensus onion_pk");
+                    }
+                    moor_crypto_wipe(dh2_alt, 32);
+                    moor_crypto_wipe(ks_alt, 32);
+                    moor_crypto_wipe(ea_alt, 32);
+                }
+                break;
+            }
+        }
+        if (!found_alt) {
+            LOG_ERROR("CKE: auth tag mismatch -- relay identity not proven");
+            moor_crypto_wipe(eph_sk, 32);
+            moor_crypto_wipe(dh1, 32);
+            moor_crypto_wipe(dh2, 32);
+            moor_crypto_wipe(key_seed, 32);
+            return -1;
+        }
     }
 
     /* Derive circuit keys from key_seed */
@@ -2355,6 +2396,7 @@ int moor_circuit_build_bridge(moor_circuit_t *circ,
         moor_mirage_client_params_t      mirage;
         moor_shitstorm_client_params_t   shitstorm;
         moor_speakeasy_client_params_t   speakeasy;
+        moor_nether_client_params_t     nether;
     } tp_params;
     memset(&tp_params, 0, sizeof(tp_params));
     if (transport) {
@@ -2375,6 +2417,8 @@ int moor_circuit_build_bridge(moor_circuit_t *circ,
             memcpy(tp_params.shitstorm.identity_pk, bridge->identity_pk, 32);
         } else if (strcmp(transport->name, "speakeasy") == 0) {
             memcpy(tp_params.speakeasy.identity_pk, bridge->identity_pk, 32);
+        } else if (strcmp(transport->name, "nether") == 0) {
+            memcpy(tp_params.nether.bridge_identity_pk, bridge->identity_pk, 32);
         }
     }
 
@@ -2404,11 +2448,28 @@ int moor_circuit_build_bridge(moor_circuit_t *circ,
     }
     bridge_conn->circuit_refcount++;
 
-    /* CREATE with bridge — bridges don't have onion_pk in their entry,
-     * so derive Curve25519 from Ed25519 identity as fallback. */
+    /* CREATE with bridge — use actual onion_pk from consensus if available.
+     * Fall back to Ed25519→Curve25519 conversion for unlisted bridges. */
     uint8_t bridge_onion_pk[32];
-    if (moor_crypto_ed25519_to_curve25519_pk(bridge_onion_pk, bridge->identity_pk) != 0)
-        return -1;
+    const moor_node_descriptor_t *bridge_desc = NULL;
+    if (consensus) {
+        for (uint32_t i = 0; i < consensus->num_relays; i++) {
+            if (sodium_memcmp(consensus->relays[i].identity_pk,
+                              bridge->identity_pk, 32) == 0) {
+                bridge_desc = &consensus->relays[i];
+                break;
+            }
+        }
+    }
+    if (bridge_desc && !sodium_is_zero(bridge_desc->onion_pk, 32)) {
+        memcpy(bridge_onion_pk, bridge_desc->onion_pk, 32);
+    } else {
+        if (moor_crypto_ed25519_to_curve25519_pk(bridge_onion_pk,
+                                                  bridge->identity_pk) != 0)
+            return -1;
+        LOG_DEBUG("bridge CKE: using identity-derived onion_pk for unlisted bridge %02x%02x%02x%02x",
+                  bridge->identity_pk[0], bridge->identity_pk[1], bridge->identity_pk[2], bridge->identity_pk[3]);
+    }
     memcpy(circ->hops[0].node_id, bridge->identity_pk, 32);
     if (moor_circuit_create(circ, bridge->identity_pk, bridge_onion_pk) != 0) {
         bridge_conn->circuit_refcount--;

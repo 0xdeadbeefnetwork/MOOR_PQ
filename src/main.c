@@ -6,6 +6,7 @@
 #include "moor/transport.h"
 #include "moor/transport_shade.h"
 #include "moor/transport_mirage.h"
+#include "moor/transport_nether.h"
 #include "moor/sandbox.h"
 #include <sodium.h>
 #include <stdio.h>
@@ -538,9 +539,13 @@ static void relay_read_cb(int fd, int events, void *arg) {
     (void)fd;
     moor_connection_t *conn = (moor_connection_t *)arg;
     MOOR_ASSERT_MSG(conn != NULL, "relay_read_cb: NULL arg (fd=%d)", fd);
-    MOOR_ASSERT_MSG(conn->state == CONN_STATE_OPEN,
-        "relay_read_cb: conn=%p state=%d fd=%d (expected OPEN)",
-        (void*)conn, conn->state, conn->fd);
+    if (conn->state != CONN_STATE_OPEN) {
+        LOG_WARN("relay_read_cb: conn=%p state=%d fd=%d -- stale event, closing",
+                 (void*)conn, conn->state, conn->fd);
+        moor_event_remove(conn->fd);
+        moor_connection_close(conn);
+        return;
+    }
 
     /* Handle write-readiness: flush connection output queue */
     if (events & MOOR_EVENT_WRITE) {
@@ -580,6 +585,7 @@ static moor_shade_server_params_t g_shade_server_params;
 static moor_mirage_server_params_t g_mirage_server_params;
 static moor_shitstorm_server_params_t g_shitstorm_server_params;
 static moor_speakeasy_server_params_t g_speakeasy_server_params;
+static moor_nether_server_params_t g_nether_server_params;
 
 static void relay_accept_cb(int fd, int events, void *arg) {
     (void)events;
@@ -671,6 +677,8 @@ static void relay_accept_cb(int fd, int events, void *arg) {
             transport_params = &g_shitstorm_server_params;
         else if (strcmp(g_bridge_transport, "speakeasy") == 0)
             transport_params = &g_speakeasy_server_params;
+        else if (strcmp(g_bridge_transport, "nether") == 0)
+            transport_params = &g_nether_server_params;
     }
 
     LOG_DEBUG("relay_accept: starting handshake with %s (fd=%d)", peer_ip, client_fd);
@@ -3350,10 +3358,20 @@ int main(int argc, char **argv) {
     if (g_data_dir[0] && (g_mode == MOOR_MODE_RELAY || g_mode == MOOR_MODE_DA)) {
         if (moor_keys_load(g_data_dir, g_identity_pk, g_identity_sk,
                            g_onion_pk, g_onion_sk) == 0) {
+            /* Override onion key with identity-derived Curve25519 so
+             * bridge clients can compute the matching CKE DH key from
+             * just the Ed25519 identity_pk in the bridge line. */
+            moor_crypto_ed25519_to_curve25519_pk(g_onion_pk, g_identity_pk);
+            moor_crypto_ed25519_to_curve25519_sk(g_onion_sk, g_identity_sk);
             LOG_INFO("loaded persistent identity keys from %s", g_data_dir);
         } else {
             moor_crypto_sign_keygen(g_identity_pk, g_identity_sk);
-            moor_crypto_box_keygen(g_onion_pk, g_onion_sk);
+            /* Derive onion key from identity key so bridge clients
+             * (who only have the identity_pk) can compute the same
+             * Curve25519 key for CKE DH. A separate onion keypair
+             * would be unreachable by bridge clients. */
+            moor_crypto_ed25519_to_curve25519_pk(g_onion_pk, g_identity_pk);
+            moor_crypto_ed25519_to_curve25519_sk(g_onion_sk, g_identity_sk);
             if (moor_keys_save(g_data_dir, g_identity_pk, g_identity_sk,
                                g_onion_pk, g_onion_sk) == 0) {
                 LOG_INFO("generated and saved persistent keys to %s", g_data_dir);
@@ -3450,6 +3468,7 @@ int main(int argc, char **argv) {
     moor_transport_register(&moor_shade_transport);
     moor_transport_register(&moor_shitstorm_transport);
     moor_transport_register(&moor_speakeasy_transport);
+    moor_transport_register(&moor_nether_transport);
 
     /* PQ hybrid always enabled -- Kyber768 + Noise_IK mandatory */
 
@@ -3479,6 +3498,9 @@ int main(int argc, char **argv) {
     memset(&g_speakeasy_server_params, 0, sizeof(g_speakeasy_server_params));
     memcpy(g_speakeasy_server_params.identity_pk, g_identity_pk, 32);
     memcpy(g_speakeasy_server_params.identity_sk, g_identity_sk, 64);
+    memset(&g_nether_server_params, 0, sizeof(g_nether_server_params));
+    memcpy(g_nether_server_params.identity_pk, g_identity_pk, 32);
+    memcpy(g_nether_server_params.identity_sk, g_identity_sk, 64);
 
     /* Init subsystems */
     moor_event_init();

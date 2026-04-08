@@ -1229,27 +1229,40 @@ int moor_connection_send_cell(moor_connection_t *conn,
      * nonce breaks ChaCha20-Poly1305 authentication). */
     conn->send_nonce++;
 
-    size_t sent = 0;
-    while (sent < total) {
-        ssize_t n = conn_send(conn, wire + sent, total - sent);
-        if (n > 0) {
-            sent += (size_t)n;
-        } else if (n == 0 || (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))) {
-            /* Socket buffer full — queue remaining bytes */
-            if (moor_queue_push(&conn->outq, wire + sent, (uint16_t)(total - sent), cell->circuit_id) != 0) {
-                /* OOM or global pressure limit — framing irrecoverable */
-                LOG_ERROR("queue push failed (OOM? global=%d) -- "
-                          "killing fd=%d", moor_queue_global_count(), conn->fd);
+    /* Transport-wrapped connections (nether, scramble, etc.) handle their
+     * own framing — partial writes + queueing would double-wrap the data
+     * on flush.  For transports: all-or-nothing send, no queueing.
+     * For raw connections: queue on EAGAIN as before. */
+    if (conn->transport && conn->transport_state) {
+        ssize_t n = conn_send(conn, wire, total);
+        if (n < 0) {
+            LOG_WARN("send_cell failed: fd=%d errno=%d -- marking dead", conn->fd, errno);
+            moor_event_remove(conn->fd);
+            conn->state = CONN_STATE_NONE;
+            return -1;
+        }
+    } else {
+        size_t sent = 0;
+        while (sent < total) {
+            ssize_t n = conn_send(conn, wire + sent, total - sent);
+            if (n > 0) {
+                sent += (size_t)n;
+            } else if (n == 0 || (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))) {
+                /* Socket buffer full — queue remaining bytes */
+                if (moor_queue_push(&conn->outq, wire + sent, (uint16_t)(total - sent), cell->circuit_id) != 0) {
+                    LOG_ERROR("queue push failed (OOM? global=%d) -- "
+                              "killing fd=%d", moor_queue_global_count(), conn->fd);
+                    conn->state = CONN_STATE_NONE;
+                    return -1;
+                }
+                moor_event_modify(conn->fd, MOOR_EVENT_READ | MOOR_EVENT_WRITE);
+                sent = total;
+            } else {
+                LOG_WARN("send_cell failed: fd=%d errno=%d -- marking dead", conn->fd, errno);
+                moor_event_remove(conn->fd);
                 conn->state = CONN_STATE_NONE;
                 return -1;
             }
-            /* Tell event loop to notify us when writable */
-            moor_event_modify(conn->fd, MOOR_EVENT_READ | MOOR_EVENT_WRITE);
-            sent = total; /* consider it "sent" (queued) */
-        } else {
-            LOG_WARN("send_cell failed: fd=%d errno=%d -- marking dead", conn->fd, errno);
-            conn->state = CONN_STATE_NONE;
-            return -1;
         }
     }
 
