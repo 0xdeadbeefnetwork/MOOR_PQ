@@ -213,7 +213,7 @@ static void derive_keys(nether_state_t *st, const uint8_t shared[32],
 static const char *mc_status_json =
     "{\"version\":{\"name\":\"1.21.4\",\"protocol\":769},"
     "\"players\":{\"max\":20,\"online\":0},"
-    "\"description\":{\"text\":\"A Minecraft Server\"},"
+    "\"description\":{\"text\":\"MAX HEADROOM'S DIAMOND MINE\"},"
     "\"enforcesSecureChat\":false,"
     "\"previewsChat\":false}";
 
@@ -237,9 +237,16 @@ static int handle_status_ping(int fd) {
 
     /* Read Ping Request, echo as Ping Response */
     n = mc_recv_packet(fd, buf, sizeof(buf));
-    if (n == 9) { /* packet_id(1) + long(8) */
+    if (n >= 9) { /* packet_id(1) + long(8) */
         mc_send_packet(fd, buf, (size_t)n);
     }
+
+    /* Linger: ensure TCP sends the response before close.
+     * Without this, close() can RST the connection before
+     * the status/pong data is delivered. */
+    struct linger lg = { 1, 2 }; /* linger 2 seconds */
+    setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+
     return -1; /* close after ping — this wasn't a real client */
 }
 
