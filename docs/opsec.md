@@ -58,6 +58,6 @@ How to run MOOR without defeating the point of running MOOR.
 
 **Metadata is data.** Even if an adversary cannot read your traffic, they can see that you are using MOOR (unless you use pluggable transports). The fact that you use an anonymity network is itself information.
 
-**Pluggable transports hide that you're using MOOR.** Shade makes your traffic look like random noise. Mirage makes it look like TLS 1.3 to a normal website. Scramble randomizes the wire format. Use them in environments where MOOR traffic might be blocked or flagged.
+**Pluggable transports hide that you're using MOOR.** ShitStorm makes traffic look like Chrome. Nether makes it look like Minecraft. Mirage looks like TLS 1.3. Shade looks like random noise. Speakeasy looks like SSH. Scramble looks like HTTP. Use them in environments where MOOR traffic might be blocked or flagged.
 
 **Do not be the only user.** Anonymity requires a crowd. A network with one user provides no anonymity. The more people use MOOR, the stronger everyone's anonymity becomes.

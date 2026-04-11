@@ -29,6 +29,8 @@ MOOR is a single binary that runs as:
 
 ## Quick start
 
+**Dependencies:** build-essential, libsodium-dev, zlib1g-dev
+
 ```
 make
 ./moor                              # client: SOCKS5 on port 9050

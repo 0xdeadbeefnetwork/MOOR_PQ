@@ -3,12 +3,10 @@
 ## Quick start
 
 ```
-./configure
 make
 ```
 
-This produces the `./moor` binary. It dynamically links against libsodium and zlib
-(it is not a static binary).
+This produces the `./moor` binary. It dynamically links against libsodium and zlib.
 
 ## Dependencies
 
@@ -44,30 +42,6 @@ On Alpine:
 apk add build-base libsodium-dev zlib-dev pkgconfig
 ```
 
-## The configure script
-
-Running `./configure` is optional but recommended. It detects your compiler,
-finds libsodium and zlib via `pkg-config` (falling back to manual detection),
-and writes a `config.mk` file that the Makefile includes.
-
-If libsodium is installed somewhere non-standard (e.g. `/usr/local/lib`),
-configure automatically adds an `-rpath` so the binary can find it at runtime
-without needing `LD_LIBRARY_PATH`.
-
-Options:
-
-```
-./configure --prefix=/usr/local    # install prefix (default: /usr/local)
-            --bindir=/usr/local/bin # binary directory (default: PREFIX/bin)
-            --sysconfdir=/usr/local/etc  # config directory (default: PREFIX/etc)
-            CC=clang               # choose compiler
-            CFLAGS="-march=native" # extra compiler flags
-            LDFLAGS="-L/opt/lib"   # extra linker flags
-```
-
-If you skip `./configure`, the Makefile falls back to sensible defaults and
-calls `pkg-config` directly.
-
 ## Build targets
 
 | Command | What it does |
@@ -79,7 +53,7 @@ calls `pkg-config` directly.
 | `make install` | Install binary, manpage, and config directory to PREFIX |
 | `make uninstall` | Remove installed files |
 | `make clean` | Remove build artifacts |
-| `make distclean` | `clean` plus remove `config.mk` and sanitizer build dirs |
+| `make distclean` | `clean` plus remove sanitizer build dirs |
 
 `make install` puts the binary in `BINDIR` (default `/usr/local/bin`), the
 manpage in `PREFIX/share/man/man1`, and creates the config directory at
@@ -91,7 +65,7 @@ make install DESTDIR=/tmp/moor-pkg
 
 ## Makefile variables
 
-These can be passed on the command line or set via `./configure`:
+These can be passed on the command line:
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
@@ -183,7 +157,7 @@ requirements. The simplest fix is to build directly on the target machine:
 
 ```
 scp moor-src.tar.gz user@host:~/
-ssh user@host 'tar xzf moor-src.tar.gz && cd moor && ./configure && make'
+ssh user@host 'tar xzf moor-src.tar.gz && cd moor && make'
 ```
 
 If libsodium is installed but not in the default search path:

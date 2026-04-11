@@ -2,9 +2,9 @@
 
 ## Overview
 
-MOOR is a single C binary that operates in one of seven modes: **client**, **relay**, **directory authority (DA)**, **hidden service (HS)**, **OnionBalance (OB)**, **BridgeDB**, or **bridge authority**. All modes share the same crypto, cell, connection, and event loop infrastructure. The binary is portable across Linux (with epoll) and Windows (with select/WSAPoll).
+MOOR is a single C binary that operates in one of six modes: **client**, **relay**, **directory authority (DA)**, **hidden service (HS)**, **OnionBalance (OB)**, or **bridge authority**. All modes share the same crypto, cell, connection, and event loop infrastructure. The binary is portable across Linux (with epoll) and Windows (with select/WSAPoll).
 
-~44,000 lines of C across 62 source files and 45 headers.
+~50,000 lines of C across 64 source files and 47 headers.
 
 ## Source layout
 
@@ -47,7 +47,7 @@ src/
   config.c            Config file parser (Tor-compatible syntax: "Key Value"), exit policy
                       parser, external IP auto-detection (connected UDP getsockname trick)
   event.c             Event loop: epoll on Linux, select on Windows, with timer support
-  transport.c         Pluggable transport registry (max 4 transports)
+  transport.c         Pluggable transport registry (max 8 transports)
   transport_scramble.c Scramble: randomized obfuscation, DH + HMAC handshake, ChaCha20
                       framed transport with random padding, header encryption,
                       poll-based send/recv timeouts
@@ -97,6 +97,10 @@ src/
   channel.c           Channel abstraction: multiplexed circuit transport over a
                       connection, state machine, circuit slot management, mark-for-close
   transport_speakeasy.c Speakeasy: SSH protocol camouflage with real banner/KEX framing
+  transport_nether.c Nether: Minecraft 1.21.4 protocol camouflage with real handshake,
+                      login sequence, and Plugin Channel framing
+  sandbox.c          seccomp-bpf sandbox: syscall filtering, no_new_privs, rlimits
+  elligator2.c       Elligator2 point encoding for key obfuscation in transports
 
   kyber/              Vendored Kyber768 (ML-KEM-768) reference implementation
   dilithium/          Vendored Dilithium3 (ML-DSA-65) reference implementation
@@ -323,7 +327,7 @@ Total path length: 6 hops (3 client-side + 3 HS-side), with the rendezvous point
 | PQ signing | ML-DSA-65 (Dilithium3) | vendored dilithium/ |
 | Key exchange | X25519 (Curve25519 DH) | libsodium |
 | PQ KEM | Kyber768 (ML-KEM-768) | vendored kyber/ |
-| Link AEAD | ChaCha20-Poly1305 | libsodium |
+| Link AEAD | XChaCha20-Poly1305 | libsodium |
 | Circuit stream cipher | ChaCha20 | libsodium |
 | Hash | BLAKE2b-256 | libsodium |
 | KDF | HKDF (BLAKE2b-based) | libsodium |
@@ -369,7 +373,7 @@ Total path length: 6 hops (3 client-side + 3 HS-side), with the rendezvous point
 | Circuit SENDME window | 1000 cells | Tunable |
 | Stream SENDME window | 100 cells | Tunable |
 | Initial congestion window | 124 cells | CC |
-| Min congestion window | 31 cells | CC |
+| Min congestion window | 100 cells (= SENDME increment) | CC |
 | Max congestion window | 2000 cells | CC |
 | Max FDs (Linux/epoll) | 8192 | Internal |
 | Max FDs (other) | 1024 | Internal |
@@ -385,7 +389,7 @@ MOOR implements multiple layers of defense against traffic analysis:
 4. **Constant-rate padding** -- optional 50ms floor to mask burst patterns.
 5. **FRONT padding** -- Rayleigh-distributed front padding cells at circuit start.
 6. **Poisson mixing** -- optional relay-side exponential delay pool with cover cells.
-7. **Pluggable transports** -- ShitStorm (Chrome TLS 1.3), Scramble (random bytes), Shade (Elligator2), Mirage (TLS 1.3), Speakeasy (SSH) hide the fact that MOOR is being used at all.
+7. **Pluggable transports** -- ShitStorm (Chrome TLS 1.3), Nether (Minecraft 1.21.4), Mirage (TLS 1.3), Shade (Elligator2), Scramble (HTTP prefix), Speakeasy (SSH) hide the fact that MOOR is being used at all.
 
 ## Bridge support
 
