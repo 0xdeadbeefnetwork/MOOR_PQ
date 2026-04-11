@@ -8,7 +8,7 @@ MOOR is an onion router. Your traffic goes through three relays. Each relay peel
 
 Every key exchange uses hybrid post-quantum cryptography: X25519 + Kyber768. Traffic recorded today cannot be decrypted by a quantum computer tomorrow.
 
-~44,000 lines of C. Three dependencies (libsodium, zlib, pthreads). No OpenSSL.
+~50,000 lines of C. Three dependencies (libsodium, zlib, pthreads). No OpenSSL.
 
 ```
 You  --->  Guard  --->  Middle  --->  Exit  --->  Destination
@@ -20,46 +20,53 @@ You  --->  Guard  --->  Middle  --->  Exit  --->  Destination
                         data along.   on your behalf.
 ```
 
-## Pluggable transports
+## Quick start
 
-Five pluggable transports for censorship circumvention:
+```bash
+# Install
+sudo apt install build-essential libsodium-dev zlib1g-dev
+git clone https://github.com/0xdeadbeefnetwork/MOOR_PQ
+cd MOOR_PQ && make
 
-### ShitStorm (recommended)
+# Run as client (SOCKS5 proxy on :9050)
+./moor
 
-Makes MOOR traffic look like Chrome 146 doing TLS 1.3 to a CDN. A DPI box cannot block it without blocking Chrome.
-
-- Chrome 146 JA4 fingerprint — real ECH GREASE, 15 cipher suites, Fisher-Yates shuffled extensions
-- Elligator2 key material — x25519 key_share indistinguishable from random
-- Double AEAD — outer ChaCha20-Poly1305 (TLS records) + inner ChaCha20-Poly1305 (length obfuscation)
-- HTTP/2 framing — h2 connection preface + SETTINGS + DATA frames
-- Fake session resumption — PSK binder + NewSessionTicket messages
-- Dynamic SNI — GeoIP + CDN resolution, ISP PTR filtering, per-country intelligence
-- Key rotation — ratcheted every 65,536 records via BLAKE2b
-- Replay protection — BLAKE2b hash-based slot placement, 600s TTL, graceful eviction on saturation
-
-```
-./moor --UseBridges 1 --Bridge "shitstorm 1.2.3.4:9001 <fingerprint>"
+# Browse
+curl -x socks5h://127.0.0.1:9050 http://example.com
 ```
 
-### Scramble
+Or one-command relay setup:
 
-Entropy evasion. ASCII HTTP prefix followed by ChaCha20-encrypted payload. Defeats entropy-based filters like GFW's fully-encrypted-traffic detector.
+```bash
+curl -sL https://raw.githubusercontent.com/0xdeadbeefnetwork/MOOR_PQ/main/setup.sh | sudo bash
+```
 
-### Shade
+## Hidden services
 
-Statistical evasion. Elligator2 constant-time key generation with IAT obfuscation modes. Defeats statistical classifiers.
+Host any TCP service as a `.moor` hidden service. SSH, HTTP, IRC, databases — anything.
 
-### Mirage
+```bash
+./moor --mode hs --hs-dir ./hs_keys --hs-port 8080 -v
+```
 
-Protocol evasion. Full TLS 1.3 record framing with real x25519 key_share, configurable SNI, session_id HMAC for probe resistance.
+Tor-style port mapping:
 
-### Speakeasy
+```
+# /etc/moor/moorrc
+HiddenServiceDir /var/lib/moor/hidden_service
+HiddenServicePort 80 8080      # virtual 80 -> localhost:8080
+HiddenServicePort 22           # virtual 22 -> localhost:22
+```
 
-SSH camouflage. MOOR traffic inside an SSH session with real banner exchange, KEX, and encrypted channel framing. Blocking it means blocking SSH.
-
-### WebWTF (in design)
-
-UDP-based WebRTC video call camouflage. STUN + DTLS + SRTP with Opus/VP8 payload types. MOOR cells hidden inside media packets. Blocking it means blocking Zoom, Meet, and Discord. See [docs/webwtf-design.md](docs/webwtf-design.md).
+- **PQ-committed .moor addresses** — Kyber768 public key hash baked into the address
+- **6-hop tunnel** — 3 client + 3 service with vanguard protection
+- **Any TCP service** — SSH, HTTP, IRC, SMTP, databases all work
+- **DPF-PIR lookups** — storage relay cannot learn which descriptor you requested
+- **Descriptor anti-replay** — signed monotonic revision counters
+- **Vanguards** — L2 (24h) + L3 (1h) rotation prevents guard discovery
+- **Argon2id PoW** — memory-hard proof-of-work prevents intro flooding
+- **OnionBalance** — load balance across multiple backend instances
+- **Client authorization** — restrict descriptor access per-client
 
 ## Cryptography
 
@@ -69,53 +76,55 @@ UDP-based WebRTC video call camouflage. STUN + DTLS + SRTP with Opus/VP8 payload
 | Circuit key exchange | X25519 + Kyber768 hybrid CKE | Each hop of the 3-hop path |
 | HS end-to-end | X25519 + Kyber768 (post-handshake KEM) | Client to hidden service |
 | Onion encryption | ChaCha20 (PQ hybrid derived keys) | Data through the circuit |
+| Link AEAD | XChaCha20-Poly1305 | Wire frames (532 bytes) |
 | Consensus signatures | Ed25519 + ML-DSA-65 (Dilithium3) | Relay directory integrity |
-| Onion keys | Curve25519 + Kyber768 hybrid | Circuit static DH (28-day rotation) + KEM |
 | Identity keys | Ed25519 | Relay and service identity |
-| KEM | ML-KEM-768 (Kyber768) | Post-quantum key encapsulation (NIST Level 3) |
-| PQ signatures | ML-DSA-65 (Dilithium3) | Post-quantum signature verification |
 | Exit DNS | DNSCrypt v2 (X25519 + XSalsa20-Poly1305) | Encrypted DNS at exit relay |
 
-Every layer uses hybrid PQ crypto. An attacker must break both X25519 and Kyber768 to decrypt anything.
+Every layer uses hybrid PQ crypto. An attacker must break both X25519 and Kyber768 to decrypt anything. PQ hybrid is mandatory — no downgrade possible.
+
+## Pluggable transports
+
+Six pluggable transports for censorship circumvention:
+
+| Transport | Technique | Looks like |
+|-----------|-----------|------------|
+| **ShitStorm** | Chrome 146 JA4, Elligator2, ECH GREASE, HTTP/2 | Chrome browsing a CDN |
+| **Nether** | Minecraft 1.21.4 protocol, real handshake + login | Minecraft gameplay |
+| **Mirage** | TLS 1.3 framing, configurable SNI | HTTPS to any domain |
+| **Shade** | Elligator2 obfuscation, IAT modes | Random bytes |
+| **Scramble** | ASCII HTTP prefix + ChaCha20 stream | HTTP traffic |
+| **Speakeasy** | SSH banner exchange + encrypted channel | SSH session |
+
+```bash
+# Connect through a ShitStorm bridge
+./moor --UseBridges 1 --Bridge "shitstorm 1.2.3.4:9001 <fingerprint>" -v
+```
 
 ## Traffic analysis resistance
 
-- **Fixed-size cells** — 514 bytes. A 10-byte message and a 498-byte page look identical on the wire.
-- **WTF-PAD adaptive padding** — randomized per-circuit padding machines (web, stream, generic presets).
-- **Poisson relay mixing** — configurable random delay per relay before forwarding.
-- **Conflux multi-path** — split traffic across multiple circuit paths simultaneously.
-- **Constant-rate padding** — cover traffic when idle.
-
-## Hidden services
-
-Host a `.moor` service reachable only through the network:
-
-```
-./moor --mode hs --hs-dir ./hs_keys --hs-port 8080 -v
-```
-
-- **PQ-committed .moor addresses** — Kyber768 public key hash baked into the address. Even if Ed25519 is broken, the service cannot be impersonated.
-- 6-hop tunnel (3 client + 3 service) with PQ hybrid end-to-end encryption
-- PIR for anonymous descriptor lookups (storage relay cannot learn which service you requested)
-- Vanguard relays protect against guard discovery
-- Proof-of-work prevents introduction flooding
-- OnionBalance for load balancing across backends
-- Client authorization restricts descriptor access
+- **Fixed 514-byte cells** — all cells identical size on the wire
+- **WTF-PAD** — per-circuit randomized adaptive padding (web, stream, generic machines)
+- **FRONT padding** — Rayleigh-sampled burst-cover over first 5 seconds
+- **Constant-rate floor** — 50 cells/sec minimum cover traffic
+- **EWMA scheduling** — exponentially weighted circuit multiplexing
+- **Conflux** — multi-path circuit aggregation
 
 ## Network infrastructure
 
+- **Vegas CC** — Prop 324/329 per-circuit congestion control with SENDME auth (Prop 289)
 - **Multi-DA consensus** — directory authorities with Ed25519 + ML-DSA-65 dual signatures
-- **Bridge relays** — unlisted relays for censorship circumvention with pluggable transports
-- **GeoIP path diversity** — no two relays in a circuit share the same country or AS
+- **Prop 271 guard selection** — sampled/primary/confirmed guard sets (kicks in at 20+ relays)
+- **GeoIP path diversity** — country + AS exclusion, 370K+ IPv4 entries
 - **Bandwidth-weighted selection** — Tor-aligned flag assignment (Guard, Fast, Stable, Exit)
-- **Congestion control** — Vegas CC (Prop 324) with SENDME flow control and XON/XOFF
-- **Argon2id PoW** — memory-hard proof-of-work for DoS protection
-- **Connection reaper** — TCP keepalive + idle connection cleanup
-- **seccomp sandbox** — PR_SET_NO_NEW_PRIVS, rlimits, dumpable=0
+- **Path bias detection** — statistical guard compromise detection
+- **Argon2id PoW** — mandatory for relay admission, configurable difficulty
+- **seccomp-bpf sandbox** — syscall filtering, no_new_privs, rlimits
+- **TransPort + DNSPort** — transparent proxy and encrypted DNS resolution
 
-## Enclaves (independent networks)
+## Enclaves
 
-Anyone can spin up a fully independent MOOR network. No recompile. Just a text file.
+Anyone can spin up a fully independent MOOR network. No recompile. Just a config file.
 
 ```bash
 # Generate DA keys on each host
@@ -134,71 +143,19 @@ moor --mode relay --enclave mynet.enclave
 moor --enclave mynet.enclave  # client
 ```
 
-Separate DAs, separate consensus, separate relays. Your own island.
-
-## Quick start
-
-### Client (browse anonymously)
-
-```bash
-sudo apt install build-essential libsodium-dev zlib1g-dev
-make
-./moor
-# SOCKS5 proxy on 127.0.0.1:9050
-curl -x socks5h://127.0.0.1:9050 http://example.com
-```
-
-### Client through a bridge
-
-```bash
-./moor --UseBridges 1 --Bridge "shitstorm 1.2.3.4:9001 <fingerprint>" -v
-```
-
-### Relay (one command)
-
-```bash
-curl -sL https://raw.githubusercontent.com/0xdeadbeefnetwork/MOOR_PQ/main/setup.sh | sudo bash
-```
-
-### Relay (manual)
-
-```bash
-./moor --mode relay --advertise 1.2.3.4 --nickname MYRELAY -v
-./moor --mode relay --exit --advertise 1.2.3.4 --nickname MYEXIT -v
-```
-
-### Bridge relay
-
-```bash
-./moor --mode relay --is-bridge --bridge-transport shitstorm --advertise 1.2.3.4 --nickname MYBRIDGE -v
-```
-
-Bridge line printed on startup. Give it to users who need censorship circumvention.
-
-### Hidden service
-
-```bash
-./moor --mode hs --hs-port 8080 -v
-```
-
 ## Current network
 
 | Node | Role | Location |
 |------|------|----------|
 | DA1 | Directory Authority | US |
 | DA2 | Directory Authority | US |
-| TURBINE | Guard relay | US |
+| TURBINE | Relay | US |
 | DROPOUT | Guard relay | NL |
 | VALIDATOR | Exit relay | NL |
-| PIBRIDGE | ShitStorm bridge | US (residential) |
-
-## Key persistence
-
-Node keys are stored in `--data-dir <path>/keys/`. Back up this directory to preserve identity across restarts, upgrades, and server migrations. Keys are tied to nothing but the files.
 
 ## Documentation
 
-- [Architecture](docs/architecture.md) — system design, source layout, browsing walkthrough
+- [Architecture](docs/architecture.md) — system design, source layout
 - [Building](docs/building.md) — dependencies, build options, cross-compilation
 - [Configuration](docs/configuration.md) — all config options, CLI flags, relay types
 - [Protocol](docs/protocol.md) — wire formats, cell types, consensus format
@@ -208,9 +165,9 @@ Node keys are stored in `--data-dir <path>/keys/`. Back up this directory to pre
 
 ## Source
 
-https://github.com/0xdeadbeefnetwork/MOOR_PQ
+~50,000 lines of C across 64 source files and 47 headers. ~3,000 lines of vendored NIST PQ reference implementations (Kyber768, ML-DSA-65).
 
-~44,000 lines of C across 62 source files and 45 headers. ~3,000 lines of vendored NIST PQ reference implementations (Kyber768, ML-DSA-65).
+Website: [https://moor.afflicted.sh](https://moor.afflicted.sh)
 
 ## License
 
