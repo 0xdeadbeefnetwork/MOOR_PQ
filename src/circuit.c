@@ -1706,11 +1706,12 @@ int moor_circuit_send_data(moor_circuit_t *circ, uint16_t stream_id,
     size_t total_len = len;
 
     while (len > 0) {
-        /* Use cwnd/inflight for sender-side congestion control */
-        if (circ->inflight >= circ->cwnd) {
-            LOG_DEBUG("circuit %u: cwnd exhausted (inflight=%d cwnd=%d)",
-                      circ->circuit_id, circ->inflight, circ->cwnd);
-            /* Return bytes sent so far, or -1 if nothing was sent */
+        /* Hard limit: legacy SENDME windows (must block to prevent overflow).
+         * cwnd is a soft CC target — mark cwnd_full for Vegas but don't
+         * hard-block.  Hard-blocking on cwnd deadlocks when cwnd < the
+         * RP's SENDME interval (100 cells). */
+        if (circ->circ_package_window <= 0) {
+            LOG_DEBUG("circuit %u: circ_package_window exhausted", circ->circuit_id);
             return (len < total_len) ? (int)(total_len - len) : -1;
         }
         if (stream && stream->package_window <= 0) {
@@ -1927,6 +1928,9 @@ int moor_circuit_handle_sendme(moor_circuit_t *circ, uint16_t stream_id,
             stream->package_window += MOOR_SENDME_INCREMENT;
             LOG_DEBUG("stream %u: SENDME received, package_window=%d",
                       stream_id, stream->package_window);
+            /* Resume paused SOCKS5 clients — stream window refilled */
+            if (circ->is_client)
+                moor_socks5_resume_reads(circ);
         }
     }
     return 0;

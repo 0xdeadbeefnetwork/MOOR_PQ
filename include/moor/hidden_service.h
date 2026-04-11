@@ -25,7 +25,10 @@ typedef struct {
     uint16_t da_port;
     moor_da_entry_t da_list[9];     /* Multi-DA list */
     int      num_das;
-    uint16_t local_port;            /* Local service port to forward to */
+    uint16_t local_port;            /* Legacy: single-port fallback */
+    /* Port mapping: virtual_port → local_port (Tor-aligned) */
+    struct { uint16_t virtual_port; uint16_t local_port; } port_map[16];
+    int      num_port_maps;
     /* Intro point circuits (Tor: 3-10, configurable) */
     moor_circuit_t *intro_circuits[MOOR_MAX_INTRO_POINTS];
     int      num_intro_circuits;

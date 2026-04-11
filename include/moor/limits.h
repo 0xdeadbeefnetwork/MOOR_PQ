@@ -61,7 +61,7 @@
 
 /* ===== INTERNAL -- Congestion Control (Prop 324 / Vegas) ===== */
 #define MOOR_CC_CWND_INIT           124     /* Initial congestion window */
-#define MOOR_CC_CWND_MIN            31      /* Minimum congestion window */
+#define MOOR_CC_CWND_MIN            MOOR_SENDME_INCREMENT /* Floor = SENDME interval to prevent deadlock */
 #define MOOR_CC_CWND_MAX            2000    /* Maximum congestion window */
 #define MOOR_CC_SSTHRESH_INIT       1000    /* Initial slow-start threshold */
 #define MOOR_CC_VEGAS_ALPHA         30      /* Vegas alpha threshold */

@@ -53,6 +53,9 @@ typedef struct moor_bridge_entry {
 typedef struct {
     char     hs_dir[256];
     uint16_t local_port;
+    /* Port mapping: virtual_port → local_port (Tor-aligned) */
+    struct { uint16_t virtual_port; uint16_t local_port; } port_map[16];
+    int      num_port_maps;
     /* Authorized client Curve25519 public keys */
     uint8_t  auth_client_pks[16][32]; /* MOOR_MAX_AUTH_CLIENTS */
     int      num_auth_clients;

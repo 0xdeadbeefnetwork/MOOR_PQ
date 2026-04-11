@@ -1312,7 +1312,15 @@ static void socks_client_read_cb(int fd, int events, void *arg) {
             /* cwnd/package_window exhausted -- pause reads until SENDME */
             moor_event_remove(client->client_fd);
             client->paused = 1;
-            LOG_DEBUG("SOCKS5 client fd %d paused (cwnd full)", client->client_fd);
+            moor_stream_t *dbg_s = moor_circuit_find_stream(client->circuit, client->stream_id);
+            LOG_WARN("SOCKS5 fd %d PAUSED: inflight=%d cwnd=%d circ_pkg=%d "
+                     "stream_pkg=%d outq=%d",
+                     client->client_fd,
+                     client->circuit->inflight, client->circuit->cwnd,
+                     client->circuit->circ_package_window,
+                     dbg_s ? dbg_s->package_window : -1,
+                     client->circuit->conn ?
+                         moor_queue_count(&client->circuit->conn->outq) : -1);
         }
     } else if (ret < 0 && client->state != SOCKS5_STATE_CONNECTED &&
                client->state != SOCKS5_STATE_STREAMING &&
@@ -1789,9 +1797,9 @@ int moor_socks5_handle_client(moor_socks5_client_t *client) {
         client->circuit->conn->state == CONN_STATE_OPEN &&
         moor_queue_count(&client->circuit->conn->outq) >
             (384)) {
-        LOG_DEBUG("backpressure: output queue %d/%d, pausing client fd=%d (pre-recv)",
+        LOG_WARN("BACKPRESSURE: outq=%d, pausing client fd=%d",
                   moor_queue_count(&client->circuit->conn->outq),
-                  384, client->client_fd);
+                  client->client_fd);
         moor_event_remove(client->client_fd);
         client->paused = 1;
         return 0; /* data stays in kernel buffer, read when resumed */
@@ -1889,21 +1897,22 @@ int moor_socks5_forward_to_circuit(moor_socks5_client_t *client,
                           client->stream_id, (unsigned long long)nonce);
                 return -1;
             }
-            client->circuit->e2e_send_nonce = nonce + 1;
             int ret = moor_circuit_send_data(client->circuit,
                                               client->stream_id,
                                               e2e_enc_buf, enc_len);
             if (ret < 0) {
-                /* cwnd exhausted — save PLAINTEXT remainder for retry.
-                 * Next call will re-encrypt from where we left off. */
-                size_t unsent = len - offset;
-                if (unsent <= sizeof(client->sendbuf)) {
-                    memcpy(client->sendbuf, data + offset, unsent);
-                    client->sendbuf_len = unsent;
-                    client->sendbuf_needs_encrypt = 1;
+                /* cwnd/package_window exhausted — save CIPHERTEXT for retry
+                 * so the nonce stays in sync.  Only commit the nonce now. */
+                client->circuit->e2e_send_nonce = nonce + 1;
+                if (enc_len <= sizeof(client->sendbuf)) {
+                    memcpy(client->sendbuf, e2e_enc_buf, enc_len);
+                    client->sendbuf_len = enc_len;
+                    client->sendbuf_needs_encrypt = 0;
                 }
                 return -1;
             }
+            /* Cell queued — now commit the nonce */
+            client->circuit->e2e_send_nonce = nonce + 1;
             if (ret > 0 && (size_t)ret < enc_len) {
                 /* Partial — save encrypted remainder */
                 size_t left = enc_len - (size_t)ret;

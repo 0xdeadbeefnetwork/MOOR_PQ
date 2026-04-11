@@ -424,12 +424,39 @@ int moor_config_set(moor_config_t *cfg, const char *key, const char *value) {
         cfg->num_hidden_services++;
     }
     else if (strcmp(key, "HiddenServicePort") == 0) {
-        /* Applies to most recently added HiddenServiceDir */
+        /* Tor-aligned: HiddenServicePort VIRTUAL_PORT [TARGET]
+         * TARGET can be: PORT, addr:PORT, or omitted (=VIRTUAL_PORT).
+         * Examples: "80", "80 8080", "80 127.0.0.1:8080" */
         if (cfg->num_hidden_services <= 0) return -1;
         int idx = cfg->num_hidden_services - 1;
-        int p = parse_port(value);
-        if (p < 0) return -1;
-        cfg->hidden_services[idx].local_port = (uint16_t)p;
+        moor_hs_entry_t *hs = &cfg->hidden_services[idx];
+
+        char val_copy[256];
+        snprintf(val_copy, sizeof(val_copy), "%s", value);
+        char *space = strchr(val_copy, ' ');
+
+        int vport, lport;
+        if (space) {
+            *space = '\0';
+            vport = parse_port(val_copy);
+            char *target = space + 1;
+            while (*target == ' ') target++;
+            /* Strip optional address prefix (e.g. "127.0.0.1:") */
+            char *colon = strrchr(target, ':');
+            lport = parse_port(colon ? colon + 1 : target);
+        } else {
+            /* Single port: virtual = local */
+            vport = parse_port(val_copy);
+            lport = vport;
+        }
+        if (vport < 0 || lport < 0) return -1;
+
+        if (hs->num_port_maps < 16) {
+            hs->port_map[hs->num_port_maps].virtual_port = (uint16_t)vport;
+            hs->port_map[hs->num_port_maps].local_port = (uint16_t)lport;
+            hs->num_port_maps++;
+        }
+        hs->local_port = (uint16_t)lport; /* legacy fallback = last port */
     }
     else if (strcmp(key, "HiddenServiceAuthorizedClient") == 0) {
         /* value = base32-encoded Curve25519 public key */

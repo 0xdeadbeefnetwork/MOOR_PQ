@@ -1726,6 +1726,8 @@ typedef struct {
     int fd;
     moor_circuit_t *circ;
     uint16_t stream_id;
+    int deliver_window;   /* SENDME: cells received before we must ack */
+    int package_window;   /* SENDME: cells we're allowed to send */
 } hs_target_fd_t;
 
 #define MAX_HS_TARGET_FDS 128
@@ -1820,6 +1822,15 @@ static void hs_target_read_cb(int fd, int events, void *arg) {
         return;
     }
 
+    /* SENDME: check package window before reading.  If exhausted, pause
+     * reads until client sends SENDME to refill. */
+    if (map->package_window <= 0 || map->circ->circ_package_window <= 0) {
+        moor_event_remove(fd);
+        LOG_DEBUG("HS: package window exhausted for stream %u (stream=%d circ=%d), pausing reads",
+                  map->stream_id, map->package_window, map->circ->circ_package_window);
+        return;
+    }
+
     /* Limit recv to max plaintext that fits in a cell after e2e AEAD
      * encryption.  Without this, each cell silently truncates 16 bytes
      * (the MAC overhead), losing 16 * num_cells bytes per response. */
@@ -1829,6 +1840,8 @@ static void hs_target_read_cb(int fd, int events, void *arg) {
 
     uint8_t buf[MOOR_RELAY_DATA];
     ssize_t n = recv(fd, (char *)buf, recv_max, 0);
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        return; /* non-blocking: no data yet, try later */
     if (n <= 0) {
         /* Local service closed or error -- send RELAY_END back */
         if (map->circ->conn && map->circ->conn->state == CONN_STATE_OPEN) {
@@ -1877,6 +1890,12 @@ static void hs_target_read_cb(int fd, int events, void *arg) {
                    map->stream_id, send_data, send_len);
     if (moor_circuit_encrypt_forward(map->circ, &data_cell) == 0)
         moor_connection_send_cell(map->circ->conn, &data_cell);
+
+    /* SENDME: decrement package windows after sending */
+    map->package_window--;
+    if (map->circ->circ_package_window > 0)
+        map->circ->circ_package_window--;
+    map->circ->inflight++;
 }
 
 /* Callback: cell arrived on HS rendezvous circuit (from client via RP) */
@@ -1944,16 +1963,54 @@ static void hs_rp_read_cb(int fd, int events, void *arg) {
 
         switch (relay.relay_command) {
         case RELAY_BEGIN: {
-            /* Client wants to connect to our local service */
-            LOG_INFO("HS: RELAY_BEGIN on RP circuit (stream %u)",
-                     relay.stream_id);
+            /* Client wants to connect to our local service.
+             * RELAY_BEGIN payload: "address:port\0" (Tor-aligned) */
+            uint16_t requested_port = 0;
+            if (relay.data_length > 0) {
+                char begin_addr[256];
+                size_t cplen = relay.data_length;
+                if (cplen >= sizeof(begin_addr)) cplen = sizeof(begin_addr) - 1;
+                memcpy(begin_addr, relay.data, cplen);
+                begin_addr[cplen] = '\0';
+                char *colon = strrchr(begin_addr, ':');
+                if (colon) requested_port = (uint16_t)strtol(colon + 1, NULL, 10);
+            }
 
-            /* Connect to our local service (localhost:local_port) */
+            /* Look up virtual port → local port */
+            uint16_t local_port = 0;
+            for (int pm = 0; pm < ctx->config->num_port_maps; pm++) {
+                if (ctx->config->port_map[pm].virtual_port == requested_port) {
+                    local_port = ctx->config->port_map[pm].local_port;
+                    break;
+                }
+            }
+            if (local_port == 0) {
+                /* Fallback: if only one port mapped, use it; else reject */
+                if (ctx->config->num_port_maps == 1)
+                    local_port = ctx->config->port_map[0].local_port;
+                else if (ctx->config->local_port)
+                    local_port = ctx->config->local_port;
+            }
+            if (local_port == 0) {
+                LOG_WARN("HS: RELAY_BEGIN for unmapped port %u, rejecting stream %u",
+                         requested_port, relay.stream_id);
+                moor_cell_t end_cell;
+                moor_cell_relay(&end_cell, circ->circuit_id, RELAY_END,
+                               relay.stream_id, NULL, 0);
+                if (moor_circuit_encrypt_forward(circ, &end_cell) == 0)
+                    moor_connection_send_cell(circ->conn, &end_cell);
+                break;
+            }
+
+            LOG_INFO("HS: RELAY_BEGIN stream %u port %u → localhost:%u",
+                     relay.stream_id, requested_port, local_port);
+
+            /* Connect to local service */
             struct sockaddr_in sa;
             memset(&sa, 0, sizeof(sa));
             sa.sin_family = AF_INET;
             sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-            sa.sin_port = htons(ctx->config->local_port);
+            sa.sin_port = htons(local_port);
 
             int target_fd = socket(AF_INET, SOCK_STREAM, 0);
             if (target_fd < 0) {
@@ -1961,11 +2018,14 @@ static void hs_rp_read_cb(int fd, int events, void *arg) {
                 break;
             }
 
-            if (connect(target_fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+            /* Non-blocking connect to avoid stalling the event loop */
+            moor_set_nonblocking(target_fd);
+
+            if (connect(target_fd, (struct sockaddr *)&sa, sizeof(sa)) != 0 &&
+                errno != EINPROGRESS) {
                 LOG_ERROR("HS: connect to localhost:%u failed: %s",
-                         ctx->config->local_port, strerror(errno));
+                         local_port, strerror(errno));
                 close(target_fd);
-                /* Send RELAY_END back */
                 moor_cell_t end_cell;
                 moor_cell_relay(&end_cell, circ->circuit_id, RELAY_END,
                                relay.stream_id, NULL, 0);
@@ -1975,7 +2035,7 @@ static void hs_rp_read_cb(int fd, int events, void *arg) {
             }
 
             LOG_INFO("HS: connected to local service localhost:%u (fd=%d)",
-                     ctx->config->local_port, target_fd);
+                     local_port, target_fd);
 
             /* Store target FD mapping */
             if (g_hs_target_fd_count < MAX_HS_TARGET_FDS) {
@@ -1983,6 +2043,8 @@ static void hs_rp_read_cb(int fd, int events, void *arg) {
                 g_hs_target_fds[idx].fd = target_fd;
                 g_hs_target_fds[idx].circ = circ;
                 g_hs_target_fds[idx].stream_id = relay.stream_id;
+                g_hs_target_fds[idx].deliver_window = MOOR_STREAM_WINDOW;
+                g_hs_target_fds[idx].package_window = MOOR_STREAM_WINDOW;
             } else {
                 LOG_WARN("HS: target fd table full, rejecting stream %u",
                          relay.stream_id);
@@ -2046,15 +2108,37 @@ static void hs_rp_read_cb(int fd, int events, void *arg) {
                 }
             }
             if (map && map->fd >= 0) {
-                ssize_t sent = send(map->fd, (const char *)relay.data,
-                     relay.data_length, MSG_NOSIGNAL);
-                LOG_DEBUG("HS: forwarded %zd/%u bytes to local service fd=%d stream=%u "
-                          "(first bytes: %02x %02x %02x %02x)",
-                          sent, relay.data_length, map->fd, relay.stream_id,
-                          relay.data_length > 0 ? relay.data[0] : 0,
-                          relay.data_length > 1 ? relay.data[1] : 0,
-                          relay.data_length > 2 ? relay.data[2] : 0,
-                          relay.data_length > 3 ? relay.data[3] : 0);
+                /* Write all data, handling short writes + EAGAIN */
+                size_t total_sent = 0;
+                while (total_sent < relay.data_length) {
+                    ssize_t sent = send(map->fd,
+                                        (const char *)relay.data + total_sent,
+                                        relay.data_length - total_sent,
+                                        MSG_NOSIGNAL);
+                    if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                        continue; /* retry non-blocking */
+                    if (sent <= 0) break;
+                    total_sent += sent;
+                }
+                LOG_DEBUG("HS: forwarded %zu/%u bytes to local service fd=%d stream=%u",
+                          total_sent, relay.data_length, map->fd, relay.stream_id);
+
+                /* SENDME: decrement deliver window, send SENDME when threshold hit */
+                map->deliver_window--;
+                if (map->deliver_window <=
+                    MOOR_STREAM_WINDOW - MOOR_SENDME_INCREMENT) {
+                    moor_cell_t sendme;
+                    moor_cell_relay(&sendme, circ->circuit_id, RELAY_SENDME,
+                                   relay.stream_id, NULL, 0);
+                    if (moor_circuit_encrypt_forward(circ, &sendme) == 0)
+                        moor_connection_send_cell(circ->conn, &sendme);
+                    map->deliver_window += MOOR_SENDME_INCREMENT;
+                    LOG_DEBUG("HS: sent stream SENDME for stream %u (window=%d)",
+                              relay.stream_id, map->deliver_window);
+                }
+                /* Circuit-level SENDME: RP relay handles this (relay.c
+                 * sendme_check) with proper Prop 289 auth digest.
+                 * HS only needs stream-level SENDMEs. */
             } else {
                 LOG_WARN("HS: RELAY_DATA but no target fd for stream %u (map=%p count=%d)",
                          relay.stream_id, (void*)map, g_hs_target_fd_count);
@@ -2078,9 +2162,38 @@ static void hs_rp_read_cb(int fd, int events, void *arg) {
             break;
         }
 
-        case RELAY_SENDME:
-            /* Acknowledge (no-op for now) */
+        case RELAY_SENDME: {
+            /* Client sent SENDME -- refill our package window */
+            if (relay.stream_id == 0) {
+                /* Circuit-level: refill circ package window */
+                circ->circ_package_window += MOOR_SENDME_INCREMENT;
+                if (circ->circ_package_window > MOOR_CIRCUIT_WINDOW)
+                    circ->circ_package_window = MOOR_CIRCUIT_WINDOW;
+                /* CC: decrement inflight by SENDME_INCREMENT cells acked */
+                circ->inflight -= MOOR_SENDME_INCREMENT;
+                if (circ->inflight < 0) circ->inflight = 0;
+                LOG_DEBUG("HS: circuit SENDME, package_window=%d inflight=%d",
+                          circ->circ_package_window, circ->inflight);
+            } else {
+                /* Stream-level: refill stream package window */
+                for (int i = 0; i < g_hs_target_fd_count; i++) {
+                    if (g_hs_target_fds[i].circ == circ &&
+                        g_hs_target_fds[i].stream_id == relay.stream_id) {
+                        g_hs_target_fds[i].package_window += MOOR_SENDME_INCREMENT;
+                        if (g_hs_target_fds[i].package_window > MOOR_STREAM_WINDOW)
+                            g_hs_target_fds[i].package_window = MOOR_STREAM_WINDOW;
+                        LOG_DEBUG("HS: stream %u SENDME, package_window=%d",
+                                  relay.stream_id, g_hs_target_fds[i].package_window);
+                        /* Re-enable reads from local service if paused */
+                        if (g_hs_target_fds[i].package_window > 0)
+                            moor_event_add(g_hs_target_fds[i].fd, MOOR_EVENT_READ,
+                                           hs_target_read_cb, NULL);
+                        break;
+                    }
+                }
+            }
             break;
+        }
 
         case RELAY_E2E_KEM_CT: {
             /* PQ hybrid e2e: accumulate Kyber768 ciphertext from client */
@@ -2516,6 +2629,14 @@ static int run_hs(void) {
             snprintf(hs_config.hs_dir, sizeof(hs_config.hs_dir), "%s",
                      g_config.hidden_services[h].hs_dir);
             hs_config.local_port = g_config.hidden_services[h].local_port;
+            /* Propagate port mappings */
+            hs_config.num_port_maps = g_config.hidden_services[h].num_port_maps;
+            for (int pm = 0; pm < hs_config.num_port_maps; pm++) {
+                hs_config.port_map[pm].virtual_port =
+                    g_config.hidden_services[h].port_map[pm].virtual_port;
+                hs_config.port_map[pm].local_port =
+                    g_config.hidden_services[h].port_map[pm].local_port;
+            }
             /* Propagate authorized clients */
             hs_config.num_auth_clients = g_config.hidden_services[h].num_auth_clients;
             for (int ac = 0; ac < hs_config.num_auth_clients; ac++) {
