@@ -21,6 +21,7 @@ typedef struct {
     } intro_points[MOOR_MAX_INTRO_POINTS];
     uint8_t  signature[64];
     uint64_t published;
+    uint64_t revision;              /* Monotonic counter (anti-replay) */
     /* Client authorization: auth_type 0 = none, 1 = sealed-box per client */
     uint8_t  auth_type;
     uint8_t  num_auth_entries;

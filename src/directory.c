@@ -1862,11 +1862,11 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
                     }
                 }
             }
-            /* Verify PoW -- required when pow_difficulty > 0 */
+            /* Verify PoW -- always required (minimum = default difficulty) */
             size_t remaining = len - (size_t)desc_len;
-            int pow_diff = config->pow_difficulty > 0 ?
+            int pow_diff = config->pow_difficulty >= MOOR_POW_DEFAULT_DIFFICULTY ?
                            config->pow_difficulty : MOOR_POW_DEFAULT_DIFFICULTY;
-            if (remaining < 16 && pow_diff > 0) {
+            if (remaining < 16) {
                 LOG_WARN("DA: rejecting relay with missing PoW data");
                 send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
                 free(desc_buf);
@@ -3206,7 +3206,31 @@ int moor_client_fetch_hs_descriptor(moor_hs_descriptor_t *desc,
     int ret = moor_hs_descriptor_deserialize(desc, plaintext, pt_len);
     sodium_memzero(plaintext, ct_len);
     free(plaintext);
-    return (ret > 0) ? 0 : -1;
+    if (ret <= 0) return -1;
+
+    /* Anti-replay: reject descriptors with stale revision counters.
+     * Cache last-seen revision per address_hash. */
+    static struct { uint8_t hash[32]; uint64_t revision; } rev_cache[64];
+    static int rev_cache_count = 0;
+    for (int i = 0; i < rev_cache_count; i++) {
+        if (sodium_memcmp(rev_cache[i].hash, desc->address_hash, 32) == 0) {
+            if (desc->revision < rev_cache[i].revision) {
+                LOG_WARN("HS descriptor replay: revision %llu < cached %llu",
+                         (unsigned long long)desc->revision,
+                         (unsigned long long)rev_cache[i].revision);
+                return -1;
+            }
+            rev_cache[i].revision = desc->revision;
+            return 0;
+        }
+    }
+    /* New HS — add to cache */
+    if (rev_cache_count < 64) {
+        memcpy(rev_cache[rev_cache_count].hash, desc->address_hash, 32);
+        rev_cache[rev_cache_count].revision = desc->revision;
+        rev_cache_count++;
+    }
+    return 0;
 }
 
 /*
@@ -3218,6 +3242,7 @@ int moor_client_fetch_hs_descriptor(moor_hs_descriptor_t *desc,
 int moor_hs_descriptor_serialize(uint8_t *out, size_t out_len,
                                  const moor_hs_descriptor_t *desc) {
     size_t needed = 32 + 32 + 32 + 32 + 4 + desc->num_intro_points * 98 + 64 + 8
+                   + 8 /* revision counter */
                    + 1 /* auth_type */
                    + 32 + 1 /* pow_seed + pow_difficulty */
                    + 1 + (desc->kem_available ? 1184 : 0) /* PQ KEM pk */;
@@ -3252,6 +3277,16 @@ int moor_hs_descriptor_serialize(uint8_t *out, size_t out_len,
     out[off++] = (uint8_t)(desc->published >> 16);
     out[off++] = (uint8_t)(desc->published >> 8);
     out[off++] = (uint8_t)(desc->published);
+
+    /* Revision counter (big-endian) -- anti-replay */
+    out[off++] = (uint8_t)(desc->revision >> 56);
+    out[off++] = (uint8_t)(desc->revision >> 48);
+    out[off++] = (uint8_t)(desc->revision >> 40);
+    out[off++] = (uint8_t)(desc->revision >> 32);
+    out[off++] = (uint8_t)(desc->revision >> 24);
+    out[off++] = (uint8_t)(desc->revision >> 16);
+    out[off++] = (uint8_t)(desc->revision >> 8);
+    out[off++] = (uint8_t)(desc->revision);
 
     /* Auth section: auth_type(1) + [num_entries(1) + entries[]] */
     out[off++] = desc->auth_type;
@@ -3318,6 +3353,19 @@ int moor_hs_descriptor_deserialize(moor_hs_descriptor_t *desc,
                       ((uint64_t)data[off+6] << 8) |
                       (uint64_t)data[off+7];
     off += 8;
+
+    /* Revision counter (anti-replay) */
+    if (off + 8 <= data_len) {
+        desc->revision = ((uint64_t)data[off] << 56) |
+                          ((uint64_t)data[off+1] << 48) |
+                          ((uint64_t)data[off+2] << 40) |
+                          ((uint64_t)data[off+3] << 32) |
+                          ((uint64_t)data[off+4] << 24) |
+                          ((uint64_t)data[off+5] << 16) |
+                          ((uint64_t)data[off+6] << 8) |
+                          (uint64_t)data[off+7];
+        off += 8;
+    }
 
     /* Auth section (optional) */
     if (off < data_len) {

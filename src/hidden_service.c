@@ -352,12 +352,28 @@ int moor_hs_build_circuit(moor_circuit_t *circ,
     uint8_t exclude[96]; /* up to 3 * 32 */
     memcpy(exclude, our_pk, 32);
 
-    /* Select guard normally */
-    const moor_node_descriptor_t *guard =
-        moor_node_select_relay(consensus, NODE_FLAG_GUARD | NODE_FLAG_RUNNING,
-                               exclude, 1);
+    /* Select guard: use Prop 271 pinning when network is large enough
+     * to provide meaningful anonymity set (>= 20 relays).
+     * Small networks: random selection (pinning is pointless with 3 relays). */
+    const moor_node_descriptor_t *guard = NULL;
+    if (consensus->num_relays >= 20) {
+        const moor_guard_entry_t *ge = moor_guard_select(moor_pathbias_get_state());
+        if (ge) {
+            for (uint32_t ri = 0; ri < consensus->num_relays; ri++) {
+                if (sodium_memcmp(consensus->relays[ri].identity_pk,
+                                  ge->identity_pk, 32) == 0 &&
+                    (consensus->relays[ri].flags & NODE_FLAG_RUNNING)) {
+                    guard = &consensus->relays[ri];
+                    break;
+                }
+            }
+        }
+    }
     if (!guard) {
-        /* Fallback to any running relay if no guard available */
+        guard = moor_node_select_relay(consensus, NODE_FLAG_GUARD | NODE_FLAG_RUNNING,
+                                       exclude, 1);
+    }
+    if (!guard) {
         guard = moor_node_select_relay(consensus, NODE_FLAG_RUNNING,
                                        exclude, 1);
     }
@@ -637,6 +653,7 @@ int moor_hs_publish_descriptor(moor_hs_config_t *config) {
     memcpy(desc.service_pk, config->identity_pk, 32);
     memcpy(desc.onion_pk, config->onion_pk, 32);
     memcpy(desc.blinded_pk, config->blinded_pk, 32);
+    desc.revision = config->desc_revision;
     /* Collect only LIVE intro circuits into the descriptor.
      * Previous code used num_intro_circuits (the desired count) which
      * included dead/NULL slots, publishing zero node_ids that clients
@@ -685,6 +702,15 @@ int moor_hs_publish_descriptor(moor_hs_config_t *config) {
     }
     memcpy(extra_buf + epos, desc.pow_seed, 32); epos += 32;
     extra_buf[epos++] = desc.pow_difficulty;
+    /* Include revision counter in signature to prevent replay */
+    extra_buf[epos++] = (uint8_t)(desc.revision >> 56);
+    extra_buf[epos++] = (uint8_t)(desc.revision >> 48);
+    extra_buf[epos++] = (uint8_t)(desc.revision >> 40);
+    extra_buf[epos++] = (uint8_t)(desc.revision >> 32);
+    extra_buf[epos++] = (uint8_t)(desc.revision >> 24);
+    extra_buf[epos++] = (uint8_t)(desc.revision >> 16);
+    extra_buf[epos++] = (uint8_t)(desc.revision >> 8);
+    extra_buf[epos++] = (uint8_t)(desc.revision);
     uint8_t content_hash[32];
     moor_crypto_hash(content_hash, extra_buf, epos);
 
@@ -1363,6 +1389,15 @@ verify_descriptor:
         }
         memcpy(extra_buf + epos, hs_desc.pow_seed, 32); epos += 32;
         extra_buf[epos++] = hs_desc.pow_difficulty;
+        /* Revision counter must match what was signed */
+        extra_buf[epos++] = (uint8_t)(hs_desc.revision >> 56);
+        extra_buf[epos++] = (uint8_t)(hs_desc.revision >> 48);
+        extra_buf[epos++] = (uint8_t)(hs_desc.revision >> 40);
+        extra_buf[epos++] = (uint8_t)(hs_desc.revision >> 32);
+        extra_buf[epos++] = (uint8_t)(hs_desc.revision >> 24);
+        extra_buf[epos++] = (uint8_t)(hs_desc.revision >> 16);
+        extra_buf[epos++] = (uint8_t)(hs_desc.revision >> 8);
+        extra_buf[epos++] = (uint8_t)(hs_desc.revision);
         uint8_t content_hash[32];
         moor_crypto_hash(content_hash, extra_buf, epos);
 

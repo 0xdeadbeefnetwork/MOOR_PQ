@@ -21,11 +21,13 @@
 #include <sys/socket.h>
 #endif
 
-/* Global cell count across all queues (OOM pressure) */
+/* Global cell count across all queues (OOM pressure).
+ * Accessed from worker threads (extend_worker) and main thread,
+ * so use atomics to prevent races (#audit). */
 static volatile int g_global_queued = 0;
 
 int moor_queue_global_count(void) {
-    return g_global_queued;
+    return __sync_add_and_fetch(&g_global_queued, 0);
 }
 
 void moor_queue_init(moor_cell_queue_t *q) {
@@ -39,7 +41,7 @@ void moor_queue_clear(moor_cell_queue_t *q) {
     while (cur) {
         moor_queued_cell_t *next = cur->next;
         free(cur);
-        if (g_global_queued > 0) g_global_queued--;
+        __sync_sub_and_fetch(&g_global_queued, 1);
         cur = next;
     }
     q->head = NULL;
@@ -50,7 +52,7 @@ void moor_queue_clear(moor_cell_queue_t *q) {
 int moor_queue_push(moor_cell_queue_t *q, const uint8_t *wire_data,
                     uint16_t wire_len, uint32_t circuit_id) {
     /* OOM safety: reject if global queue pressure is extreme */
-    if (g_global_queued >= MOOR_GLOBAL_QUEUE_HARD_LIMIT) {
+    if (__sync_add_and_fetch(&g_global_queued, 0) >= MOOR_GLOBAL_QUEUE_HARD_LIMIT) {
         LOG_WARN("global queue limit reached (%d cells), dropping",
                  g_global_queued);
         return -1;
@@ -73,7 +75,7 @@ int moor_queue_push(moor_cell_queue_t *q, const uint8_t *wire_data,
     }
     q->tail = cell;
     q->count++;
-    g_global_queued++;
+    __sync_add_and_fetch(&g_global_queued, 1);
 
     return 0;
 }
@@ -89,7 +91,7 @@ int moor_queue_pop(moor_cell_queue_t *q, uint8_t *out, uint16_t *out_len) {
     q->head = cell->next;
     if (!q->head) q->tail = NULL;
     q->count--;
-    if (g_global_queued > 0) g_global_queued--;
+    __sync_sub_and_fetch(&g_global_queued, 1);
     free(cell);
 
     return 0;
