@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MOOR — As Dark As It Gets</title>
-<meta name="description" content="Post-quantum anonymous overlay network. 3-hop onion routing, Kyber768 + X25519 hybrid crypto, hidden services, traffic analysis resistance.">
+<meta name="description" content="Post-quantum anonymous overlay network. 3-hop onion routing, Kyber768 + X25519 hybrid crypto, hidden services, 6 pluggable transports, traffic analysis resistance.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
@@ -111,7 +111,7 @@ nav{
 
 .hero-terminal{
   position:absolute;right:60px;top:50%;transform:translateY(-50%);
-  width:420px;background:var(--bg2);border:1px solid var(--border);
+  width:440px;background:var(--bg2);border:1px solid var(--border);
   border-radius:8px;overflow:hidden;opacity:.7;
   display:none;
 }
@@ -119,11 +119,12 @@ nav{
 .term-bar{padding:10px 14px;border-bottom:1px solid var(--border);display:flex;gap:6px}
 .term-dot{width:10px;height:10px;border-radius:50%}
 .term-dot:nth-child(1){background:#ff5f56}.term-dot:nth-child(2){background:#ffbd2e}.term-dot:nth-child(3){background:#27c93f}
-.term-body{padding:16px;font-family:var(--mono);font-size:.72rem;line-height:1.8;color:var(--fg2);min-height:280px}
+.term-body{padding:16px;font-family:var(--mono);font-size:.7rem;line-height:1.8;color:var(--fg2);min-height:320px}
 .term-body .cmd{color:var(--cyan)}
 .term-body .out{color:var(--fg-dim)}
 .term-body .ok{color:var(--green)}
 .term-body .hl{color:var(--magenta)}
+.term-body .warn{color:var(--amber)}
 .term-cursor{display:inline-block;width:7px;height:14px;background:var(--cyan);animation:blink 1s step-end infinite;vertical-align:middle}
 @keyframes blink{50%{opacity:0}}
 
@@ -140,27 +141,29 @@ section{padding:100px 60px}
 
 .features{background:var(--bg)}
 .features-grid{
-  display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));
-  gap:1px;background:var(--border);border:1px solid var(--border);border-radius:8px;overflow:hidden;
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));
+  gap:1px;background:var(--bg);border:1px solid var(--border);border-radius:8px;overflow:hidden;
 }
-.feature{background:var(--bg);padding:36px 32px;transition:background .3s}
+.feature{border-bottom:1px solid var(--border);border-right:1px solid var(--border)}
+.feature{background:var(--bg);padding:32px 28px;transition:background .3s}
 .feature:hover{background:var(--bg2)}
 .feature-icon{
-  width:40px;height:40px;border-radius:8px;
+  width:36px;height:36px;border-radius:6px;
   display:flex;align-items:center;justify-content:center;
-  font-size:1.2rem;margin-bottom:16px;
+  font-size:1rem;margin-bottom:14px;
   border:1px solid var(--border2);color:var(--cyan);font-family:var(--mono);
 }
-.feature h3{font-family:var(--mono);font-size:.88rem;color:#fff;margin-bottom:8px;font-weight:500}
-.feature p{font-size:.82rem;color:var(--fg2);line-height:1.65}
+.feature h3{font-family:var(--mono);font-size:.84rem;color:#fff;margin-bottom:6px;font-weight:500}
+.feature p{font-size:.78rem;color:var(--fg2);line-height:1.65}
 .feature .tag{
-  display:inline-block;margin-top:12px;font-family:var(--mono);font-size:.65rem;
+  display:inline-block;margin-top:10px;font-family:var(--mono);font-size:.62rem;
   padding:3px 10px;border-radius:3px;letter-spacing:1px;
 }
 .tag-pq{background:rgba(199,146,234,.1);color:var(--magenta)}
 .tag-privacy{background:rgba(93,228,199,.08);color:var(--cyan)}
 .tag-resist{background:rgba(255,215,0,.08);color:var(--amber)}
 .tag-perf{background:rgba(166,226,46,.08);color:var(--green)}
+.tag-sec{background:rgba(255,107,107,.08);color:var(--red)}
 
 .howitworks{background:var(--bg2);border-top:1px solid var(--border);border-bottom:1px solid var(--border)}
 .hop-diagram{
@@ -168,14 +171,14 @@ section{padding:100px 60px}
   margin:40px 0;flex-wrap:wrap;
 }
 .hop-node{
-  text-align:center;padding:24px 20px;min-width:130px;
+  text-align:center;padding:20px 16px;min-width:110px;
   background:var(--bg);border:1px solid var(--border);border-radius:8px;
 }
-.hop-node .icon{font-size:1.5rem;margin-bottom:8px}
-.hop-node .name{font-family:var(--mono);font-size:.78rem;color:#fff;font-weight:500}
-.hop-node .desc{font-size:.65rem;color:var(--fg2);margin-top:4px}
+.hop-node .icon{font-size:1.3rem;margin-bottom:6px}
+.hop-node .name{font-family:var(--mono);font-size:.72rem;color:#fff;font-weight:500}
+.hop-node .desc{font-size:.6rem;color:var(--fg2);margin-top:3px}
 .hop-arrow{
-  width:50px;height:2px;background:linear-gradient(90deg,var(--cyan),var(--magenta));
+  width:40px;height:2px;background:linear-gradient(90deg,var(--cyan),var(--magenta));
   position:relative;flex-shrink:0;
 }
 .hop-arrow::after{
@@ -183,7 +186,7 @@ section{padding:100px 60px}
   border:5px solid transparent;border-left:8px solid var(--magenta);
 }
 .hop-label{
-  font-family:var(--mono);font-size:.58rem;color:var(--fg-dim);
+  font-family:var(--mono);font-size:.55rem;color:var(--fg-dim);
   text-align:center;margin-top:-8px;letter-spacing:1px;
 }
 .crypto-layers{
@@ -198,6 +201,7 @@ section{padding:100px 60px}
 .crypto-layer:nth-child(1)::before{background:var(--cyan)}
 .crypto-layer:nth-child(2)::before{background:var(--magenta)}
 .crypto-layer:nth-child(3)::before{background:var(--amber)}
+.crypto-layer:nth-child(4)::before{background:var(--green)}
 .crypto-layer h4{font-family:var(--mono);font-size:.78rem;color:#fff;margin-bottom:6px}
 .crypto-layer p{font-size:.72rem;color:var(--fg2);line-height:1.6}
 
@@ -314,19 +318,19 @@ footer a{color:var(--fg2)}
     <h1>As <em>Dark</em><br>As It Gets.</h1>
     <p class="hero-sub">
       Post-quantum anonymous overlay network. 3-hop onion routing with
-      Kyber768 + X25519 hybrid cryptography at every hop. Hidden services.
-      Traffic analysis resistance. No exceptions.
+      Kyber768 + X25519 hybrid cryptography at every layer. Hidden services
+      for any TCP protocol. 6 pluggable transports. No exceptions.
     </p>
     <div class="hero-actions">
       <a href="#download" class="btn btn-primary">Download v0.8.1</a>
       <a href="#install" class="btn">Quick Start</a>
-      <a href="docs.html" class="btn">Documentation</a>
+      <a href="https://github.com/0xdeadbeefnetwork/MOOR_PQ" class="btn">Source</a>
     </div>
     <div class="hero-stats">
-      <div class="hero-stat"><div class="val">~45<span>k</span></div><div class="lbl">Lines of C</div></div>
+      <div class="hero-stat"><div class="val">~50<span>k</span></div><div class="lbl">Lines of C</div></div>
       <div class="hero-stat"><div class="val">3<span>-hop</span></div><div class="lbl">Onion Routing</div></div>
       <div class="hero-stat"><div class="val">PQ<span>+</span></div><div class="lbl">Kyber768 Hybrid</div></div>
-      <div class="hero-stat"><div class="val">5</div><div class="lbl">Relay Network</div></div>
+      <div class="hero-stat"><div class="val">6</div><div class="lbl">Transports</div></div>
     </div>
   </div>
   <div class="hero-terminal">
@@ -338,61 +342,103 @@ footer a{color:var(--fg2)}
 <section class="features" id="features">
   <div class="section-tag reveal">01 // Features</div>
   <h2 class="section-title reveal">Post-quantum at every layer.</h2>
-  <p class="section-desc reveal">v0.8.1 &mdash; ~45,000 lines of C. Minimal dependencies: libsodium, zlib, pthreads. No OpenSSL.</p>
+  <p class="section-desc reveal">v0.8.1 &mdash; ~50,000 lines of C. Minimal dependencies: libsodium, zlib, pthreads. No OpenSSL.</p>
   <div class="features-grid reveal">
     <div class="feature">
       <div class="feature-icon">K</div>
       <h3>Hybrid Cryptography</h3>
-      <p>X25519 + Kyber768 (NIST Level 3) key exchange with ChaCha20-Poly1305 AEAD. Quantum-resistant at every hop.</p>
+      <p>X25519 + Kyber768 (NIST Level 3) key exchange at every hop. XChaCha20-Poly1305 link AEAD. ChaCha20-Poly1305 circuit AEAD. Quantum-safe by default.</p>
       <span class="tag tag-pq">Post-Quantum</span>
     </div>
     <div class="feature">
       <div class="feature-icon">D</div>
       <h3>ML-DSA Consensus</h3>
-      <p>ML-DSA-65 (Dilithium) signatures for directory authority authentication. PQ-safe consensus verification.</p>
+      <p>ML-DSA-65 (Dilithium) signatures for directory authority authentication. PQ-safe consensus verification and relay descriptor signing.</p>
       <span class="tag tag-pq">Post-Quantum</span>
     </div>
     <div class="feature">
       <div class="feature-icon">.</div>
       <h3>Hidden Services</h3>
-      <p>.moor addresses with 6-hop end-to-end encryption. PQ-committed addresses bake Kyber768 pk hash into the address.</p>
+      <p>.moor addresses with 6-hop e2e encryption. Any TCP service: SSH, HTTP, IRC, databases. Tor-style port mapping. PQ-committed addresses bake Kyber768 hash into the address.</p>
       <span class="tag tag-privacy">Privacy</span>
     </div>
     <div class="feature">
       <div class="feature-icon">?</div>
       <h3>DPF-PIR Lookups</h3>
-      <p>Distributed Point Function private information retrieval. The relay you query cannot learn which descriptor you fetched.</p>
+      <p>Distributed Point Function private information retrieval. The relay you query cannot learn which hidden service descriptor you fetched.</p>
       <span class="tag tag-privacy">Privacy</span>
     </div>
     <div class="feature">
-      <div class="feature-icon">5</div>
+      <div class="feature-icon">6</div>
       <h3>Pluggable Transports</h3>
-      <p>ShitStorm, Mirage, Shade, Scramble, Speakeasy. Make MOOR traffic look like HTTPS, SSH, or random noise.</p>
+      <p>ShitStorm, Mirage, Shade, Scramble, Speakeasy, Nether. Make MOOR traffic look like HTTPS, SSH, Minecraft, or random noise.</p>
       <span class="tag tag-resist">Censorship Resistance</span>
     </div>
     <div class="feature">
       <div class="feature-icon">~</div>
       <h3>WTF-PAD Padding</h3>
-      <p>Adaptive padding machines (web, stream, generic). Fixed 514-byte cells. Poisson relay mixing. No size fingerprinting.</p>
+      <p>Per-circuit randomized adaptive padding. Fixed 514-byte cells. FRONT burst-cover padding. Constant-rate floor at 50 cells/sec. No fingerprinting.</p>
       <span class="tag tag-resist">Traffic Analysis</span>
     </div>
     <div class="feature">
       <div class="feature-icon">V</div>
       <h3>Vegas Congestion Control</h3>
-      <p>Per-circuit congestion control with SENDME authentication. 8 pre-built circuits. Sub-second circuit establishment.</p>
+      <p>Prop 324/329 per-circuit CC with SENDME authentication (Prop 289). EWMA circuit scheduling. 8 pre-built circuits.</p>
       <span class="tag tag-perf">Performance</span>
     </div>
     <div class="feature">
       <div class="feature-icon">N</div>
       <h3>Noise_IK Links</h3>
-      <p>1-RTT authenticated link handshake with PQ hybrid upgrade. Forward secrecy built in. ~800 lines of implementation.</p>
+      <p>1-RTT authenticated link handshake with mandatory PQ hybrid Kyber768 upgrade. Forward secrecy. No downgrade possible.</p>
       <span class="tag tag-pq">Post-Quantum</span>
     </div>
     <div class="feature">
       <div class="feature-icon">#</div>
       <h3>Argon2id PoW</h3>
-      <p>Memory-hard proof of work for DoS protection. 256KB per hash. No GPU advantage. Protects hidden services and relays.</p>
+      <p>Memory-hard proof of work. Mandatory for relay admission. 256KB per hash. Epoch-bound salt prevents precomputation. Protects HS intro points.</p>
       <span class="tag tag-resist">DoS Protection</span>
+    </div>
+    <div class="feature">
+      <div class="feature-icon">&#9670;</div>
+      <h3>Vanguards</h3>
+      <p>L2 vanguards rotate every 24h, L3 every 1h. Prevents guard discovery attacks on hidden services. Prop 271 guard pinning above 20 relays.</p>
+      <span class="tag tag-privacy">Privacy</span>
+    </div>
+    <div class="feature">
+      <div class="feature-icon">&#8721;</div>
+      <h3>Conflux Multi-Path</h3>
+      <p>Aggregate bandwidth across multiple circuit legs. EWMA-weighted scheduling. Latency-aware path selection.</p>
+      <span class="tag tag-perf">Performance</span>
+    </div>
+    <div class="feature">
+      <div class="feature-icon">&#9635;</div>
+      <h3>seccomp-bpf Sandbox</h3>
+      <p>Linux syscall filtering. no_new_privs enforced. Relay and client processes drop privileges after startup. Defense in depth.</p>
+      <span class="tag tag-sec">Security</span>
+    </div>
+    <div class="feature">
+      <div class="feature-icon">&#8623;</div>
+      <h3>Path Bias Detection</h3>
+      <p>Statistical analysis of guard circuit success rates. Detects compromised guards that selectively fail circuits to force path changes.</p>
+      <span class="tag tag-sec">Security</span>
+    </div>
+    <div class="feature">
+      <div class="feature-icon">&#9789;</div>
+      <h3>GeoIP Path Diversity</h3>
+      <p>Country and AS-level exclusion prevents all-same-jurisdiction circuits. 370K+ IPv4 entries. Geographic diversity enforced at path selection.</p>
+      <span class="tag tag-privacy">Privacy</span>
+    </div>
+    <div class="feature">
+      <div class="feature-icon">&#8644;</div>
+      <h3>OnionBalance</h3>
+      <p>Distributed hidden service load balancing across multiple backend instances. Transparent to clients. Scale HS horizontally.</p>
+      <span class="tag tag-perf">Performance</span>
+    </div>
+    <div class="feature">
+      <div class="feature-icon">&#9783;</div>
+      <h3>TransPort + DNSPort</h3>
+      <p>Transparent proxy mode routes all system traffic through MOOR without application configuration. Encrypted DNS resolution via DNSPort.</p>
+      <span class="tag tag-privacy">Privacy</span>
     </div>
   </div>
 </section>
@@ -400,7 +446,7 @@ footer a{color:var(--fg2)}
 <section class="howitworks" id="how">
   <div class="section-tag reveal">02 // Architecture</div>
   <h2 class="section-title reveal">Three hops. Six layers.</h2>
-  <p class="section-desc reveal">Every connection traverses guard, middle, and exit relays. Each hop adds a layer of post-quantum hybrid encryption.</p>
+  <p class="section-desc reveal">Every connection traverses guard, middle, and exit relays. Each hop adds a layer of post-quantum hybrid encryption. Hidden services add 3 more hops with vanguard protection.</p>
   <div class="hop-diagram reveal">
     <div class="hop-node"><div class="icon">&#9783;</div><div class="name">Client</div><div class="desc">Your machine</div></div>
     <div><div class="hop-arrow"></div><div class="hop-label">Noise_IK+Kyber</div></div>
@@ -408,23 +454,25 @@ footer a{color:var(--fg2)}
     <div><div class="hop-arrow"></div><div class="hop-label">Encrypted</div></div>
     <div class="hop-node" style="border-color:var(--magenta)"><div class="icon">&#9673;</div><div class="name">Middle</div><div class="desc">Knows nothing</div></div>
     <div><div class="hop-arrow"></div><div class="hop-label">Encrypted</div></div>
-    <div class="hop-node" style="border-color:var(--amber)"><div class="icon">&#9674;</div><div class="name">Exit</div><div class="desc">Knows destination</div></div>
+    <div class="hop-node" style="border-color:var(--amber)"><div class="icon">&#9674;</div><div class="name">Exit / RP</div><div class="desc">Exit or rendezvous</div></div>
     <div><div class="hop-arrow"></div><div class="hop-label">Cleartext*</div></div>
-    <div class="hop-node"><div class="icon">&#8962;</div><div class="name">Destination</div><div class="desc">*unless HTTPS</div></div>
+    <div class="hop-node"><div class="icon">&#8962;</div><div class="name">Destination</div><div class="desc">*unless HS/HTTPS</div></div>
   </div>
   <div class="crypto-layers reveal">
-    <div class="crypto-layer"><h4>Link Layer</h4><p>Noise_IK + Kyber768 authenticated handshake. ChaCha20-Poly1305 AEAD. 532-byte wire frames (514 plaintext + MAC).</p></div>
-    <div class="crypto-layer"><h4>Circuit Layer</h4><p>Layered ChaCha20 onion encryption. X25519 + Kyber768 CKE per hop. Fixed 514-byte cells prevent size fingerprinting.</p></div>
-    <div class="crypto-layer"><h4>End-to-End (HS)</h4><p>Hidden service rendezvous adds 3 more hops (6 total). PQ hybrid e2e keys derived at rendezvous point.</p></div>
+    <div class="crypto-layer"><h4>Link Layer</h4><p>Noise_IK + Kyber768 mandatory PQ hybrid handshake. XChaCha20-Poly1305 AEAD. 532-byte wire frames. No downgrade path.</p></div>
+    <div class="crypto-layer"><h4>Circuit Layer</h4><p>Layered ChaCha20 onion encryption. X25519 + Kyber768 CKE per hop. Fixed 514-byte cells. BLAKE2b running digest authentication.</p></div>
+    <div class="crypto-layer"><h4>End-to-End (HS)</h4><p>Hidden service rendezvous adds 3 vanguard-protected hops (6 total). PQ hybrid e2e keys. Any TCP service: SSH, HTTP, IRC, SMTP.</p></div>
+    <div class="crypto-layer"><h4>Descriptor Layer</h4><p>Encrypted descriptors with signed revision counters. DPF-PIR private lookup. Blinded keys rotate per time period. Anti-replay protection.</p></div>
   </div>
 </section>
 
 <section class="transports" id="transports">
   <div class="section-tag reveal">03 // Pluggable Transports</div>
-  <h2 class="section-title reveal">Five ways to disappear.</h2>
+  <h2 class="section-title reveal">Six ways to disappear.</h2>
   <p class="section-desc reveal">When plain encryption isn't enough, make MOOR traffic look like something else entirely.</p>
   <div class="transport-list reveal">
     <div class="transport"><div class="name">ShitStorm</div><div class="rec">Recommended</div><p>Chrome 146 JA4 fingerprint. Elligator2 key hiding. ECH GREASE. HTTP/2 framing. Key rotation every 65K records.</p></div>
+    <div class="transport"><div class="name">Nether</div><div class="rec">New</div><p>Minecraft 1.21.4 protocol camouflage. Real handshake, login sequence, and Plugin Channel framing. DPI sees Minecraft gameplay.</p></div>
     <div class="transport"><div class="name">Mirage</div><p>TLS 1.3 framing with configurable SNI. Looks like a connection to any domain you choose.</p></div>
     <div class="transport"><div class="name">Shade</div><p>Elligator2 point obfuscation with inter-arrival time modes. Wire bytes indistinguishable from random.</p></div>
     <div class="transport"><div class="name">Scramble</div><p>ASCII HTTP prefix + ChaCha20 stream cipher. Passes casual DPI as regular web traffic.</p></div>
@@ -450,12 +498,12 @@ moor</div>
       <h3>Build from Source</h3>
       <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button>git clone https://github.com/0xdeadbeefnetwork/MOOR_PQ
 cd MOOR_PQ
-./configure
-make -j$(nproc)
-<span class="comment"># Optional: run tests + install</span>
-make check
-sudo make install</div>
-      <p style="margin-top:16px;font-size:.8rem;color:var(--fg2)">Requires: build-essential, libsodium-dev, zlib1g-dev, pkg-config</p>
+make
+sudo make install
+
+<span class="comment"># Run as SOCKS5 proxy</span>
+moor</div>
+      <p style="margin-top:16px;font-size:.8rem;color:var(--fg2)">Requires: build-essential, libsodium-dev, zlib1g-dev</p>
     </div>
   </div>
 </section>
@@ -466,9 +514,9 @@ sudo make install</div>
   <p class="section-desc reveal" style="margin:0 auto 48px">Post-quantum at every hop. No exceptions.</p>
   <div class="dl-card reveal">
     <div class="dl-version">v0.8<span>.1</span></div>
-    <div class="dl-date">April 5, 2026</div>
-    <a href="moor-0.8.1.tar.gz" class="btn btn-primary" style="width:100%">Download moor-0.8.1.tar.gz</a>
-    <div class="dl-hash"><span>SHA-256:</span> 8e95ae665cd07f062ce77f13cdcd9a355696ed421f0fc612b67315d413a251e8</div>
+    <div class="dl-date">April 11, 2026</div>
+    <a href="https://github.com/0xdeadbeefnetwork/MOOR_PQ/archive/refs/heads/main.tar.gz" class="btn btn-primary" style="width:100%">Download Source</a>
+    <div class="dl-hash"><span>git:</span> github.com/0xdeadbeefnetwork/MOOR_PQ</div>
   </div>
 </section>
 
@@ -479,23 +527,25 @@ sudo make install</div>
 </section>
 
 <footer>
-  <span>MOOR v0.8.1 &mdash; BSD 3-Clause &mdash; &copy; 2026 MOOR Contributors</span>
-  <span><a href="docs.html">Docs</a> &middot; <a href="network.html">Network</a> &middot; <a href="https://github.com/0xdeadbeefnetwork/MOOR_PQ">GitHub</a></span>
+  <span>MOOR v0.8.1 &mdash; BSD 3-Clause &mdash; &copy; 2026</span>
+  <span><a href="https://github.com/0xdeadbeefnetwork/MOOR_PQ">GitHub</a></span>
 </footer>
 
 <script>
 const lines=[
-  {text:'$ moor',cls:'cmd'},
+  {text:'$ moor --bind 0.0.0.0 -v',cls:'cmd'},
   {text:'Bootstrapped 25%: Requesting consensus',cls:'out'},
-  {text:'Bootstrapped 50%: Loaded 5 relays',cls:'out'},
-  {text:'Bootstrapped 90%: Circuit established',cls:'ok'},
+  {text:'consensus: 3 relays (2 DA sigs verified)',cls:'out'},
+  {text:'Noise_IK + Kyber768 handshake complete',cls:'hl'},
+  {text:'Bootstrapped 90%: Circuit established (3 hops)',cls:'ok'},
   {text:'Bootstrapped 100%: Done',cls:'ok'},
-  {text:'SOCKS5 proxy on 127.0.0.1:9050',cls:'hl'},
+  {text:'SOCKS5 proxy on 127.0.0.1:9050',cls:'ok'},
   {text:'',cls:''},
-  {text:'$ curl --socks5 127.0.0.1:9050 https://check.moor',cls:'cmd'},
-  {text:'IP: [exit relay]',cls:'out'},
-  {text:'Circuit: 3 hops (PQ hybrid)',cls:'ok'},
-  {text:'Crypto: X25519 + Kyber768',cls:'hl'},
+  {text:'$ proxychains ssh user@myhiddenservice.moor',cls:'cmd'},
+  {text:'[proxychains] Strict chain ... 127.0.0.1:9050',cls:'out'},
+  {text:'HS rendezvous: 6-hop PQ hybrid circuit',cls:'hl'},
+  {text:'e2e: X25519 + Kyber768 established',cls:'hl'},
+  {text:'user@hidden:~$ ',cls:'ok'},
 ];
 const term=document.getElementById('terminal');
 let li=0,ci=0;

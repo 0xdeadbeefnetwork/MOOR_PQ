@@ -81,10 +81,8 @@ void moor_circ_queue_clear(moor_circ_cell_queue_t *q);
 int  moor_circuit_queue_cell(struct moor_circuit *circ,
                              const moor_cell_t *cell, uint8_t direction);
 
-/* KIST stubs — no scheduler, direct send handles everything */
+/* KIST stubs — called from event flush paths but no-op (direct send) */
 void moor_kist_init(void);
-void moor_kist_run(void *arg);
-void moor_kist_channel_has_cells(struct moor_channel *chan);
 void moor_kist_channel_wants_writes(struct moor_channel *chan);
 void moor_kist_remove_channel(struct moor_channel *chan);
 

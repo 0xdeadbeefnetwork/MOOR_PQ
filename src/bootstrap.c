@@ -33,20 +33,12 @@ void moor_bootstrap_report(moor_boot_phase_t phase) {
     LOG_INFO("Bootstrapped %d%%: %s", pct, phase_desc(phase));
 }
 
-int moor_bootstrap_get_pct(void) {
-    return g_boot_pct;
-}
-
 void moor_liveness_note_activity(void) {
     g_last_activity = (uint64_t)time(NULL);
     if (!g_network_live) {
         g_network_live = 1;
         LOG_INFO("network: connectivity restored");
     }
-}
-
-int moor_liveness_is_live(void) {
-    return g_network_live;
 }
 
 void moor_liveness_check(void) {

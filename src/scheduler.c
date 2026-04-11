@@ -175,9 +175,7 @@ void moor_circ_queue_clear(moor_circ_cell_queue_t *q) {
     q->count = 0;
 }
 
-/* KIST stubs — no scheduler, direct send handles everything. */
-void moor_kist_run(void *arg) { (void)arg; }
-void moor_kist_channel_has_cells(moor_channel_t *chan) { (void)chan; }
+/* KIST stubs — called from event flush paths but no-op (direct send). */
 void moor_kist_channel_wants_writes(moor_channel_t *chan) { (void)chan; }
 void moor_kist_remove_channel(moor_channel_t *chan) { (void)chan; }
-void moor_kist_init(void) { /* no timer, no scheduler */ }
+void moor_kist_init(void) { }

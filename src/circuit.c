@@ -2780,10 +2780,6 @@ void moor_padding_enable(int enabled) {
     LOG_INFO("padding machines %s", enabled ? "enabled" : "disabled");
 }
 
-int moor_padding_is_enabled(void) {
-    return g_padding_enabled;
-}
-
 uint64_t moor_padding_next_interval(void) {
     /* Random interval between MOOR_PADDING_MIN_MS and MOOR_PADDING_MAX_MS.
      * Use rejection sampling to avoid modulo bias. */
@@ -3616,20 +3612,6 @@ int moor_lspec_decode(const uint8_t *buf, size_t buf_len,
     }
 
     return (got_addr && got_id) ? (int)off : -1;
-}
-
-/* ================================================================
- * Guard subnet (/16) and family restriction
- * ================================================================ */
-static uint16_t extract_subnet16(const char *address) {
-    int a = 0, b = 0;
-    sscanf(address, "%d.%d", &a, &b);
-    return (uint16_t)((a << 8) | b);
-}
-
-int moor_guard_same_subnet16(const moor_guard_entry_t *a,
-                              const moor_guard_entry_t *b) {
-    return extract_subnet16(a->address) == extract_subnet16(b->address);
 }
 
 /* ================================================================

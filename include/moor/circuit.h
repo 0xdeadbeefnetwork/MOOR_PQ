@@ -505,7 +505,6 @@ uint32_t moor_circuit_gen_id(void);
 
 /* Padding machines: inject CELL_PADDING on active circuits */
 void moor_padding_enable(int enabled);
-int  moor_padding_is_enabled(void);
 void moor_padding_send_all(void);    /* Called by timer: pad all active circuits */
 uint64_t moor_padding_next_interval(void); /* Random interval in ms */
 
@@ -568,10 +567,6 @@ void moor_circuit_set_isolation(moor_circuit_t *circ, const char *key);
 void moor_ewma_update(moor_circuit_t *circ, uint64_t now_ms);
 double moor_ewma_score(const moor_circuit_t *circ, uint64_t now_ms);
 #define MOOR_EWMA_HALFLIFE_MS  10000  /* 10 second half-life */
-
-/* Guard subnet/family restriction */
-int moor_guard_same_subnet16(const moor_guard_entry_t *a,
-                              const moor_guard_entry_t *b);
 
 /* DoS cell rate limiting (Prop 305) */
 int moor_dos_cell_check_circuit(moor_circuit_t *circ);

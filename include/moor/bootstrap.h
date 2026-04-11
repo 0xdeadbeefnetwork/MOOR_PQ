@@ -21,12 +21,8 @@ typedef enum {
  * Prints "Bootstrapped N%: <description>" to stderr like Tor. */
 void moor_bootstrap_report(moor_boot_phase_t phase);
 
-/* Get current bootstrap percentage */
-int moor_bootstrap_get_pct(void);
-
 /* Network liveness tracking */
 void moor_liveness_note_activity(void);   /* Cell received or handshake done */
-int  moor_liveness_is_live(void);         /* 1 if network alive, 0 if dead */
 void moor_liveness_check(void);           /* Called periodically (10s timer) */
 
 /* Liveness timeout: consider network dead after this many seconds of silence */
