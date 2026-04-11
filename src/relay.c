@@ -2265,7 +2265,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                                        MOOR_SENDME_AUTH_MAX;
                         if (sodium_memcmp(relay.data,
                                           circ->sendme_auth_expected[tail],
-                                          8) != 0) {
+                                          MOOR_SENDME_AUTH_LEN) != 0) {
                             LOG_WARN("SENDME: auth digest mismatch on circuit %u",
                                      circ->circuit_id);
                             return -1;
