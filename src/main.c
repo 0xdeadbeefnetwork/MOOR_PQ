@@ -758,14 +758,14 @@ static void relay_periodic_cb(void *arg) {
         if (!g_is_bridge)
             moor_relay_register(&g_relay_cfg);
     }
-    /* Sample observed bandwidth before re-registration so the descriptor
-     * advertises min(configured, observed) — Tor-aligned. */
+    /* Sample observed bandwidth for stats reporting, but do NOT let it
+     * override the self-test capacity.  The old code did:
+     *   if (observed < bandwidth) bandwidth = observed;
+     * This caused a death spiral: idle relay → low observed → low
+     * advertised → less traffic → observed stays low forever.
+     * The self-test already measures actual capacity with 0.7x derating.
+     * Observed BW is tracked for monitoring only. */
     moor_monitor_sample_observed_bw();
-    moor_stats_t *stats = moor_monitor_stats();
-    if (stats->observed_bw > 0 && stats->observed_bw < g_relay_cfg.bandwidth) {
-        g_relay_cfg.bandwidth = stats->observed_bw;
-        g_bandwidth = stats->observed_bw;
-    }
     moor_relay_periodic();
 }
 

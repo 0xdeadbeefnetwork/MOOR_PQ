@@ -2991,14 +2991,25 @@ const moor_guard_entry_t *moor_guard_select(const moor_guard_state_t *state) {
             return &state->sampled[idx];
     }
 
-    /* No reachable primary: return first primary anyway (will be tried) */
+    /* No reachable primary: try ANY reachable sampled guard.
+     * Without this, the client retries the same dead primary with
+     * exponential backoff and never recovers until it comes back. */
+    for (int i = 0; i < state->num_sampled; i++) {
+        if (state->sampled[i].is_reachable)
+            return &state->sampled[i];
+    }
+
+    /* Nothing reachable at all: rotate through primaries round-robin
+     * so we at least try different ones instead of hammering the first */
     if (state->num_primary > 0) {
-        int idx = state->primary_indices[0];
+        static int rr_idx = 0;
+        int idx = state->primary_indices[rr_idx % state->num_primary];
+        rr_idx++;
         if (idx >= 0 && idx < state->num_sampled)
             return &state->sampled[idx];
     }
 
-    /* Fallback: first sampled */
+    /* Last resort: first sampled */
     if (state->num_sampled > 0)
         return &state->sampled[0];
 
@@ -3791,11 +3802,17 @@ static void cbuild_finish(moor_circuit_t *circ, int status) {
         if (conn) {
             if (conn->circuit_refcount > 0)
                 conn->circuit_refcount--;
-            /* Only close if no other circuits share this connection */
-            if (conn->circuit_refcount <= 0 &&
-                conn->state == CONN_STATE_OPEN) {
-                moor_event_remove(conn->fd);
-                moor_connection_close(conn);
+            /* Close if no other circuits share this connection.
+             * Check CONN_STATE_OPEN (live) OR CONN_STATE_NONE (async
+             * connect failed — fd already closed but conn leaks in pool
+             * if we don't free it here). */
+            if (conn->circuit_refcount <= 0) {
+                if (conn->state == CONN_STATE_OPEN) {
+                    moor_event_remove(conn->fd);
+                    moor_connection_close(conn);
+                } else if (conn->state == CONN_STATE_NONE) {
+                    moor_connection_free(conn);
+                }
             }
         }
         circ->conn = NULL;
