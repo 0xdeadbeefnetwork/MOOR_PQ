@@ -214,10 +214,10 @@ static int scramble_client_handshake(int fd, const void *params,
     moor_elligator2_representative_to_key(server_eph_pk, server_eph_repr);
 
     /* Read remaining data with short timeout — server sends 96-544 bytes,
-     * we don't know the exact length. Use 500ms timeout so we collect
+     * we don't know the exact length. Use 2s timeout so we collect
      * whatever was sent without blocking forever. */
     {
-        struct timeval tv = { 0, 500000 }; /* 500ms */
+        struct timeval tv = { 2, 0 };
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     }
     while (resp_total < 544) {
@@ -353,9 +353,10 @@ static int scramble_server_handshake(int fd, const void *params,
 
     /* Read ALL remaining client data with short timeout, then constant-time
      * scan for HMAC. Timeout ensures we don't block forever if client sent
-     * less than 544 bytes. Prevents timing oracle on padding length. */
+     * less than 544 bytes. Prevents timing oracle on padding length.
+     * 2s timeout: must survive high-latency paths (Tor-over-Tor, satellite). */
     {
-        struct timeval tv = { 0, 500000 };
+        struct timeval tv = { 2, 0 };
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     }
     while (client_total < 544) {

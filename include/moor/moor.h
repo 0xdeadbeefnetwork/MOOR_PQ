@@ -193,6 +193,7 @@ typedef enum {
 #include "transport_mirage.h"
 #include "transport_shitstorm.h"
 #include "transport_speakeasy.h"
+#include "transport_nether.h"
 #include "dht.h"
 #include "mix.h"
 

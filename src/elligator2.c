@@ -343,7 +343,13 @@ void moor_elligator2_representative_to_key(uint8_t pk[32],
     fe r, r2, ur2, denom, inv_d, v, v2, v3, Av2, rhs, leg;
     fe neg_A, neg_v_minus_A, result;
 
-    fe_frombytes(r, representative);
+    /* Clear the two high bits that keygen randomized for uniformity.
+     * The representative is a 254-bit field element; bits 254-255 are
+     * padding and must be zero for correct inverse mapping. */
+    uint8_t repr_clean[32];
+    memcpy(repr_clean, representative, 32);
+    repr_clean[31] &= 0x3f;
+    fe_frombytes(r, repr_clean);
     fe_sq(r2, r);
     fe_mul(ur2, FE_TWO, r2);
     fe_add(denom, FE_ONE, ur2);
