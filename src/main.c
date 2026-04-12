@@ -2108,18 +2108,12 @@ static void hs_rp_read_cb(int fd, int events, void *arg) {
                 }
             }
             if (map && map->fd >= 0) {
-                /* Write all data, handling short writes + EAGAIN */
-                size_t total_sent = 0;
-                while (total_sent < relay.data_length) {
-                    ssize_t sent = send(map->fd,
-                                        (const char *)relay.data + total_sent,
-                                        relay.data_length - total_sent,
-                                        MSG_NOSIGNAL);
-                    if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-                        continue; /* retry non-blocking */
-                    if (sent <= 0) break;
-                    total_sent += sent;
-                }
+                size_t total_sent;
+                int fwd = moor_stream_forward_to_target(
+                    map->fd, relay.data, relay.data_length, &total_sent);
+                if (fwd == STREAM_FWD_ERROR)
+                    LOG_WARN("HS: send to local service failed for stream %u",
+                             relay.stream_id);
                 LOG_DEBUG("HS: forwarded %zu/%u bytes to local service fd=%d stream=%u",
                           total_sent, relay.data_length, map->fd, relay.stream_id);
 

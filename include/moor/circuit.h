@@ -106,9 +106,6 @@ typedef struct moor_circuit {
     int64_t  bdp;                  /* bandwidth-delay product (cells) */
     int32_t  cwnd_full;            /* 1 if inflight reached cwnd since last SENDME */
     uint32_t sendme_ack_count;     /* total circuit-level SENDMEs received */
-    /* EWMA scheduling weight */
-    double   ewma_cell_count;
-    uint64_t ewma_last_update;
     /* Fragment reassembly state */
     moor_reassembly_state_t reassembly;
     /* PQ circuit-level crypto: per-hop Kyber state */
@@ -120,7 +117,6 @@ typedef struct moor_circuit {
     int      pq_kem_pending;            /* 1 = waiting for CELL_KEM_CT to complete CREATE_PQ */
     struct moor_conflux_set *conflux;   /* Multi-path set (NULL if unused) */
     /* Advanced padding state */
-    uint64_t last_real_cell_time;       /* Timestamp of last real cell */
     int      padding_mode;              /* Bitmask: constant|adaptive|jitter */
     /* WTF-PAD adaptive padding state machine */
     wfpad_circuit_state_t wfpad_state;
@@ -562,11 +558,6 @@ uint8_t moor_bootstrap_pct(const moor_bootstrap_state_t *bs);
 int moor_circuit_preemptive_count(void);
 /* Tag a circuit with an isolation key */
 void moor_circuit_set_isolation(moor_circuit_t *circ, const char *key);
-
-/* EWMA scheduling */
-void moor_ewma_update(moor_circuit_t *circ, uint64_t now_ms);
-double moor_ewma_score(const moor_circuit_t *circ, uint64_t now_ms);
-#define MOOR_EWMA_HALFLIFE_MS  10000  /* 10 second half-life */
 
 /* DoS cell rate limiting (Prop 305) */
 int moor_dos_cell_check_circuit(moor_circuit_t *circ);

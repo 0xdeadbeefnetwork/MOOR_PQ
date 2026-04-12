@@ -151,6 +151,14 @@ moor_connection_t *moor_connection_find_by_identity(const uint8_t peer_id[32]);
 ssize_t moor_connection_send_raw(moor_connection_t *conn,
                                  const uint8_t *data, size_t len);
 
+/* Encrypt a cell into a wire frame (2-byte len + ciphertext) without sending.
+ * Used by SKIPS scheduler for batched writes via channel outbuf.
+ * Returns wire frame length (2 + MOOR_CELL_SIZE + MOOR_MAC_LEN) or -1 on error.
+ * Caller must provide wire[] of at least MOOR_CELL_WIRE_SIZE bytes. */
+int moor_connection_encrypt_cell(moor_connection_t *conn,
+                                 const moor_cell_t *cell,
+                                 uint8_t *wire, size_t *wire_len);
+
 /* Post-quantum hybrid handshake is always enabled (Kyber768 + Noise_IK) */
 
 /* Create a TCP listen socket */

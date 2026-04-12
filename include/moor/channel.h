@@ -101,11 +101,12 @@ typedef struct moor_channel {
     size_t            outbuf_cap;       /* allocated capacity */
     size_t            outbuf_flushed;   /* bytes sent to kernel (partial write tracking) */
 
-    /* KIST kernel socket info (refreshed each scheduler tick) */
+    /* KIST/SKIPS kernel socket info (refreshed each scheduler tick) */
     uint32_t          kist_cwnd;
     uint32_t          kist_unacked;
     uint32_t          kist_mss;
     uint32_t          kist_notsent;
+    uint32_t          kist_rtt_us;      /* kernel-measured RTT (microseconds) */
     uint64_t          kist_limit;       /* max bytes writable this tick */
     uint64_t          kist_written;     /* bytes written this tick */
 } moor_channel_t;

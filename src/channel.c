@@ -574,6 +574,48 @@ int moor_circuitmux_total_queued(const moor_channel_t *chan) {
     return total;
 }
 
+int moor_channel_outbuf_append(moor_channel_t *chan, const uint8_t *wire,
+                               size_t len) {
+    if (!chan || !wire || len == 0) return -1;
+    size_t needed = chan->outbuf_len + len;
+    if (needed > chan->outbuf_cap) {
+        size_t new_cap = chan->outbuf_cap ? chan->outbuf_cap * 2 : 4096;
+        while (new_cap < needed) new_cap *= 2;
+        uint8_t *p = realloc(chan->outbuf, new_cap);
+        if (!p) return -1;
+        chan->outbuf = p;
+        chan->outbuf_cap = new_cap;
+    }
+    memcpy(chan->outbuf + chan->outbuf_len, wire, len);
+    chan->outbuf_len += len;
+    return 0;
+}
+
+int moor_channel_outbuf_flush(moor_channel_t *chan) {
+    if (!chan || !chan->conn || chan->outbuf_len == 0) return 0;
+    if (chan->conn->state != CONN_STATE_OPEN) return -1;
+
+    while (chan->outbuf_flushed < chan->outbuf_len) {
+        size_t remaining = chan->outbuf_len - chan->outbuf_flushed;
+        ssize_t n = moor_connection_send_raw(chan->conn,
+                        chan->outbuf + chan->outbuf_flushed, remaining);
+        if (n > 0) {
+            chan->outbuf_flushed += (size_t)n;
+        } else if (n == 0 || (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))) {
+            /* Socket full — will finish on next writable event */
+            moor_event_modify(chan->conn->fd,
+                              MOOR_EVENT_READ | MOOR_EVENT_WRITE);
+            return 0;
+        } else {
+            return -1;
+        }
+    }
+    /* Fully flushed — reset */
+    chan->outbuf_len = 0;
+    chan->outbuf_flushed = 0;
+    return 0;
+}
+
 void moor_channel_outbuf_clear(moor_channel_t *chan) {
     if (!chan) return;
     free(chan->outbuf);

@@ -75,15 +75,37 @@ typedef struct {
 
 void moor_circ_queue_init(moor_circ_cell_queue_t *q);
 void moor_circ_queue_clear(moor_circ_cell_queue_t *q);
+int  moor_circ_queue_push(moor_circ_cell_queue_t *q, const moor_cell_t *cell);
+int  moor_circ_queue_pop(moor_circ_cell_queue_t *q, moor_cell_t *out);
 
-/* Send a cell on a circuit's connection (direct send, no scheduler).
- * direction: 0=toward n_chan, 1=toward p_chan. */
+/* Send a cell on a circuit's per-circuit queue.
+ * direction: 0=toward n_chan, 1=toward p_chan.
+ * Cells are queued then flushed; SKIPS scheduler will replace
+ * the immediate flush with timer-based scheduling. */
 int  moor_circuit_queue_cell(struct moor_circuit *circ,
                              const moor_cell_t *cell, uint8_t direction);
 
-/* KIST stubs — called from event flush paths but no-op (direct send) */
-void moor_kist_init(void);
-void moor_kist_channel_wants_writes(struct moor_channel *chan);
-void moor_kist_remove_channel(struct moor_channel *chan);
+/* ---- SKIPS Scheduler (Sick Kernel Informed Packet Scheduler) ---- */
+
+/* Initialize SKIPS: set up periodic timer, allocate pending list */
+void moor_skips_init(void);
+
+/* Notify scheduler: channel has cells ready to send.
+ * Called from moor_circuit_queue_cell() and write-ready callbacks. */
+void moor_skips_channel_has_cells(struct moor_channel *chan);
+
+/* Remove channel from scheduler (channel closing) */
+void moor_skips_remove_channel(struct moor_channel *chan);
+
+/* Run one scheduling tick (called from timer or direct). */
+void moor_skips_run(void);
+
+/* Query scheduler state */
+int moor_skips_pending_count(void);
+
+/* Backward-compat aliases for existing call sites */
+#define moor_kist_init              moor_skips_init
+#define moor_kist_channel_wants_writes  moor_skips_channel_has_cells
+#define moor_kist_remove_channel    moor_skips_remove_channel
 
 #endif /* MOOR_SCHEDULER_H */

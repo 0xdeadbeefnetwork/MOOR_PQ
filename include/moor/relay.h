@@ -99,6 +99,15 @@ int moor_relay_self_test(const moor_relay_config_t *config);
 /* Store a consensus for address resolution (microdescriptor EXTEND) */
 void moor_relay_set_consensus(const moor_consensus_t *cons);
 
+/* Stream data forwarding: write to target FD with short-write handling.
+ * Returns STREAM_FWD_OK (0), STREAM_FWD_EAGAIN (1), or STREAM_FWD_ERROR (-1).
+ * *bytes_written is set to the number of bytes actually sent. */
+#define STREAM_FWD_OK       0
+#define STREAM_FWD_EAGAIN   1
+#define STREAM_FWD_ERROR   (-1)
+int moor_stream_forward_to_target(int target_fd, const uint8_t *data,
+                                  uint16_t data_length, size_t *bytes_written);
+
 /* Invalidate all RP cookie entries pointing to this circuit (dangling pointer fix) */
 void moor_relay_invalidate_rp_cookies(const moor_circuit_t *circ);
 

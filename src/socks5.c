@@ -522,7 +522,7 @@ static void hs_rp_read_cb(int fd, int events, void *arg) {
                         size_t ct_off = 0;
                         while (ct_off < 1088) {
                             size_t chunk = 1088 - ct_off;
-                            if (chunk > 498) chunk = 498; /* MOOR_RELAY_DATA */
+                            if (chunk > MOOR_RELAY_DATA) chunk = MOOR_RELAY_DATA;
                             moor_cell_t kcell;
                             moor_cell_relay(&kcell,
                                 pending->rp_circ->circuit_id,
@@ -1015,20 +1015,12 @@ static int process_circuit_cell(moor_connection_t *conn, moor_cell_t *cell) {
         moor_socks5_client_t *client =
             find_client_by_stream(primary, relay.stream_id);
         if (client && client->client_fd >= 0) {
-            /* Write all data, handling short writes */
-            size_t total_sent = 0;
-            int send_err = 0;
-            while (total_sent < relay.data_length) {
-                ssize_t n = send(client->client_fd,
-                                 (char *)relay.data + total_sent,
-                                 relay.data_length - total_sent,
-                                 MSG_NOSIGNAL);
-                if (n <= 0) { send_err = 1; break; }
-                total_sent += n;
-            }
-            if (send_err) {
+            size_t written;
+            int fwd = moor_stream_forward_to_target(
+                client->client_fd, relay.data, relay.data_length, &written);
+            if (fwd != STREAM_FWD_OK) {
                 LOG_WARN("stream %u: send to browser failed (%zu/%u sent), closing",
-                         relay.stream_id, total_sent, relay.data_length);
+                         relay.stream_id, written, relay.data_length);
                 moor_event_remove(client->client_fd);
                 close(client->client_fd);
                 client->client_fd = -1;
@@ -1165,15 +1157,21 @@ static void circuit_read_cb(int fd, int events, void *arg) {
         }
 
         /* Resume any SOCKS5 clients that were paused due to backpressure */
-        if (moor_queue_count(&conn->outq) < (256)) {
-            for (int ci = 0; ci < MAX_SOCKS5_CLIENTS; ci++) {
-                moor_socks5_client_t *sc = &g_socks5_clients[ci];
-                if (sc->client_fd < 0) continue;
-                if (sc->paused && sc->circuit && sc->circuit->conn == conn) {
-                    sc->paused = 0;
-                    moor_event_add(sc->client_fd, MOOR_EVENT_READ,
-                                   socks_client_read_cb, NULL);
-                    LOG_DEBUG("backpressure: resumed client fd=%d", sc->client_fd);
+        {
+            moor_channel_t *bp_chan = moor_channel_find_by_conn(conn);
+            int total_q = moor_queue_count(&conn->outq) +
+                          moor_circuitmux_total_queued(bp_chan);
+            if (total_q < MOOR_BACKPRESSURE_RESUME) {
+                for (int ci = 0; ci < MAX_SOCKS5_CLIENTS; ci++) {
+                    moor_socks5_client_t *sc = &g_socks5_clients[ci];
+                    if (sc->client_fd < 0) continue;
+                    if (sc->paused && sc->circuit && sc->circuit->conn == conn) {
+                        sc->paused = 0;
+                        moor_event_add(sc->client_fd, MOOR_EVENT_READ,
+                                       socks_client_read_cb, NULL);
+                        LOG_DEBUG("backpressure: resumed client fd=%d (q=%d)",
+                                  sc->client_fd, total_q);
+                    }
                 }
             }
         }
@@ -1795,10 +1793,12 @@ int moor_socks5_handle_client(moor_socks5_client_t *client) {
          client->state == SOCKS5_STATE_STREAMING) &&
         client->circuit && client->circuit->conn &&
         client->circuit->conn->state == CONN_STATE_OPEN &&
-        moor_queue_count(&client->circuit->conn->outq) >
-            (384)) {
-        LOG_WARN("BACKPRESSURE: outq=%d, pausing client fd=%d",
+        (moor_queue_count(&client->circuit->conn->outq) +
+         moor_circuitmux_total_queued(client->circuit->chan)) >
+            MOOR_BACKPRESSURE_PAUSE) {
+        LOG_WARN("BACKPRESSURE: outq=%d circ_q=%d, pausing client fd=%d",
                   moor_queue_count(&client->circuit->conn->outq),
+                  moor_circuitmux_total_queued(client->circuit->chan),
                   client->client_fd);
         moor_event_remove(client->client_fd);
         client->paused = 1;
@@ -1860,11 +1860,13 @@ int moor_socks5_forward_to_circuit(moor_socks5_client_t *client,
      * The queue flush callback re-enables reading when space opens up. */
     if (client->circuit->conn &&
         client->circuit->conn->state == CONN_STATE_OPEN &&
-        moor_queue_count(&client->circuit->conn->outq) >
-        (384)) {
-        LOG_DEBUG("backpressure: output queue %d/%d, pausing client fd=%d",
+        (moor_queue_count(&client->circuit->conn->outq) +
+         moor_circuitmux_total_queued(client->circuit->chan)) >
+        MOOR_BACKPRESSURE_PAUSE) {
+        LOG_DEBUG("backpressure: outq=%d circ_q=%d, pausing client fd=%d",
                   moor_queue_count(&client->circuit->conn->outq),
-                  384, client->client_fd);
+                  moor_circuitmux_total_queued(client->circuit->chan),
+                  client->client_fd);
         moor_event_remove(client->client_fd);
         client->paused = 1;
         return 0; /* data already in kernel buffer, will be read when resumed */

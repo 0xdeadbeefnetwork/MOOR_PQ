@@ -23,30 +23,58 @@
 #include <strings.h>
 #endif
 
+/* ---- Shared stream data forwarding ---- */
+int moor_stream_forward_to_target(int target_fd, const uint8_t *data,
+                                  uint16_t data_length, size_t *bytes_written) {
+    size_t total = 0;
+    while (total < data_length) {
+        ssize_t sent = send(target_fd, (const char *)data + total,
+                            data_length - total, MSG_NOSIGNAL);
+        if (sent < 0) {
+#ifdef _WIN32
+            int werr = WSAGetLastError();
+            if (werr == WSAEWOULDBLOCK) {
+#else
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+#endif
+                *bytes_written = total;
+                return STREAM_FWD_EAGAIN;
+            }
+            *bytes_written = total;
+            return STREAM_FWD_ERROR;
+        }
+        if (sent == 0) break;
+        total += (size_t)sent;
+    }
+    *bytes_written = total;
+    return STREAM_FWD_OK;
+}
+
+/* IPv4 private/reserved network masks (host byte order, pre-shifted) */
+#define IPV4_LOOPBACK_8     127             /* 127.0.0.0/8 */
+#define IPV4_RFC1918_10_8   10              /* 10.0.0.0/8 */
+#define IPV4_RFC1918_172_12 ((172 << 4) | 1)  /* 172.16.0.0/12 */
+#define IPV4_RFC1918_192_16 ((192 << 8) | 168) /* 192.168.0.0/16 */
+#define IPV4_LINKLOCAL_16   ((169 << 8) | 254) /* 169.254.0.0/16 */
+#define IPV4_CGNAT_10       ((100 << 2) | 1)   /* 100.64.0.0/10 */
+#define IPV4_MULTICAST_4    14              /* 224.0.0.0/4 */
+#define IPV4_RESERVED_4     15              /* 240.0.0.0/4 */
+
 /* Reject private/reserved/loopback addresses to prevent SSRF via EXTEND.
  * Returns 1 if the address is forbidden, 0 if public. */
 static int is_private_address(const char *addr) {
     struct in_addr in;
     if (inet_pton(AF_INET, addr, &in) == 1) {
         uint32_t ip = ntohl(in.s_addr);
-        /* 127.0.0.0/8   -- loopback */
-        if ((ip >> 24) == 127) return 1;
-        /* 10.0.0.0/8    -- RFC 1918 */
-        if ((ip >> 24) == 10) return 1;
-        /* 172.16.0.0/12 -- RFC 1918 */
-        if ((ip >> 20) == (172 << 4 | 1)) return 1;
-        /* 192.168.0.0/16 -- RFC 1918 */
-        if ((ip >> 16) == (192 << 8 | 168)) return 1;
-        /* 169.254.0.0/16 -- link-local */
-        if ((ip >> 16) == (169 << 8 | 254)) return 1;
-        /* 0.0.0.0/8 -- "this" network */
-        if ((ip >> 24) == 0) return 1;
-        /* 100.64.0.0/10 -- carrier-grade NAT */
-        if ((ip >> 22) == (100 << 2 | 1)) return 1;
-        /* 224.0.0.0/4 -- multicast */
-        if ((ip >> 28) == 14) return 1;
-        /* 240.0.0.0/4 -- reserved */
-        if ((ip >> 28) == 15) return 1;
+        if ((ip >> 24) == IPV4_LOOPBACK_8) return 1;
+        if ((ip >> 24) == IPV4_RFC1918_10_8) return 1;
+        if ((ip >> 20) == IPV4_RFC1918_172_12) return 1;
+        if ((ip >> 16) == IPV4_RFC1918_192_16) return 1;
+        if ((ip >> 16) == IPV4_LINKLOCAL_16) return 1;
+        if ((ip >> 24) == 0) return 1;  /* 0.0.0.0/8 "this" network */
+        if ((ip >> 22) == IPV4_CGNAT_10) return 1;
+        if ((ip >> 28) == IPV4_MULTICAST_4) return 1;
+        if ((ip >> 28) == IPV4_RESERVED_4) return 1;
     }
     struct in6_addr in6;
     if (inet_pton(AF_INET6, addr, &in6) == 1) {
@@ -160,7 +188,7 @@ static int g_extend_head = 0, g_extend_tail = 0, g_extend_count = 0;
 static volatile int g_extend_threads = 0; /* active worker threads */
 static pthread_mutex_t g_extend_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int g_extend_pipe[2] = {-1, -1};
-static int g_extend_pq_inflight = 0; /* concurrency cap for EXTEND_PQ (#R1-B3) */
+static volatile int g_extend_pq_inflight = 0; /* concurrency cap for EXTEND_PQ (#R1-B3) */
 
 static void extend_push_result(extend_work_t *w) {
     pthread_mutex_lock(&g_extend_mutex);
@@ -246,7 +274,7 @@ static void *extend_worker_func(void *arg) {
     int expected_cmd = w->pq ? CELL_CREATED_PQ : CELL_CREATED;
     moor_cell_t resp;
     int ret;
-    uint64_t deadline = (uint64_t)time(NULL) + 30;
+    uint64_t deadline = (uint64_t)time(NULL) + MOOR_HANDSHAKE_TIMEOUT;
     for (;;) {
         ret = moor_connection_recv_cell(conn, &resp);
         if (ret > 0) {
@@ -2043,63 +2071,50 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                     goto sendme_check;
                 }
 
-                /* Write all data, handling short writes */
-                size_t total_sent = 0;
-                while (total_sent < relay.data_length) {
-                    ssize_t sent = send(stream->target_fd,
-                                        (char *)relay.data + total_sent,
-                                        relay.data_length - total_sent,
-                                        MSG_NOSIGNAL);
-                    if (sent < 0) {
-#ifdef _WIN32
-                        int werr = WSAGetLastError();
-                        if (werr == WSAEWOULDBLOCK) {
-#else
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-#endif
-                            /* TCP buffer full: send XOFF to tell client to pause */
-                            if (!stream->xoff_sent && circ->prev_conn) {
-                                moor_cell_t xoff;
-                                moor_cell_relay(&xoff, circ->prev_circuit_id,
-                                               RELAY_XOFF, relay.stream_id, NULL, 0);
-                                moor_relay_set_digest(xoff.payload,
-                                                      circ->relay_backward_digest);
-                                moor_circuit_relay_encrypt(circ, &xoff);
-                                if (moor_circuit_queue_cell(circ, &xoff, 1) == 0)
-                                    stream->xoff_sent = 1;
-                                LOG_DEBUG("exit: sent XOFF for stream %u (TCP buffer full)",
-                                          relay.stream_id);
-                            }
-                            /* MUST NOT return here — deliver_window must still be
-                             * decremented to keep SENDME auth digest in sync.
-                             * Data is lost but protocol state stays consistent. */
-                            break;
-                        }
-                        LOG_WARN("exit send failed for stream %u -- closing",
-                                 relay.stream_id);
-                        /* Send RELAY_END back to client */
-                        if (circ->prev_conn) {
-                            moor_cell_t end_cell;
-                            moor_cell_relay(&end_cell, circ->prev_circuit_id, RELAY_END,
-                                           relay.stream_id, NULL, 0);
-                            moor_relay_set_digest(end_cell.payload,
-                                                  circ->relay_backward_digest);
-                            moor_circuit_relay_encrypt(circ, &end_cell);
-                            if (moor_circuit_queue_cell(circ, &end_cell, 1) != 0)
-                                LOG_DEBUG("send_cell failed (line %d)", __LINE__);
-                        }
-                        moor_event_remove(stream->target_fd);
-                        exit_fd_remove(stream->target_fd);
-                        close(stream->target_fd);
-                        stream->target_fd = -1;
-                        stream->stream_id = 0;
-                        return 0;
+                /* Forward data to target, handling short writes */
+                size_t total_sent;
+                int fwd = moor_stream_forward_to_target(
+                    stream->target_fd, relay.data, relay.data_length,
+                    &total_sent);
+
+                if (fwd == STREAM_FWD_ERROR) {
+                    LOG_WARN("exit send failed for stream %u -- closing",
+                             relay.stream_id);
+                    /* Send RELAY_END back to client */
+                    if (circ->prev_conn) {
+                        moor_cell_t end_cell;
+                        moor_cell_relay(&end_cell, circ->prev_circuit_id, RELAY_END,
+                                       relay.stream_id, NULL, 0);
+                        moor_relay_set_digest(end_cell.payload,
+                                              circ->relay_backward_digest);
+                        moor_circuit_relay_encrypt(circ, &end_cell);
+                        if (moor_circuit_queue_cell(circ, &end_cell, 1) != 0)
+                            LOG_DEBUG("send_cell failed (line %d)", __LINE__);
                     }
-                    if (sent == 0) break;
-                    total_sent += sent;
+                    moor_event_remove(stream->target_fd);
+                    exit_fd_remove(stream->target_fd);
+                    close(stream->target_fd);
+                    stream->target_fd = -1;
+                    stream->stream_id = 0;
+                    return 0;
+                }
+                if (fwd == STREAM_FWD_EAGAIN) {
+                    /* TCP buffer full: send XOFF to tell client to pause */
+                    if (!stream->xoff_sent && circ->prev_conn) {
+                        moor_cell_t xoff;
+                        moor_cell_relay(&xoff, circ->prev_circuit_id,
+                                       RELAY_XOFF, relay.stream_id, NULL, 0);
+                        moor_relay_set_digest(xoff.payload,
+                                              circ->relay_backward_digest);
+                        moor_circuit_relay_encrypt(circ, &xoff);
+                        if (moor_circuit_queue_cell(circ, &xoff, 1) == 0)
+                            stream->xoff_sent = 1;
+                        LOG_DEBUG("exit: sent XOFF for stream %u (TCP buffer full)",
+                                  relay.stream_id);
+                    }
                 }
                 if (total_sent == 0) {
-                    /* TCP send failed, but still count toward deliver window
+                    /* No data sent, but still count toward deliver window
                      * to keep SENDME auth digest in sync with client */
                     circ->circ_deliver_window--;
                     stream->deliver_window--;
@@ -2359,6 +2374,21 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                 }
                 LOG_INFO("ESTABLISH_INTRO: verified, blinded_pk=%02x%02x...",
                          relay.data[0], relay.data[1]);
+
+                /* Send RELAY_INTRO_ESTABLISHED acknowledgement back to HS.
+                 * Without this, the HS can't know the relay has registered
+                 * the intro point — it would publish the descriptor before
+                 * the relay is ready, causing INTRODUCE1 to fail. */
+                {
+                    moor_cell_t ack;
+                    moor_cell_relay(&ack, circ->prev_circuit_id,
+                                   RELAY_INTRO_ESTABLISHED, 0, NULL, 0);
+                    moor_relay_set_digest(ack.payload,
+                                          circ->relay_backward_digest);
+                    moor_circuit_relay_encrypt(circ, &ack);
+                    if (moor_circuit_queue_cell(circ, &ack, 1) != 0)
+                        LOG_WARN("ESTABLISH_INTRO: failed to send ack");
+                }
                 return 0;
             }
             case RELAY_INTRODUCE1: {
@@ -2585,7 +2615,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                              inner_cmd, reassembled_len);
                     if (inner_cmd == RELAY_EXTEND_PQ) {
                         /* Concurrency cap for blocking EXTEND_PQ (#R1-B3) */
-                        if (g_extend_pq_inflight >= 4) {
+                        if (g_extend_pq_inflight >= MOOR_MAX_PQ_EXTEND_INFLIGHT) {
                             LOG_WARN("EXTEND_PQ (frag): concurrency cap reached (%d), sending DESTROY",
                                      g_extend_pq_inflight);
                             moor_cell_t destroy;
@@ -2597,12 +2627,12 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                                 LOG_DEBUG("send_cell failed (line %d)", __LINE__);
                             return -1;
                         }
-                        g_extend_pq_inflight++;
+                        __sync_fetch_and_add(&g_extend_pq_inflight, 1);
                         /* PQ EXTEND: reassembled payload contains
                          * addr(64) + port(2) + identity_pk(32) + eph_pk(32) + kyber_pk(1184) */
                         if (reassembled_len < 130) {
                             LOG_ERROR("EXTEND_PQ payload too short");
-                            g_extend_pq_inflight--;
+                            __sync_fetch_and_sub(&g_extend_pq_inflight, 1);
                             return -1;
                         }
                         char next_addr[64];
@@ -2618,7 +2648,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                         /* Reject EXTEND_PQ to private/reserved addresses (SSRF) */
                         if (is_private_address(next_addr)) {
                             LOG_WARN("EXTEND_PQ: rejecting private address");
-                            g_extend_pq_inflight--;
+                            __sync_fetch_and_sub(&g_extend_pq_inflight, 1);
                             return -1;
                         }
 
@@ -2634,7 +2664,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                                              next_identity_pk, client_eph_pk_ext);
                             create_cell.command = CELL_CREATE_PQ;
                             if (moor_connection_send_cell(n_chan_uf->conn, &create_cell) != 0) {
-                                g_extend_pq_inflight--;
+                                __sync_fetch_and_sub(&g_extend_pq_inflight, 1);
                                 return -1;
                             }
                             circ->n_chan = n_chan_uf;
@@ -2646,12 +2676,12 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                             moor_event_add(n_chan_uf->conn->fd, MOOR_EVENT_READ,
                                            relay_conn_read_cb, n_chan_uf->conn);
                             moor_circuit_register(circ);
-                            g_extend_pq_inflight--;
+                            __sync_fetch_and_sub(&g_extend_pq_inflight, 1);
                             LOG_INFO("EXTEND_PQ (unfrag): fast path to %s:%u", next_addr, next_port);
                         } else {
                             /* SLOW PATH: async worker */
                             extend_work_t *w = calloc(1, sizeof(extend_work_t));
-                            if (!w) { g_extend_pq_inflight--; return -1; }
+                            if (!w) { __sync_fetch_and_sub(&g_extend_pq_inflight, 1); return -1; }
                             memcpy(w->next_addr, next_addr, 64);
                             w->next_port = next_port;
                             memcpy(w->next_identity_pk, next_identity_pk, 32);
@@ -2669,7 +2699,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                             if (g_extend_threads >= EXTEND_MAX_THREADS) {
                                 circ->extend_pending = 0;
                                 extend_work_free(w);
-                                g_extend_pq_inflight--;
+                                __sync_fetch_and_sub(&g_extend_pq_inflight, 1);
                                 return -1;
                             }
                             __sync_fetch_and_add(&g_extend_threads, 1);
@@ -2682,11 +2712,11 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                                 __sync_fetch_and_sub(&g_extend_threads, 1);
                                 circ->extend_pending = 0;
                                 extend_work_free(w);
-                                g_extend_pq_inflight--;
+                                __sync_fetch_and_sub(&g_extend_pq_inflight, 1);
                                 return -1;
                             }
                             pthread_attr_destroy(&attr);
-                            g_extend_pq_inflight--;
+                            __sync_fetch_and_sub(&g_extend_pq_inflight, 1);
                             LOG_INFO("EXTEND_PQ (unfrag): async worker to %s:%u", next_addr, next_port);
                         }
 
@@ -2713,7 +2743,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                 }
                 circ->relay_early_count++;
                 /* Concurrency cap for blocking EXTEND_PQ (#R1-B3) */
-                if (g_extend_pq_inflight >= 4) {
+                if (g_extend_pq_inflight >= MOOR_MAX_PQ_EXTEND_INFLIGHT) {
                     LOG_WARN("EXTEND_PQ: concurrency cap reached (%d), sending DESTROY",
                              g_extend_pq_inflight);
                     moor_cell_t destroy;
@@ -2725,11 +2755,11 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                         LOG_DEBUG("send_cell failed (line %d)", __LINE__);
                     return -1;
                 }
-                g_extend_pq_inflight++;
+                __sync_fetch_and_add(&g_extend_pq_inflight, 1);
                 /* Non-fragmented PQ EXTEND (small enough to fit) */
                 if (relay.data_length < 130) {
                     LOG_ERROR("EXTEND_PQ payload too short");
-                    g_extend_pq_inflight--;
+                    __sync_fetch_and_sub(&g_extend_pq_inflight, 1);
                     return -1;
                 }
                 char next_addr[64];
@@ -2746,14 +2776,14 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                 if (sodium_memcmp(next_identity_pk_pq,
                                   g_relay_config.identity_pk, 32) == 0) {
                     LOG_WARN("EXTEND_PQ: rejecting loop to self");
-                    g_extend_pq_inflight--;
+                    __sync_fetch_and_sub(&g_extend_pq_inflight, 1);
                     return -1;
                 }
 
                 /* Reject EXTEND_PQ to private/reserved addresses (SSRF) */
                 if (is_private_address(next_addr)) {
                     LOG_WARN("EXTEND_PQ: rejecting private address");
-                    g_extend_pq_inflight--;
+                    __sync_fetch_and_sub(&g_extend_pq_inflight, 1);
                     return -1;
                 }
 
@@ -2773,7 +2803,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                     create_cell.command = CELL_CREATE_PQ;
                     if (moor_connection_send_cell(n_chan_pq->conn, &create_cell) != 0) {
                         LOG_WARN("EXTEND_PQ: send CREATE_PQ on channel failed");
-                        g_extend_pq_inflight--;
+                        __sync_fetch_and_sub(&g_extend_pq_inflight, 1);
                         return -1;
                     }
                     circ->n_chan = n_chan_pq;
@@ -2787,14 +2817,14 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                     moor_circuit_register(circ);
                     LOG_INFO("EXTEND_PQ: fast path (channel reuse) to %s:%u",
                              next_addr, next_port);
-                    g_extend_pq_inflight--;
+                    __sync_fetch_and_sub(&g_extend_pq_inflight, 1);
                     return 0;
                 }
 
                 /* SLOW PATH: async worker thread (like RELAY_EXTEND) */
                 {
                     extend_work_t *w = calloc(1, sizeof(extend_work_t));
-                    if (!w) { g_extend_pq_inflight--; return -1; }
+                    if (!w) { __sync_fetch_and_sub(&g_extend_pq_inflight, 1); return -1; }
                     memcpy(w->next_addr, next_addr, 64);
                     w->next_port = next_port;
                     memcpy(w->next_identity_pk, next_identity_pk_pq, 32);
@@ -2815,7 +2845,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                         LOG_WARN("EXTEND_PQ: thread limit (%d), rejecting", g_extend_threads);
                         circ->extend_pending = 0;
                         extend_work_free(w);
-                        g_extend_pq_inflight--;
+                        __sync_fetch_and_sub(&g_extend_pq_inflight, 1);
                         return -1;
                     }
                     __sync_fetch_and_add(&g_extend_threads, 1);
@@ -2829,13 +2859,13 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                         __sync_fetch_and_sub(&g_extend_threads, 1);
                         circ->extend_pending = 0;
                         extend_work_free(w);
-                        g_extend_pq_inflight--;
+                        __sync_fetch_and_sub(&g_extend_pq_inflight, 1);
                         return -1;
                     }
                     pthread_attr_destroy(&attr);
                     LOG_INFO("EXTEND_PQ: async worker for new connection to %s:%u",
                              next_addr, next_port);
-                    g_extend_pq_inflight--;
+                    __sync_fetch_and_sub(&g_extend_pq_inflight, 1);
                     return 0;
                 }
 
@@ -2970,9 +3000,6 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                 }
                 circ->relay_early_count++;
             }
-
-            /* Advanced padding: track real cell for adaptive burst detection */
-            circ->last_real_cell_time = (uint64_t)time(NULL);
 
             /* Fix #178: Notify WTF-PAD state machine of real cell (forward) */
             if (circ->wfpad_state.machine)

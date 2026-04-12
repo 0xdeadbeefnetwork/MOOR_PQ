@@ -1276,6 +1276,36 @@ int moor_connection_send_cell(moor_connection_t *conn,
     return 0;
 }
 
+int moor_connection_encrypt_cell(moor_connection_t *conn,
+                                 const moor_cell_t *cell,
+                                 uint8_t *wire, size_t *wire_len) {
+    if (!conn || !cell || !wire || !wire_len) return -1;
+    if (conn->state != CONN_STATE_OPEN) return -1;
+    if (conn->send_nonce == UINT64_MAX) {
+        LOG_ERROR("encrypt_cell: nonce exhausted fd=%d", conn->fd);
+        conn->state = CONN_STATE_NONE;
+        return -1;
+    }
+
+    uint8_t plain[MOOR_CELL_SIZE];
+    moor_cell_pack(plain, cell);
+
+    size_t ct_len;
+    if (moor_crypto_aead_encrypt(wire + 2, &ct_len, plain, MOOR_CELL_SIZE,
+                                  NULL, 0, conn->send_key,
+                                  conn->send_nonce) != 0) {
+        moor_crypto_wipe(plain, sizeof(plain));
+        return -1;
+    }
+    moor_crypto_wipe(plain, sizeof(plain));
+    conn->send_nonce++;
+
+    wire[0] = (uint8_t)(ct_len >> 8);
+    wire[1] = (uint8_t)(ct_len);
+    *wire_len = 2 + ct_len;
+    return 0;
+}
+
 int moor_connection_recv_cell(moor_connection_t *conn, moor_cell_t *cell) {
     MOOR_ASSERT_MSG(conn != NULL, "recv_cell: NULL conn");
     if (conn->state != CONN_STATE_OPEN) return -1;

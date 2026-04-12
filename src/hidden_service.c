@@ -613,6 +613,58 @@ int moor_hs_establish_intro(moor_hs_config_t *config,
             continue;
         }
 
+        /* Wait for RELAY_INTRO_ESTABLISHED from the intro relay.
+         * Without this, we'd publish the descriptor before the relay
+         * has registered our intro point — clients send INTRODUCE1
+         * to a relay that doesn't know about us yet. */
+        {
+            moor_cell_t resp;
+            int got_ack = 0;
+            uint64_t deadline = (uint64_t)time(NULL) + 10;
+            while ((uint64_t)time(NULL) < deadline) {
+                int ret = moor_connection_recv_cell(circ->conn, &resp);
+                if (ret > 0) {
+                    if (resp.command == CELL_PADDING) continue;
+                    if (resp.circuit_id != circ->circuit_id) {
+                        if (circ->conn->on_other_cell)
+                            circ->conn->on_other_cell(circ->conn, &resp);
+                        continue;
+                    }
+                    if (resp.command == CELL_DESTROY) {
+                        LOG_WARN("HS: DESTROY while waiting for INTRO_ESTABLISHED");
+                        break;
+                    }
+                    if (resp.command == CELL_RELAY) {
+                        if (moor_circuit_decrypt_backward(circ, &resp) == 0) {
+                            moor_relay_payload_t rp;
+                            moor_relay_unpack(&rp, resp.payload);
+                            if (rp.relay_command == RELAY_INTRO_ESTABLISHED) {
+                                got_ack = 1;
+                                LOG_INFO("HS: INTRO_ESTABLISHED received for slot %d", i);
+                            } else {
+                                LOG_WARN("HS: unexpected relay cmd %d waiting for INTRO_ESTABLISHED",
+                                         rp.relay_command);
+                            }
+                        }
+                        break;
+                    }
+                    continue;
+                }
+                if (ret < 0) break;
+                struct pollfd pfd = { circ->conn->fd, POLLIN, 0 };
+                if (poll(&pfd, 1, 5000) <= 0) break;
+            }
+            if (!got_ack) {
+                LOG_WARN("HS: INTRO_ESTABLISHED timeout for slot %d, dropping", i);
+                moor_circuit_free(circ);
+                if (conn->fd >= 0)
+                    moor_connection_close(conn);
+                else
+                    moor_connection_free(conn);
+                continue;
+            }
+        }
+
         config->intro_circuits[i] = circ;
         config->intro_established_at[i] = (uint64_t)time(NULL);
         config->intro_count[i] = 0;

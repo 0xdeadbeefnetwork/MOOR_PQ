@@ -259,6 +259,9 @@ static moor_circuit_t **g_pending_close = NULL;
 static int g_pending_close_count = 0;
 static int g_pending_close_cap = 0;
 
+/* Forward declaration: flush SKIPS-deferred cells before circuit teardown */
+static int circ_queue_flush_direct(moor_circuit_t *circ, uint8_t direction);
+
 /* ---- Dynamic circuit array helpers ---- */
 static int circ_array_add(moor_circuit_t *circ) {
     if (g_circuits_count >= g_circuits_cap) {
@@ -499,6 +502,15 @@ void moor_circuit_close_all_marked(void) {
         LOG_DEBUG("circuit %u freed (%s)",
                   circ->circuit_id,
                   destroy_reason_str(circ->marked_for_close_reason));
+
+        /* --- Phase 0: Flush any SKIPS-deferred cells before DESTROY ---
+         * Without this, cells queued in per-circuit queues (waiting for
+         * the SKIPS timer) would be destroyed along with the circuit.
+         * The DESTROY propagation below sends immediately, so it would
+         * arrive at the next hop BEFORE the queued data cells, causing
+         * the next relay to discard them.  Critical for INTRODUCE1. */
+        circ_queue_flush_direct(circ, 0); /* flush forward queue */
+        circ_queue_flush_direct(circ, 1); /* flush backward queue */
 
         /* --- Phase 1: Send DESTROY cells to peers --- */
         uint8_t destroy_reason = circ->marked_for_close_reason;
@@ -1684,20 +1696,87 @@ uint32_t moor_circuit_resolve(moor_circuit_t *circ, const char *hostname) {
     return 0;
 }
 
-/* Send a cell on a circuit's connection.
+/* Resolve the channel for a given direction on a circuit */
+static moor_channel_t *circ_get_channel(moor_circuit_t *circ, uint8_t direction) {
+    if (direction == 0)
+        return circ->n_chan ? circ->n_chan : circ->chan;
+    return circ->p_chan ? circ->p_chan : circ->chan;
+}
+
+/* Immediate flush fallback: drain per-circuit queue through connection.
+ * Used when no channel is available (e.g., during circuit build before
+ * channel assignment) or for transport-wrapped connections. */
+static int circ_queue_flush_direct(moor_circuit_t *circ, uint8_t direction) {
+    moor_circ_cell_queue_t *q = (direction == 0)
+        ? &circ->cell_queue_n : &circ->cell_queue_p;
+    moor_connection_t *conn = (direction == 0)
+        ? (circ->next_conn ? circ->next_conn : circ->conn)
+        : (circ->prev_conn ? circ->prev_conn : circ->conn);
+    if (!conn || conn->state != CONN_STATE_OPEN) return -1;
+
+    moor_channel_t *chan = circ_get_channel(circ, direction);
+    int sent = 0;
+    moor_cell_t cell;
+    while (moor_circ_queue_pop(q, &cell) == 0) {
+        if (moor_connection_send_cell(conn, &cell) != 0) {
+            moor_crypto_wipe(&cell, sizeof(cell));
+            /* Count the failed cell too — it was already popped from the
+             * queue and counted by notify_cells(+1).  Without this, the
+             * mux queued_cells counter leaks +1 per send failure, eventually
+             * triggering permanent backpressure (SSH stall). */
+            if (chan) moor_circuitmux_notify_xmit(chan, circ, sent + 1);
+            return -1;
+        }
+        moor_crypto_wipe(&cell, sizeof(cell));
+        sent++;
+    }
+    if (chan && sent > 0)
+        moor_circuitmux_notify_xmit(chan, circ, sent);
+    return 0;
+}
+
+/* Send a cell on a circuit's per-circuit queue.
  * direction: 0=toward n_chan/conn (forward), 1=toward p_chan/conn (backward).
- * Cell is relay-encrypted; link-AEAD happens in moor_connection_send_cell. */
+ * Cell is relay-encrypted; link-AEAD happens at send time.
+ *
+ * SKIPS path (relay forward only): push → notify mux → defer to scheduler.
+ * The SKIPS timer uses TCP_INFO + EWMA to decide when and which circuit
+ * to flush.  Only relay-side forward cells (n_chan set) take this path —
+ * that's where many circuits share one link and fair scheduling matters.
+ *
+ * Immediate path (everything else): client circuits, HS circuits, backward
+ * relay cells — flush directly.  These paths need low latency for circuit
+ * builds, ESTABLISH_INTRO, RENDEZVOUS, and interactive traffic. */
 int moor_circuit_queue_cell(moor_circuit_t *circ, const moor_cell_t *cell,
                             uint8_t direction) {
     if (!circ || !cell) return -1;
     if (MOOR_CIRCUIT_IS_MARKED(circ)) return -1;
 
-    moor_connection_t *conn = (direction == 0)
-        ? (circ->next_conn ? circ->next_conn : circ->conn)
-        : (circ->prev_conn ? circ->prev_conn : circ->conn);
-    if (conn && conn->state == CONN_STATE_OPEN)
-        return moor_connection_send_cell(conn, cell);
-    return -1;
+    moor_circ_cell_queue_t *q = (direction == 0)
+        ? &circ->cell_queue_n : &circ->cell_queue_p;
+    if (moor_circ_queue_push(q, cell) != 0)
+        return -1;
+
+    /* Notify circuitmux so EWMA tracking stays current */
+    moor_channel_t *chan = circ_get_channel(circ, direction);
+    if (chan)
+        moor_circuitmux_notify_cells(chan, circ, 1);
+
+    /* Relay forward path: defer to SKIPS scheduler.
+     * n_chan is only set on relay-side circuits (never client/HS).
+     * SKIPS picks the fairest circuit via EWMA, respects TCP_INFO
+     * write budgets, and adapts timing to link RTT. */
+    if (direction == 0 && circ->n_chan) {
+        moor_skips_channel_has_cells(circ->n_chan);
+        LOG_DEBUG("SKIPS: deferred circ %u cmd=%d to chan %llu (q=%u)",
+                  circ->circuit_id, cell->command,
+                  (unsigned long long)circ->n_chan->id,
+                  circ->cell_queue_n.count);
+        return 0;
+    }
+
+    /* All other paths: flush immediately */
+    return circ_queue_flush_direct(circ, direction);
 }
 
 int moor_circuit_send_data(moor_circuit_t *circ, uint16_t stream_id,
@@ -1756,9 +1835,6 @@ int moor_circuit_send_data(moor_circuit_t *circ, uint16_t stream_id,
                 circ->sendme_auth_count++;
             }
         }
-
-        /* EWMA: increment cell count for this circuit */
-        circ->ewma_cell_count += 1.0;
 
         data += chunk;
         len -= chunk;
@@ -3428,32 +3504,6 @@ void moor_bootstrap_advance(moor_bootstrap_state_t *bs, uint8_t phase) {
 
 uint8_t moor_bootstrap_pct(const moor_bootstrap_state_t *bs) {
     return bs->pct;
-}
-
-/* ================================================================
- * EWMA scheduling
- * ================================================================ */
-void moor_ewma_update(moor_circuit_t *circ, uint64_t now_ms) {
-    if (circ->ewma_last_update == 0) {
-        circ->ewma_last_update = now_ms;
-        circ->ewma_cell_count = 1.0;
-        return;
-    }
-    uint64_t elapsed = now_ms - circ->ewma_last_update;
-    if (elapsed > 0) {
-        double decay = pow(0.5, (double)elapsed / MOOR_EWMA_HALFLIFE_MS);
-        circ->ewma_cell_count = circ->ewma_cell_count * decay + 1.0;
-        circ->ewma_last_update = now_ms;
-    } else {
-        circ->ewma_cell_count += 1.0;
-    }
-}
-
-double moor_ewma_score(const moor_circuit_t *circ, uint64_t now_ms) {
-    if (circ->ewma_last_update == 0) return 0.0;
-    uint64_t elapsed = now_ms - circ->ewma_last_update;
-    double decay = pow(0.5, (double)elapsed / MOOR_EWMA_HALFLIFE_MS);
-    return circ->ewma_cell_count * decay;
 }
 
 /* ================================================================

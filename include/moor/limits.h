@@ -82,8 +82,24 @@
 #define MOOR_POW_OPSLIMIT              1       /* Argon2id ops (1 pass) */
 
 /* ===== INTERNAL -- OOM (soft threshold, never blocks allocation) ===== */
+#define MOOR_MAX_PQ_EXTEND_INFLIGHT 4   /* Max concurrent EXTEND_PQ operations */
+
+/* ===== INTERNAL -- Backpressure ===== */
+#define MOOR_BACKPRESSURE_PAUSE   384   /* Pause client reads when queue exceeds this */
+#define MOOR_BACKPRESSURE_RESUME  256   /* Resume client reads when queue drops below */
+
 #define MOOR_OOM_HIGH_WATER     8192    /* Soft: triggers idle circuit cleanup */
 #define MOOR_OOM_IDLE_SECS      60      /* OOM idle cleanup interval */
+
+/* ===== INTERNAL -- SKIPS Scheduler ===== */
+#define MOOR_SKIPS_INTERVAL_DEFAULT  2      /* ms between scheduler runs */
+#define MOOR_SKIPS_INTERVAL_MIN      1
+#define MOOR_SKIPS_INTERVAL_MAX      100
+#define MOOR_SKIPS_BURST_THRESHOLD   16     /* active circuits before burst mode */
+#define MOOR_SKIPS_BURST_SIZE        4      /* cells per pop in burst mode */
+#define MOOR_SKIPS_OUTBUF_FLUSH      8      /* cells before mid-tick kernel flush */
+#define MOOR_SKIPS_SOCK_BUF_FACTOR   1.0    /* socket buffer factor (RTT-adjusted) */
+#define MOOR_SKIPS_EXTRA_SPACE       (32 * 1024)  /* 32KB extra write headroom */
 
 /* Tor-aligned: per-circuit cell queue limit (relay-side DoS defense).
  * Tor default: RELAY_CIRC_CELL_QUEUE_SIZE_DEFAULT = 2500 (~1.25 MB).
