@@ -407,6 +407,20 @@ static void parse_args_into_config(moor_config_t *cfg, int argc, char **argv) {
 /* DA event callback */
 static moor_da_config_t g_da_config;
 
+/* DA dir port: each client gets its own thread so PUBLISH (with PoW
+ * verification) doesn't block consensus fetches or vote exchange.
+ * moor_da_handle_request uses da_lock/da_unlock internally to protect
+ * consensus state — thread-safe by design. */
+typedef struct { int fd; } da_client_arg_t;
+
+static void *da_client_thread(void *arg) {
+    da_client_arg_t *a = (da_client_arg_t *)arg;
+    moor_da_handle_request(a->fd, &g_da_config);
+    close(a->fd);
+    free(a);
+    return NULL;
+}
+
 static void da_accept_cb(int fd, int events, void *arg) {
     (void)events;
     (void)arg;
@@ -414,11 +428,20 @@ static void da_accept_cb(int fd, int events, void *arg) {
     socklen_t plen = sizeof(peer);
     int client_fd = accept(fd, (struct sockaddr *)&peer, &plen);
     if (client_fd < 0) return;
-    /* Set recv timeout to prevent slowloris blocking the event loop (#191) */
-    moor_setsockopt_timeo(client_fd, SO_RCVTIMEO, 5);
-    moor_setsockopt_timeo(client_fd, SO_SNDTIMEO, 5);
-    moor_da_handle_request(client_fd, &g_da_config);
-    close(client_fd);
+    moor_setsockopt_timeo(client_fd, SO_RCVTIMEO, 10);
+    moor_setsockopt_timeo(client_fd, SO_SNDTIMEO, 10);
+
+    da_client_arg_t *a = malloc(sizeof(*a));
+    if (!a) { close(client_fd); return; }
+    a->fd = client_fd;
+
+    pthread_t t;
+    if (pthread_create(&t, NULL, da_client_thread, a) == 0) {
+        pthread_detach(t);
+    } else {
+        close(client_fd);
+        free(a);
+    }
 }
 
 static uint64_t g_da_last_epoch = 0;

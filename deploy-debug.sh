@@ -110,9 +110,9 @@ deploy_node() {
         export DEBIAN_FRONTEND=noninteractive
         if command -v apt-get >/dev/null 2>&1; then
             sudo apt-get update -qq 2>/dev/null
-            sudo apt-get install -y -qq gdb strace libsodium-dev build-essential 2>/dev/null || true
+            sudo apt-get install -y -qq gdb strace libsodium-dev libevent-dev build-essential 2>/dev/null || true
         elif command -v yum >/dev/null 2>&1; then
-            sudo yum install -y -q gdb strace libsodium-devel gcc make 2>/dev/null || true
+            sudo yum install -y -q gdb strace libsodium-devel libevent-devel gcc make 2>/dev/null || true
         fi
 TOOLS_EOF
 
@@ -340,6 +340,87 @@ for ((n=0; n<NODE_COUNT; n++)); do
 done
 
 rm -f "$TARBALL"
+
+# ==== Phase 9: Deploy to AWS nodes ====
+AWS_KEY="$HOME/.ssh/moor_aws.pem"
+AWS_SSH="ssh -i $AWS_KEY -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+
+if [[ -f "$AWS_KEY" ]]; then
+    # Collect all AWS relay IPs from all regions
+    AWS_REGIONS=(us-east-1 us-west-2 eu-west-1 eu-central-1 ap-northeast-1 ap-southeast-1 ap-south-1 ap-southeast-2 ca-west-1 af-south-1 eu-south-2)
+    declare -a AWS_IPS
+    for region in "${AWS_REGIONS[@]}"; do
+        while IFS= read -r ip; do
+            [[ -n "$ip" && "$ip" != "None" ]] && AWS_IPS+=("$ip")
+        done < <(aws ec2 describe-instances --region "$region" \
+            --filters "Name=tag:Project,Values=moor-fleet" "Name=instance-state-name,Values=running" \
+            --query 'Reservations[*].Instances[*].PublicIpAddress' --output text 2>/dev/null)
+    done
+
+    if [[ ${#AWS_IPS[@]} -gt 0 ]]; then
+        echo -e "${YELLOW}==> Deploying to ${#AWS_IPS[@]} AWS nodes...${NC}"
+        AWS_TARBALL="/tmp/moor-aws-deploy.tar.gz"
+        tar czf "$AWS_TARBALL" -C "$SCRIPT_DIR" \
+            --exclude='.git' --exclude='obj' --exclude='obj_*' --exclude='*.o' \
+            --exclude='./moor' --exclude='./moor_debug' --exclude='./moor_keygen' \
+            --exclude='./moor-top' --exclude='promo' --exclude='*.mp3' .
+
+        aws_deploy_node() {
+            local ip="$1"
+            scp -i "$AWS_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -q \
+                "$AWS_TARBALL" ubuntu@${ip}:/tmp/moor-src.tar.gz && \
+            $AWS_SSH ubuntu@${ip} \
+                'cd /opt/moor && sudo tar xzf /tmp/moor-src.tar.gz && sudo make -j$(nproc) 2>&1 | tail -1 && sudo install -m 755 moor /usr/local/bin/moor && sudo mkdir -p /var/lib/moor/keys && sudo chmod 755 /var/lib/moor && sudo chmod 700 /var/lib/moor/keys && sudo systemctl restart moor' && \
+            echo "$ip"
+        }
+
+        for ip in "${AWS_IPS[@]}"; do
+            aws_deploy_node "$ip" &
+        done
+        wait
+        rm -f "$AWS_TARBALL"
+        ok "AWS nodes deployed (${#AWS_IPS[@]})"
+        NODE_COUNT=$((NODE_COUNT + ${#AWS_IPS[@]}))
+    fi
+fi
+
+# ==== Phase 10: Deploy to Pi ====
+PI_HOST="192.168.1.83"
+PI_USER="pii"
+PI_PASS="io"
+
+if command -v sshpass >/dev/null 2>&1; then
+    PI_SSH="sshpass -p $PI_PASS ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
+    PI_RSYNC="sshpass -p $PI_PASS rsync"
+
+    echo -e "${YELLOW}==> Deploying to Pi ($PI_HOST)...${NC}"
+
+    $PI_RSYNC -az --exclude='.git' --exclude='obj' --exclude='obj_*' \
+        --exclude='*.o' --exclude='moor' --exclude='moor_keygen' \
+        --exclude='moor-top' --exclude='moor_debug' --exclude='promo' \
+        -e "ssh -o StrictHostKeyChecking=accept-new" \
+        "${SCRIPT_DIR}/" ${PI_USER}@${PI_HOST}:~/MOOR_PQ_SKIPS/ 2>/dev/null
+
+    $PI_SSH ${PI_USER}@${PI_HOST} bash -s <<'PI_EOF'
+        set -e
+        cd ~/MOOR_PQ_SKIPS
+        make clean 2>/dev/null || true
+        make -j$(nproc) 2>&1 | tail -1
+        sudo systemctl stop moor 2>/dev/null || true
+        sudo cp ./moor /usr/local/bin/moor
+        sudo systemctl start moor
+PI_EOF
+
+    if [[ $? -eq 0 ]]; then
+        ok "Pi deployed and HS restarted"
+        NODE_COUNT=$((NODE_COUNT + 1))
+    else
+        fail "Pi deploy failed"
+        ALL_OK=0
+    fi
+else
+    info "sshpass not installed — skipping Pi deploy"
+fi
 
 echo ""
 if [[ $ALL_OK -eq 1 ]]; then

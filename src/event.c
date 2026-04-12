@@ -1,27 +1,20 @@
+/*
+ * MOOR -- Event loop (libevent backend)
+ *
+ * Wraps libevent2 behind the existing moor_event_* API.
+ * All existing call sites remain unchanged.
+ */
 #include "moor/moor.h"
 #include <signal.h>
+#include <event2/event.h>
+#include <string.h>
+#include <time.h>
 
 #ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
 #include <windows.h>
-/* WSAPoll is broken on many Windows versions (doesn't detect listen events).
- * Use select() instead — reliable on all Windows versions. */
-#define MOOR_USE_SELECT_WIN32
 #else
-#include <poll.h>
-#include <sys/time.h>
 #include <unistd.h>
-#include <errno.h>
 #endif
-
-#ifdef MOOR_USE_EPOLL
-#include <sys/epoll.h>
-#endif
-
-#include <string.h>
-#include <limits.h>
-#include <time.h>
 
 volatile sig_atomic_t g_shutdown_requested = 0;
 volatile sig_atomic_t g_sighup_requested = 0;
@@ -29,15 +22,35 @@ volatile sig_atomic_t g_sighup_requested = 0;
 #define MAX_EVENTS  MOOR_MAX_FDS
 #define MAX_TIMERS  256
 
-static moor_event_entry_t g_entries[MAX_EVENTS];
-static moor_timer_t       g_timers[MAX_TIMERS];
-static int                g_num_entries = 0;
-static int                g_running = 0;
+/* ---- FD event tracking ---- */
+typedef struct {
+    struct event *ev;
+    int           fd;
+    int           moor_events;  /* MOOR_EVENT_READ | MOOR_EVENT_WRITE */
+    moor_event_cb callback;
+    void         *arg;
+    int           active;
+} ev_entry_t;
 
-#ifdef MOOR_USE_EPOLL
-static int g_epoll_fd = -1;
-#endif
+static ev_entry_t g_entries[MAX_EVENTS];
+static int        g_num_entries = 0;
 
+/* ---- Timer tracking ---- */
+typedef struct {
+    struct event  *ev;
+    uint64_t       interval_ms;
+    moor_timer_cb  callback;
+    void          *arg;
+    int            active;
+} timer_entry_t;
+
+static timer_entry_t g_timers[MAX_TIMERS];
+
+/* ---- Global state ---- */
+static struct event_base *g_base = NULL;
+static int g_running = 0;
+
+/* ---- Time ---- */
 uint64_t moor_time_ms(void) {
 #ifdef _WIN32
     return (uint64_t)GetTickCount64();
@@ -48,73 +61,87 @@ uint64_t moor_time_ms(void) {
 #endif
 }
 
-#ifdef MOOR_USE_EPOLL
-static uint32_t moor_to_epoll_events(int events) {
-    uint32_t ep = 0;
-    if (events & MOOR_EVENT_READ)  ep |= EPOLLIN;
-    if (events & MOOR_EVENT_WRITE) ep |= EPOLLOUT;
-    return ep;
-}
-#endif
+/* ---- libevent fd callback adapter ---- */
+static void ev_fd_cb(evutil_socket_t fd, short what, void *arg) {
+    (void)fd;
+    ev_entry_t *e = (ev_entry_t *)arg;
+    if (!e->active) return;
 
+    int events = 0;
+    if (what & EV_READ)  events |= MOOR_EVENT_READ;
+    if (what & EV_WRITE) events |= MOOR_EVENT_WRITE;
+
+    e->callback(e->fd, events, e->arg);
+}
+
+/* Convert MOOR flags to libevent flags */
+static short moor_to_lev(int events) {
+    short f = EV_PERSIST;
+    if (events & MOOR_EVENT_READ)  f |= EV_READ;
+    if (events & MOOR_EVENT_WRITE) f |= EV_WRITE;
+    return f;
+}
+
+/* ---- Init ---- */
 int moor_event_init(void) {
     memset(g_entries, 0, sizeof(g_entries));
     memset(g_timers, 0, sizeof(g_timers));
     g_num_entries = 0;
     g_running = 0;
 
-#ifdef MOOR_USE_EPOLL
-    if (g_epoll_fd >= 0) {
-        close(g_epoll_fd);
+    if (g_base) {
+        event_base_free(g_base);
     }
-    g_epoll_fd = epoll_create1(EPOLL_CLOEXEC);
-    if (g_epoll_fd < 0) {
-        LOG_ERROR("epoll_create1 failed");
+    g_base = event_base_new();
+    if (!g_base) {
+        LOG_ERROR("event_base_new failed");
         return -1;
     }
-    LOG_DEBUG("event loop initialized (epoll fd=%d)", g_epoll_fd);
-#else
-    LOG_DEBUG("event loop initialized");
-#endif
+    LOG_DEBUG("event loop initialized (%s fd=%d)",
+              event_base_get_method(g_base), /* epoll/kqueue/poll */
+              0 /* no single fd to report */);
     return 0;
 }
 
+/* ---- FD events ---- */
 int moor_event_add(int fd, int events, moor_event_cb callback, void *arg) {
-    /* Check if fd already registered -- update instead of duplicating */
+    /* Check if fd already registered — update */
     for (int i = 0; i < g_num_entries; i++) {
         if (g_entries[i].active && g_entries[i].fd == fd) {
-            g_entries[i].events = events;
+            g_entries[i].moor_events = events;
             g_entries[i].callback = callback;
             g_entries[i].arg = arg;
-#ifdef MOOR_USE_EPOLL
-            struct epoll_event ev;
-            ev.events = moor_to_epoll_events(events);
-            ev.data.u32 = (uint32_t)i;
-            epoll_ctl(g_epoll_fd, EPOLL_CTL_MOD, fd, &ev);
-#endif
+            /* Recreate the event with new flags */
+            if (g_entries[i].ev) {
+                event_del(g_entries[i].ev);
+                event_free(g_entries[i].ev);
+            }
+            g_entries[i].ev = event_new(g_base, fd, moor_to_lev(events),
+                                        ev_fd_cb, &g_entries[i]);
+            if (!g_entries[i].ev) return -1;
+            event_add(g_entries[i].ev, NULL);
             LOG_DEBUG("event_add fd=%d updated", fd);
             return 0;
         }
     }
 
+    /* New entry */
     for (int i = 0; i < MAX_EVENTS; i++) {
         if (!g_entries[i].active) {
             g_entries[i].fd = fd;
-            g_entries[i].events = events;
+            g_entries[i].moor_events = events;
             g_entries[i].callback = callback;
             g_entries[i].arg = arg;
             g_entries[i].active = 1;
             if (i >= g_num_entries) g_num_entries = i + 1;
-#ifdef MOOR_USE_EPOLL
-            struct epoll_event ev;
-            ev.events = moor_to_epoll_events(events);
-            ev.data.u32 = (uint32_t)i;
-            if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, fd, &ev) != 0) {
-                LOG_ERROR("epoll_ctl ADD fd=%d failed", fd);
+
+            g_entries[i].ev = event_new(g_base, fd, moor_to_lev(events),
+                                        ev_fd_cb, &g_entries[i]);
+            if (!g_entries[i].ev) {
                 g_entries[i].active = 0;
                 return -1;
             }
-#endif
+            event_add(g_entries[i].ev, NULL);
             LOG_DEBUG("event_add fd=%d events=%d", fd, events);
             return 0;
         }
@@ -126,13 +153,15 @@ int moor_event_add(int fd, int events, moor_event_cb callback, void *arg) {
 int moor_event_modify(int fd, int events) {
     for (int i = 0; i < g_num_entries; i++) {
         if (g_entries[i].active && g_entries[i].fd == fd) {
-            g_entries[i].events = events;
-#ifdef MOOR_USE_EPOLL
-            struct epoll_event ev;
-            ev.events = moor_to_epoll_events(events);
-            ev.data.u32 = (uint32_t)i;
-            epoll_ctl(g_epoll_fd, EPOLL_CTL_MOD, fd, &ev);
-#endif
+            g_entries[i].moor_events = events;
+            if (g_entries[i].ev) {
+                event_del(g_entries[i].ev);
+                event_free(g_entries[i].ev);
+            }
+            g_entries[i].ev = event_new(g_base, fd, moor_to_lev(events),
+                                        ev_fd_cb, &g_entries[i]);
+            if (!g_entries[i].ev) return -1;
+            event_add(g_entries[i].ev, NULL);
             return 0;
         }
     }
@@ -142,10 +171,12 @@ int moor_event_modify(int fd, int events) {
 int moor_event_remove(int fd) {
     for (int i = 0; i < g_num_entries; i++) {
         if (g_entries[i].active && g_entries[i].fd == fd) {
+            if (g_entries[i].ev) {
+                event_del(g_entries[i].ev);
+                event_free(g_entries[i].ev);
+                g_entries[i].ev = NULL;
+            }
             g_entries[i].active = 0;
-#ifdef MOOR_USE_EPOLL
-            epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, fd, NULL);
-#endif
             LOG_DEBUG("event_remove fd=%d", fd);
             return 0;
         }
@@ -153,15 +184,45 @@ int moor_event_remove(int fd) {
     return -1;
 }
 
+/* ---- Timers ---- */
+
+static void ev_timer_cb(evutil_socket_t fd, short what, void *arg) {
+    (void)fd; (void)what;
+    timer_entry_t *t = (timer_entry_t *)arg;
+    if (!t->active) return;
+
+    moor_timer_cb cb = t->callback;
+    void *cb_arg = t->arg;
+    cb(cb_arg);
+
+    /* Re-arm if still active (callback may have removed it) */
+    if (t->active && t->callback == cb && t->arg == cb_arg && t->ev) {
+        struct timeval tv;
+        tv.tv_sec = (long)(t->interval_ms / 1000);
+        tv.tv_usec = (long)((t->interval_ms % 1000) * 1000);
+        evtimer_add(t->ev, &tv);
+    }
+}
+
 int moor_event_add_timer(uint64_t interval_ms, moor_timer_cb callback,
                          void *arg) {
     for (int i = 0; i < MAX_TIMERS; i++) {
         if (!g_timers[i].active) {
             g_timers[i].interval_ms = interval_ms;
-            g_timers[i].next_fire = moor_time_ms() + interval_ms;
             g_timers[i].callback = callback;
             g_timers[i].arg = arg;
             g_timers[i].active = 1;
+
+            g_timers[i].ev = evtimer_new(g_base, ev_timer_cb, &g_timers[i]);
+            if (!g_timers[i].ev) {
+                g_timers[i].active = 0;
+                return -1;
+            }
+            struct timeval tv;
+            tv.tv_sec = (long)(interval_ms / 1000);
+            tv.tv_usec = (long)((interval_ms % 1000) * 1000);
+            evtimer_add(g_timers[i].ev, &tv);
+
             LOG_DEBUG("timer added: %llu ms", (unsigned long long)interval_ms);
             return i;
         }
@@ -171,6 +232,11 @@ int moor_event_add_timer(uint64_t interval_ms, moor_timer_cb callback,
 
 int moor_event_remove_timer(int timer_id) {
     if (timer_id < 0 || timer_id >= MAX_TIMERS) return -1;
+    if (g_timers[timer_id].ev) {
+        evtimer_del(g_timers[timer_id].ev);
+        event_free(g_timers[timer_id].ev);
+        g_timers[timer_id].ev = NULL;
+    }
     g_timers[timer_id].active = 0;
     return 0;
 }
@@ -179,124 +245,68 @@ int moor_event_set_timer_interval(int timer_id, uint64_t interval_ms) {
     if (timer_id < 0 || timer_id >= MAX_TIMERS) return -1;
     if (!g_timers[timer_id].active) return -1;
     g_timers[timer_id].interval_ms = interval_ms;
+    /* Takes effect on next fire — the re-arm in ev_timer_cb uses the
+     * updated interval_ms. No need to reschedule now. */
     return 0;
+}
+
+/* ---- Event loop ---- */
+
+/* Postloop callback — runs after every iteration of the event loop.
+ * Handles deferred circuit/channel closes (Tor-aligned pattern). */
+static void postloop_cb(evutil_socket_t fd, short what, void *arg) {
+    (void)fd; (void)what; (void)arg;
+    moor_circuit_close_all_marked();
+    moor_channel_close_all_marked();
+
+    if (g_sighup_requested) {
+        g_sighup_requested = 0;
+        extern void moor_handle_sighup(void);
+        moor_handle_sighup();
+    }
+
+    if (g_shutdown_requested) {
+        event_base_loopbreak(g_base);
+    }
 }
 
 void moor_event_stop(void) {
     g_running = 0;
+    g_shutdown_requested = 1;
+    if (g_base)
+        event_base_loopbreak(g_base);
 }
-
-/* Compute timeout_ms for the nearest timer */
-static int compute_timer_timeout(void) {
-    int timeout_ms = 1000;
-    uint64_t now = moor_time_ms();
-    for (int i = 0; i < MAX_TIMERS; i++) {
-        if (!g_timers[i].active) continue;
-        int64_t diff = (int64_t)(g_timers[i].next_fire - now);
-        if (diff <= 0) { timeout_ms = 0; break; }
-        if (diff < timeout_ms)
-            timeout_ms = (diff > INT_MAX) ? INT_MAX : (int)diff;
-    }
-    return timeout_ms;
-}
-
-/* Fire all expired timers.
- * Re-check active after callback — the callback may have removed this
- * timer (or the slot may have been reused for a new timer). */
-static void fire_timers(void) {
-    uint64_t now = moor_time_ms();
-    for (int i = 0; i < MAX_TIMERS; i++) {
-        if (!g_timers[i].active) continue;
-        if (now >= g_timers[i].next_fire) {
-            moor_timer_cb cb = g_timers[i].callback;
-            void *arg = g_timers[i].arg;
-            cb(arg);
-            /* Only re-arm if still active — callback may have removed it,
-             * or the slot may have been reused for a different timer. */
-            if (g_timers[i].active && g_timers[i].callback == cb &&
-                g_timers[i].arg == arg)
-                g_timers[i].next_fire = now + g_timers[i].interval_ms;
-        }
-    }
-}
-
-#ifdef MOOR_USE_EPOLL
 
 int moor_event_loop(void) {
-    struct epoll_event ep_events[256];
-
     g_running = 1;
-    LOG_INFO("event loop started (epoll)");
-    uint64_t last_heartbeat = 0;
+    LOG_INFO("event loop started (%s)", event_base_get_method(g_base));
 
-    while (g_running) {
-        int timeout_ms = compute_timer_timeout();
+    /* 1ms postloop timer for deferred cleanup — runs every iteration.
+     * This replaces the inline close_all_marked() calls in the old
+     * hand-rolled loops. Low overhead: libevent's timer wheel is O(1). */
+    struct event *postloop = event_new(g_base, -1, EV_PERSIST,
+                                       postloop_cb, NULL);
+    struct timeval postloop_tv = { 0, 1000 }; /* 1ms */
+    event_add(postloop, &postloop_tv);
 
-        int nready = epoll_wait(g_epoll_fd, ep_events, 256, timeout_ms);
+    /* Heartbeat timer */
+    uint64_t last_heartbeat = moor_time_ms();
 
-        /* Heartbeat every 60s to confirm event loop is alive */
-        uint64_t now_hb = moor_time_ms();
-        if (now_hb - last_heartbeat > 60000) {
-            LOG_DEBUG("event loop heartbeat (nready=%d, timers=%d)",
-                      nready, timeout_ms);
-            last_heartbeat = now_hb;
+    while (g_running && !g_shutdown_requested) {
+        /* Run one iteration — process all pending events + timers */
+        event_base_loop(g_base, EVLOOP_ONCE);
+
+        uint64_t now = moor_time_ms();
+        if (now - last_heartbeat > 60000) {
+            LOG_DEBUG("event loop heartbeat");
+            last_heartbeat = now;
         }
-        if (g_shutdown_requested) break;
-        if (nready < 0) {
-            if (errno == EINTR) continue;
-            /* EBADF can happen transiently when a stale fd is removed
-             * between epoll_ctl and epoll_wait.  Log and continue rather
-             * than killing the entire event loop — stability trumps. */
-            LOG_ERROR("epoll_wait error: %s (errno=%d)", strerror(errno), errno);
-            if (errno == EBADF || errno == EINVAL) {
-                /* Transient — sleep briefly and retry */
-                usleep(10000); /* 10ms */
-                continue;
-            }
-            break; /* Fatal: EFAULT, ENOMEM */
-        }
-
-        /* Tor-aligned: SIGHUP config reload (like do_hup()) */
-        if (g_sighup_requested) {
-            g_sighup_requested = 0;
-            extern void moor_handle_sighup(void);
-            moor_handle_sighup();
-        }
-
-        /* Process I/O events BEFORE timers.  Timers (reaper, OOM killer,
-         * circuit timeouts) can free connections/circuits.  If fired before
-         * event dispatch, stale pointers in the epoll batch cause UAF. */
-        for (int i = 0; i < nready; i++) {
-            uint32_t idx = ep_events[i].data.u32;
-            if (idx >= (uint32_t)MAX_EVENTS || !g_entries[idx].active) continue;
-
-            int events = 0;
-            if (ep_events[i].events & (EPOLLIN | EPOLLHUP | EPOLLERR))
-                events |= MOOR_EVENT_READ;
-            if (ep_events[i].events & EPOLLOUT)
-                events |= MOOR_EVENT_WRITE;
-
-            MOOR_ASSERT_MSG(g_entries[idx].callback != NULL,
-                "event loop: NULL callback for fd=%d idx=%u",
-                g_entries[idx].fd, idx);
-
-            /* Snapshot entry before callback — callback may deactivate it */
-            moor_event_cb cb = g_entries[idx].callback;
-            int cb_fd = g_entries[idx].fd;
-            void *cb_arg = g_entries[idx].arg;
-            cb(cb_fd, events, cb_arg);
-        }
-
-        fire_timers();
-
-        /* Tor-aligned: process deferred circuit closes at END of each
-         * iteration — no circuit is ever freed while a callback is
-         * processing it.  This is Tor's postloop_cleanup_cb pattern. */
-        moor_circuit_close_all_marked();
-        moor_channel_close_all_marked();
     }
 
-    /* Tor-aligned: graceful shutdown — flush queues and close circuits */
+    event_del(postloop);
+    event_free(postloop);
+
+    /* Graceful shutdown */
     {
         extern void moor_graceful_shutdown(void);
         moor_graceful_shutdown();
@@ -305,130 +315,3 @@ int moor_event_loop(void) {
     LOG_INFO("event loop stopped");
     return 0;
 }
-
-#elif defined(MOOR_USE_SELECT_WIN32)
-
-/* Windows select()-based event loop (WSAPoll is buggy on many versions) */
-int moor_event_loop(void) {
-    g_running = 1;
-    LOG_INFO("event loop started (select)");
-
-    while (g_running) {
-        fd_set read_set, write_set;
-        FD_ZERO(&read_set);
-        FD_ZERO(&write_set);
-
-        int fd_indices[MAX_EVENTS];
-        int nfds = 0;
-
-        for (int i = 0; i < g_num_entries; i++) {
-            if (!g_entries[i].active) continue;
-            if (nfds >= FD_SETSIZE) break;
-            if (g_entries[i].events & MOOR_EVENT_READ)
-                FD_SET((SOCKET)g_entries[i].fd, &read_set);
-            if (g_entries[i].events & MOOR_EVENT_WRITE)
-                FD_SET((SOCKET)g_entries[i].fd, &write_set);
-            fd_indices[nfds++] = i;
-        }
-
-        int timeout_ms = compute_timer_timeout();
-        struct timeval tv;
-        tv.tv_sec = timeout_ms / 1000;
-        tv.tv_usec = (timeout_ms % 1000) * 1000;
-
-        int ret = select(0, &read_set, &write_set, NULL, &tv);
-        if (g_shutdown_requested) break;
-        if (ret < 0) {
-            int wsa_err = WSAGetLastError();
-            if (wsa_err == WSAEINTR) continue;
-            LOG_ERROR("select error: %d", wsa_err);
-            break;
-        }
-
-        for (int i = 0; i < nfds; i++) {
-            int idx = fd_indices[i];
-            if (!g_entries[idx].active) continue;
-
-            int events = 0;
-            if (FD_ISSET((SOCKET)g_entries[idx].fd, &read_set))
-                events |= MOOR_EVENT_READ;
-            if (FD_ISSET((SOCKET)g_entries[idx].fd, &write_set))
-                events |= MOOR_EVENT_WRITE;
-
-            if (events)
-                g_entries[idx].callback(g_entries[idx].fd, events,
-                                       g_entries[idx].arg);
-        }
-
-        fire_timers();
-        moor_circuit_close_all_marked();
-        moor_channel_close_all_marked();
-    }
-
-    LOG_INFO("event loop stopped");
-    return 0;
-}
-
-#else /* poll() fallback (Unix without epoll) */
-
-int moor_event_loop(void) {
-    struct pollfd pfds[MAX_EVENTS];
-    int fd_map[MAX_EVENTS];
-
-    g_running = 1;
-    LOG_INFO("event loop started (poll)");
-
-    while (g_running) {
-        int nfds = 0;
-        for (int i = 0; i < g_num_entries; i++) {
-            if (!g_entries[i].active) continue;
-            pfds[nfds].fd = g_entries[i].fd;
-            pfds[nfds].events = 0;
-            if (g_entries[i].events & MOOR_EVENT_READ)
-                pfds[nfds].events |= POLLIN;
-            if (g_entries[i].events & MOOR_EVENT_WRITE)
-                pfds[nfds].events |= POLLOUT;
-            pfds[nfds].revents = 0;
-            fd_map[nfds] = i;
-            nfds++;
-        }
-
-        int timeout_ms = compute_timer_timeout();
-        int ret = poll(pfds, nfds, timeout_ms);
-        if (g_shutdown_requested) break;
-        if (ret < 0) {
-            if (errno == EINTR) continue;
-            LOG_ERROR("poll error: %s", strerror(errno));
-            break;
-        }
-
-        for (int i = 0; i < nfds; i++) {
-            if (pfds[i].revents == 0) continue;
-            int idx = fd_map[i];
-            if (!g_entries[idx].active) continue;
-
-            int events = 0;
-            if (pfds[i].revents & (POLLIN | POLLHUP | POLLERR))
-                events |= MOOR_EVENT_READ;
-            if (pfds[i].revents & POLLOUT)
-                events |= MOOR_EVENT_WRITE;
-
-            MOOR_ASSERT_MSG(g_entries[idx].callback != NULL,
-                "event loop: NULL callback for fd=%d idx=%d",
-                g_entries[idx].fd, idx);
-            moor_event_cb cb = g_entries[idx].callback;
-            int cb_fd = g_entries[idx].fd;
-            void *cb_arg = g_entries[idx].arg;
-            cb(cb_fd, events, cb_arg);
-        }
-
-        fire_timers();
-        moor_circuit_close_all_marked();
-        moor_channel_close_all_marked();
-    }
-
-    LOG_INFO("event loop stopped");
-    return 0;
-}
-
-#endif /* MOOR_USE_EPOLL / MOOR_USE_SELECT_WIN32 */

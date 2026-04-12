@@ -2089,6 +2089,11 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
         da_unlock(config);
     }
     else if (strncmp(cmd_buf, "VOTE\n", 5) == 0) {
+        /* Reject from non-peer: only trusted DAs may send votes */
+        if (!da_is_peer(client_fd, config)) {
+            send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
+            return 0;
+        }
         /*
          * Vote exchange: peer DA sends its signature + identity_pk.
          * Wire format: "VOTE\n" + identity_pk(32) + signature(64) = 96 bytes
@@ -2097,32 +2102,36 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
         uint8_t *data = (uint8_t *)cmd_buf + 5;
         size_t remaining = n - 5;
 
-        uint8_t vote_buf[96];
-        size_t got = (remaining < 96) ? remaining : 96;
+        uint8_t vote_buf[128]; /* body_hash(32) + identity_pk(32) + sig(64) */
+        size_t got = (remaining < 128) ? remaining : 128;
         memcpy(vote_buf, data, got);
-        while (got < 96) {
-            ssize_t r = recv(client_fd, (char *)vote_buf + got, 96 - got, 0);
+        while (got < 128) {
+            ssize_t r = recv(client_fd, (char *)vote_buf + got, 128 - got, 0);
             if (r <= 0) return -1;
             got += r;
         }
 
-        uint8_t peer_pk[32], peer_sig[64];
-        memcpy(peer_pk, vote_buf, 32);
-        memcpy(peer_sig, vote_buf + 32, 64);
+        uint8_t peer_body_hash[32], peer_pk[32], peer_sig[64];
+        memcpy(peer_body_hash, vote_buf, 32);
+        memcpy(peer_pk, vote_buf + 32, 32);
+        memcpy(peer_sig, vote_buf + 64, 64);
 
         da_lock(config);
-        /* Verify this signature against our consensus body */
-        uint8_t body_hash[32];
-        if (consensus_body_hash(body_hash, &config->consensus) != 0) {
+        /* Verify signature against the body hash the SENDER included.
+         * Then check if their body hash matches ours — if not, the
+         * consensus bodies diverged and we reject (not a valid co-sign). */
+        if (moor_crypto_sign_verify(peer_sig, peer_body_hash, 32, peer_pk) != 0) {
             da_unlock(config);
+            LOG_WARN("DA: rejecting invalid vote (bad signature)");
             send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
-            return -1;
+            return 0;
         }
-
-        if (moor_crypto_sign_verify(peer_sig, body_hash, 32, peer_pk) != 0) {
+        uint8_t our_body_hash[32];
+        if (consensus_body_hash(our_body_hash, &config->consensus) != 0 ||
+            sodium_memcmp(our_body_hash, peer_body_hash, 32) != 0) {
             da_unlock(config);
-            LOG_WARN("DA: rejecting invalid vote from peer");
-            send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
+            LOG_WARN("DA: vote valid but consensus bodies diverged, rebuilding");
+            send(client_fd, "DIVERGED\n", 9, MSG_NOSIGNAL);
             return 0;
         }
 
@@ -2185,15 +2194,22 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
         send(client_fd, "OK\n", 3, MSG_NOSIGNAL);
     }
     else if (strncmp(cmd_buf, "VOTE_PQ\n", 8) == 0) {
+        /* Reject from non-peer: only trusted DAs may send PQ votes.
+         * Without this, any relay connecting to the dir port can spam
+         * VOTE_PQ and flood the log with "bad Ed25519" warnings. */
+        if (!da_is_peer(client_fd, config)) {
+            send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
+            return 0;
+        }
         /*
          * PQ vote exchange: peer DA sends hybrid signature.
-         * Wire: "VOTE_PQ\n" + identity_pk(32) + ed25519_sig(64) +
-         *       pq_pk(1952) + pq_sig(3309) = 5357 bytes
+         * Wire: "VOTE_PQ\n" + body_hash(32) + identity_pk(32) + ed25519_sig(64) +
+         *       pq_pk(1952) + pq_sig(3309)
          */
         uint8_t *data = (uint8_t *)cmd_buf + 8;
         size_t remaining = n - 8;
 
-        size_t pq_vote_sz = 32 + 64 + MOOR_MLDSA_PK_LEN + MOOR_MLDSA_SIG_LEN;
+        size_t pq_vote_sz = 32 + 32 + 64 + MOOR_MLDSA_PK_LEN + MOOR_MLDSA_SIG_LEN;
         uint8_t *vote_buf = malloc(pq_vote_sz);
         if (!vote_buf) { send(client_fd, "ERR\n", 4, MSG_NOSIGNAL); return -1; }
 
@@ -2206,28 +2222,32 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
             got += r;
         }
 
-        uint8_t peer_pk[32], peer_sig[64];
-        memcpy(peer_pk, vote_buf, 32);
-        memcpy(peer_sig, vote_buf + 32, 64);
+        uint8_t peer_body_hash[32], peer_pk[32], peer_sig[64];
+        memcpy(peer_body_hash, vote_buf, 32);
+        memcpy(peer_pk, vote_buf + 32, 32);
+        memcpy(peer_sig, vote_buf + 64, 64);
 
-        uint8_t *peer_pq_pk = vote_buf + 96;
-        uint8_t *peer_pq_sig = vote_buf + 96 + MOOR_MLDSA_PK_LEN;
+        uint8_t *peer_pq_pk = vote_buf + 128;
+        uint8_t *peer_pq_sig = vote_buf + 128 + MOOR_MLDSA_PK_LEN;
 
         da_lock(config);
-        /* Verify Ed25519 signature against our consensus body */
-        uint8_t body_hash[32];
-        if (consensus_body_hash(body_hash, &config->consensus) != 0) {
-            da_unlock(config);
-            free(vote_buf);
-            send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
-            return -1;
-        }
-
-        if (moor_crypto_sign_verify(peer_sig, body_hash, 32, peer_pk) != 0) {
+        /* Verify Ed25519 signature against the body hash the SENDER
+         * included — this is what they actually signed. */
+        if (moor_crypto_sign_verify(peer_sig, peer_body_hash, 32, peer_pk) != 0) {
             da_unlock(config);
             LOG_WARN("DA: rejecting invalid PQ vote (bad Ed25519)");
             free(vote_buf);
             send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
+            return 0;
+        }
+        /* Check if their body matches ours — if not, consensus diverged */
+        uint8_t our_body_hash[32];
+        if (consensus_body_hash(our_body_hash, &config->consensus) != 0 ||
+            sodium_memcmp(our_body_hash, peer_body_hash, 32) != 0) {
+            da_unlock(config);
+            LOG_WARN("DA: PQ vote valid but consensus bodies diverged");
+            free(vote_buf);
+            send(client_fd, "DIVERGED\n", 9, MSG_NOSIGNAL);
             return 0;
         }
 
@@ -2592,14 +2612,19 @@ static int da_exchange_votes_unlocked(moor_da_config_t *config) {
         moor_setsockopt_timeo(fd, SO_SNDTIMEO, 5);
         moor_setsockopt_timeo(fd, SO_RCVTIMEO, 5);
 
+        /* Compute body hash — this is what our signature covers */
+        uint8_t our_body_hash[32];
+        consensus_body_hash(our_body_hash, &config->consensus);
+
         if (our_has_pq) {
-            /* Send VOTE_PQ: identity_pk(32) + ed25519_sig(64) +
+            /* Send VOTE_PQ: body_hash(32) + identity_pk(32) + ed25519_sig(64) +
              * pq_pk(1952) + pq_sig(3293) */
             da_send_all(fd, (const uint8_t *)"VOTE_PQ\n", 8);
-            size_t pq_vote_sz = 32 + 64 + MOOR_MLDSA_PK_LEN + MOOR_MLDSA_SIG_LEN;
+            size_t pq_vote_sz = 32 + 32 + 64 + MOOR_MLDSA_PK_LEN + MOOR_MLDSA_SIG_LEN;
             uint8_t *vote_data = malloc(pq_vote_sz);
             if (vote_data) {
                 size_t voff = 0;
+                memcpy(vote_data + voff, our_body_hash, 32); voff += 32;
                 memcpy(vote_data + voff, config->identity_pk, 32); voff += 32;
                 memcpy(vote_data + voff,
                        config->consensus.da_sigs[our_slot].signature, 64);
@@ -2616,13 +2641,14 @@ static int da_exchange_votes_unlocked(moor_da_config_t *config) {
                 free(vote_data);
             }
         } else {
-            /* Classic VOTE: identity_pk(32) + signature(64) */
+            /* Classic VOTE: body_hash(32) + identity_pk(32) + signature(64) */
             da_send_all(fd, (const uint8_t *)"VOTE\n", 5);
-            uint8_t vote_data[96];
-            memcpy(vote_data, config->identity_pk, 32);
-            memcpy(vote_data + 32,
+            uint8_t vote_data[128];
+            memcpy(vote_data, our_body_hash, 32);
+            memcpy(vote_data + 32, config->identity_pk, 32);
+            memcpy(vote_data + 64,
                    config->consensus.da_sigs[our_slot].signature, 64);
-            da_send_all(fd, vote_data, 96);
+            da_send_all(fd, vote_data, 128);
         }
 
         char resp[16];
@@ -4083,11 +4109,14 @@ void moor_da_compute_flags_statistical(moor_da_config_t *config) {
         guard_bw_threshold = bws[n_active / 2]; /* fallback to overall median */
 
     /* Guard time-known: 12.5th percentile.
-     * Tor uses DA_GUARD_MIN_TIME_KNOWN (8 days) as floor, but on small/test
-     * networks with few relays this prevents ANY guards from existing.
-     * Scale: use the floor only when we have 20+ relays (production-sized). */
+     * Tor uses 8 days as floor for 6000+ relay networks.  For networks
+     * under 100 relays, trust self-declared Guard flags — stripping them
+     * based on uptime would kill all guards when crossing the 20-relay
+     * threshold (every relay restarts with fresh uptime).  The 8-day
+     * floor only kicks in at 100+ relays where the anonymity set is
+     * large enough that uptime-based Guard selection matters. */
     uint64_t guard_tk = time_knowns[n_active / 8];
-    if (n_active >= 20 && guard_tk < DA_GUARD_MIN_TIME_KNOWN)
+    if (n_active >= 100 && guard_tk < DA_GUARD_MIN_TIME_KNOWN)
         guard_tk = DA_GUARD_MIN_TIME_KNOWN;
 
     /* --- Assign flags --- */
@@ -4116,8 +4145,10 @@ void moor_da_compute_flags_statistical(moor_da_config_t *config) {
          * On small networks (<20 relays): trust self-declared Guard flag
          * immediately. Without this, fresh networks can't build circuits
          * because nobody has uptime to earn Guard. */
-        if (n_active < 20) {
-            /* Small network: preserve self-declared Guard/Exit as-is */
+        if (n_active < 100) {
+            /* Growing network (<100 relays): preserve self-declared Guard.
+             * The 20-relay threshold that enables guard pinning must not
+             * simultaneously strip all guards via uptime requirements. */
         } else if ((r->flags & NODE_FLAG_GUARD) &&
             (r->flags & NODE_FLAG_FAST) &&
             (r->flags & NODE_FLAG_STABLE) &&

@@ -9,6 +9,8 @@ SYSCONFDIR ?= $(PREFIX)/etc
 CC ?= gcc
 SODIUM_CFLAGS ?= $(shell pkg-config --cflags libsodium 2>/dev/null)
 SODIUM_LIBS ?= $(shell pkg-config --libs libsodium 2>/dev/null || echo -lsodium)
+LIBEVENT_CFLAGS ?= $(shell pkg-config --cflags libevent 2>/dev/null)
+LIBEVENT_LIBS ?= $(shell pkg-config --libs libevent 2>/dev/null || echo -levent)
 ZLIB_CFLAGS ?=
 ZLIB_LIBS ?= -lz
 EXTRA_CFLAGS ?=
@@ -19,9 +21,9 @@ CFLAGS = -Wall -Wextra -O2 -g3 -fno-strict-aliasing -fstack-protector-strong \
          -D_FORTIFY_SOURCE=2 -Iinclude -Isrc/kyber -Isrc/dilithium \
          -fPIE -Wformat -Wformat-security \
          -DMOOR_SYSCONFDIR='"$(SYSCONFDIR)/moor"' \
-         $(SODIUM_CFLAGS) $(ZLIB_CFLAGS) $(EXTRA_CFLAGS)
+         $(SODIUM_CFLAGS) $(LIBEVENT_CFLAGS) $(ZLIB_CFLAGS) $(EXTRA_CFLAGS)
 LDFLAGS = -pie -Wl,-z,relro,-z,now -rdynamic \
-          $(SODIUM_LIBS) -lm -lpthread $(ZLIB_LIBS) $(EXTRA_LDFLAGS)
+          $(SODIUM_LIBS) $(LIBEVENT_LIBS) -lm -lpthread $(ZLIB_LIBS) $(EXTRA_LDFLAGS)
 
 # Windows/MSYS2 needs winsock
 UNAME := $(shell uname -s)
