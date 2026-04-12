@@ -59,7 +59,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --nickname <name>   Node nickname"
             echo "  --ip <addr>         Public IP address"
             echo "  --port <port>       OR port (default: 9001)"
-            echo "  --transport <name>  Bridge transport: shitstorm|mirage|shade|scramble|speakeasy"
+            echo "  --transport <name>  Bridge transport: shitstorm|mirage|shade|scramble|speakeasy|nether"
             echo "  --enclave <file>    Use independent network (enclave file with DA list)"
             echo "  --contact <info>    Contact email/URL (optional)"
             exit 0 ;;
@@ -108,18 +108,20 @@ if [[ "$ROLE" == "bridge" && -z "$TRANSPORT" ]]; then
     echo " Which pluggable transport?"
     echo ""
     echo "   1) shitstorm  - Chrome TLS 1.3 fingerprint (recommended, hardest to block)"
-    echo "   2) mirage     - TLS 1.3 record framing with configurable SNI"
-    echo "   3) shade      - Elligator2 statistical evasion"
-    echo "   4) scramble   - Entropy evasion with HTTP prefix"
-    echo "   5) speakeasy  - SSH protocol camouflage"
+    echo "   2) nether     - Minecraft protocol camouflage"
+    echo "   3) mirage     - TLS 1.3 record framing with configurable SNI"
+    echo "   4) shade      - Elligator2 statistical evasion"
+    echo "   5) scramble   - Entropy evasion with HTTP prefix"
+    echo "   6) speakeasy  - SSH protocol camouflage"
     echo ""
-    read -rp " Choose [1-5] (default: 1): " tchoice <&$STDIN_FD
+    read -rp " Choose [1-6] (default: 1): " tchoice <&$STDIN_FD
     case "${tchoice:-1}" in
         1|shitstorm) TRANSPORT="shitstorm" ;;
-        2|mirage)    TRANSPORT="mirage" ;;
-        3|shade)     TRANSPORT="shade" ;;
-        4|scramble)  TRANSPORT="scramble" ;;
-        5|speakeasy) TRANSPORT="speakeasy" ;;
+        2|nether)    TRANSPORT="nether" ;;
+        3|mirage)    TRANSPORT="mirage" ;;
+        4|shade)     TRANSPORT="shade" ;;
+        5|scramble)  TRANSPORT="scramble" ;;
+        6|speakeasy) TRANSPORT="speakeasy" ;;
         *) die "Invalid transport." ;;
     esac
 fi
@@ -179,15 +181,15 @@ echo ""
 echo "[1/5] Installing dependencies..."
 if command -v apt-get >/dev/null 2>&1; then
     apt-get update -qq
-    apt-get install -y -qq build-essential libsodium-dev zlib1g-dev pkg-config git curl >/dev/null 2>&1
+    apt-get install -y -qq build-essential libsodium-dev libevent-dev zlib1g-dev pkg-config git curl >/dev/null 2>&1
 elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y -q gcc make libsodium-devel zlib-devel pkg-config git curl >/dev/null 2>&1
+    dnf install -y -q gcc make libsodium-devel libevent-devel zlib-devel pkg-config git curl >/dev/null 2>&1
 elif command -v pacman >/dev/null 2>&1; then
-    pacman -Sy --noconfirm base-devel libsodium zlib git curl >/dev/null 2>&1
+    pacman -Sy --noconfirm base-devel libsodium libevent zlib git curl >/dev/null 2>&1
 elif command -v apk >/dev/null 2>&1; then
-    apk add --quiet build-base libsodium-dev zlib-dev pkgconfig git curl
+    apk add --quiet build-base libsodium-dev libevent-dev zlib-dev pkgconfig git curl
 else
-    die "Unsupported OS. Install manually: gcc make libsodium-dev zlib1g-dev pkg-config git"
+    die "Unsupported OS. Install manually: gcc make libsodium-dev libevent-dev zlib1g-dev pkg-config git"
 fi
 
 if pkg-config --exists libsodium 2>/dev/null; then
@@ -234,6 +236,21 @@ fi
 install -m 755 moor /usr/local/bin/moor
 echo "  installed /usr/local/bin/moor"
 
+# Fetch GeoIP database for path diversity (Tor-format IPFire location data)
+GEOIP_DIR="/usr/local/share/moor"
+mkdir -p "$GEOIP_DIR"
+if [[ ! -f "$GEOIP_DIR/geoip" ]]; then
+    echo "  fetching GeoIP database..."
+    curl -sL "https://raw.githubusercontent.com/torproject/tor/main/src/config/geoip" \
+        -o "$GEOIP_DIR/geoip" 2>/dev/null || true
+    if [[ -s "$GEOIP_DIR/geoip" ]]; then
+        echo "  installed GeoIP ($(wc -l < "$GEOIP_DIR/geoip") entries)"
+    else
+        echo "  GeoIP fetch failed (path diversity will be disabled)"
+        rm -f "$GEOIP_DIR/geoip"
+    fi
+fi
+
 # ---- configure ----
 
 echo "[4/5] Configuring..."
@@ -242,8 +259,9 @@ if ! id "$MOOR_USER" &>/dev/null; then
     useradd -r -m -d /home/$MOOR_USER -s /usr/sbin/nologin "$MOOR_USER"
 fi
 
-mkdir -p "$DATA_DIR" "$CONF_DIR"
-chown "$MOOR_USER:$MOOR_USER" "$DATA_DIR"
+mkdir -p "$DATA_DIR/keys" "$CONF_DIR"
+chown -R "$MOOR_USER:$MOOR_USER" "$DATA_DIR"
+chmod 700 "$DATA_DIR/keys"
 
 # Build config
 ROLE_LINE=""
@@ -280,7 +298,6 @@ DataDirectory $DATA_DIR
 ${ROLE_LINE}
 ${BRIDGE_LINES}
 ${ENCLAVE_LINE}
-Verbose 1
 $(if [[ -n "$CONTACT_INFO" ]]; then echo "ContactInfo $CONTACT_INFO"; fi)
 
 # Bandwidth (auto-detected, uncomment to override)

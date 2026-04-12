@@ -3544,8 +3544,16 @@ int main(int argc, char **argv) {
     }
     apply_config_to_globals(&g_config);
 
-    if (g_verbose)
+    if (g_verbose) {
         moor_log_set_level(MOOR_LOG_DEBUG);
+        moor_log_set_safe_mode(1);
+        fprintf(stderr,
+            "\n"
+            "  *** WARNING: VERBOSE LOGGING ENABLED ***\n"
+            "  IP addresses and key material are always redacted.\n"
+            "  DO NOT use -v in production.\n"
+            "\n");
+    }
 
     /* Init crypto */
     if (moor_crypto_init() != 0) {

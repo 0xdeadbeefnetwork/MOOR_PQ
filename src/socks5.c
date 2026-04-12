@@ -170,8 +170,8 @@ static void assign_circuits_to_waiting_clients(void) {
             ce->conn = pb->circuit->conn;
             g_circuit_cache_count++;
             client->circuit = pb->circuit;
-            LOG_INFO("assigned prebuilt circuit %u to domain %s",
-                     pb->circuit->circuit_id, domain);
+            LOG_INFO("assigned prebuilt circuit %u for stream (instant)",
+                     pb->circuit->circuit_id);
         } else {
             continue;
         }
@@ -181,8 +181,8 @@ static void assign_circuits_to_waiting_clients(void) {
                                       client->target_port) == 0) {
             client->state = SOCKS5_STATE_CONNECTED;
             client->begin_sent_at = (uint64_t)time(NULL);
-            LOG_INFO("stream %u opened for queued clearnet client -> %s",
-                     client->stream_id, client->target_addr);
+            LOG_INFO("stream %u opened for queued clearnet client",
+                     client->stream_id);
         } else {
             uint8_t fail[] = { 0x05, 0x04, 0x00, 0x01, 0,0,0,0, 0,0 };
             send(client->client_fd, (char *)fail, sizeof(fail), MSG_NOSIGNAL);
@@ -382,8 +382,8 @@ static void hs_pending_complete(hs_pending_connect_t *pending) {
                                           client->target_port) == 0) {
                 client->state = SOCKS5_STATE_CONNECTED;
                 client->begin_sent_at = (uint64_t)time(NULL);
-                LOG_INFO("HS: stream %u opened for queued client -> %s",
-                         client->stream_id, client->target_addr);
+                LOG_INFO("HS: stream %u opened for queued client",
+                         client->stream_id);
             } else {
                 uint8_t fail[] = { 0x05, 0x04, 0x00, 0x01, 0,0,0,0, 0,0 };
                 send(client->client_fd, (char *)fail, sizeof(fail), MSG_NOSIGNAL);
@@ -755,7 +755,7 @@ static circuit_cache_entry_t *get_circuit_for_domain(const char *domain,
             }
             if (built) {
                 g_inflight_builds++;
-                LOG_INFO("on-demand async build started for %s", domain);
+                LOG_INFO("on-demand async circuit build started");
             } else {
                 moor_circuit_free(bcirc);
                 moor_connection_free(bc);
@@ -1589,7 +1589,7 @@ int moor_socks5_handle_request(moor_socks5_client_t *client,
     /* SOCKS5 RESOLVE (0xF0): resolve hostname through circuit, return IP.
      * Tor-aligned: client sends domain name, we resolve and return IPv4. */
     if (cmd == 0xF0) {
-        LOG_DEBUG("SOCKS5 RESOLVE request for %s", client->target_addr);
+        LOG_DEBUG("SOCKS5 RESOLVE request");
         /* For .moor addresses: assign virtual IP via addressmap */
         if (moor_is_moor_address(client->target_addr)) {
             uint32_t vip = moor_addressmap_assign(client->target_addr);
@@ -1654,8 +1654,7 @@ int moor_socks5_handle_request(moor_socks5_client_t *client,
                 /* Queue behind the existing build -- RENDEZVOUS2 callback
                  * will find all BUILDING clients for this address */
                 client->state = SOCKS5_STATE_BUILDING;
-                LOG_DEBUG("HS: queuing client for %s (build in progress)",
-                          client->target_addr);
+                LOG_DEBUG("HS: queuing client for .moor service (build in progress)");
                 return 0;
             }
 
@@ -1728,8 +1727,7 @@ int moor_socks5_handle_request(moor_socks5_client_t *client,
                            hs_rp_read_cb, rp_circ->conn);
 
             client->state = SOCKS5_STATE_BUILDING;
-            LOG_INFO("HS: async connect started for %s (waiting for RV2)",
-                     client->target_addr);
+            LOG_INFO("HS: async connect started (waiting for RV2)");
             return 0;
         }
     } else {
@@ -1749,8 +1747,7 @@ int moor_socks5_handle_request(moor_socks5_client_t *client,
              * up when a circuit becomes ready. */
             client->state = SOCKS5_STATE_BUILDING;
             client->begin_sent_at = (uint64_t)time(NULL);
-            LOG_DEBUG("SOCKS5: no circuit for %s, entering BUILDING state",
-                      client->target_addr);
+            LOG_DEBUG("SOCKS5: no circuit available, entering BUILDING state");
             return 0;
         }
 

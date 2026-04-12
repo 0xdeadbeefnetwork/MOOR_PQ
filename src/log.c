@@ -65,15 +65,34 @@ static void sanitize_log_message(char *out, size_t out_len,
             }
         }
 
-        /* Detect long hex strings (potential key material: 64+ hex chars = 32+ bytes) */
+        /* Detect long hex strings (potential key material: 16+ hex chars = 8+ bytes) */
         if (isxdigit((unsigned char)msg[si]) && si + 1 < msg_len &&
             isxdigit((unsigned char)msg[si + 1])) {
             size_t hex_start = si;
             size_t j = si;
             while (j < msg_len && isxdigit((unsigned char)msg[j])) j++;
-            if ((j - hex_start) >= 64) {
-                /* 32+ bytes of hex -- likely key material, redact */
-                const char *redacted = "[KEY_REDACTED]";
+            if ((j - hex_start) >= 8) {
+                /* 4+ bytes of hex -- likely key material, redact */
+                const char *redacted = "[KEY]";
+                size_t rlen = strlen(redacted);
+                if (di + rlen < out_len) {
+                    memcpy(out + di, redacted, rlen);
+                    di += rlen;
+                }
+                si = j;
+                continue;
+            }
+        }
+
+        /* Detect .moor addresses (alphanumeric+.moor) */
+        if (si + 5 < msg_len && isalnum((unsigned char)msg[si])) {
+            size_t j = si;
+            while (j < msg_len && (isalnum((unsigned char)msg[j]) || msg[j] == '.'))
+                j++;
+            if (j - si > 10 && j >= 5 &&
+                msg[j-5] == '.' && msg[j-4] == 'm' && msg[j-3] == 'o' &&
+                msg[j-2] == 'o' && msg[j-1] == 'r') {
+                const char *redacted = "[ADDR]";
                 size_t rlen = strlen(redacted);
                 if (di + rlen < out_len) {
                     memcpy(out + di, redacted, rlen);
