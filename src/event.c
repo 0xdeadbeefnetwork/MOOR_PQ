@@ -270,6 +270,10 @@ static void postloop_cb(evutil_socket_t fd, short what, void *arg) {
     }
 }
 
+struct event_base *moor_event_get_base(void) {
+    return g_base;
+}
+
 void moor_event_stop(void) {
     g_running = 0;
     g_shutdown_requested = 1;

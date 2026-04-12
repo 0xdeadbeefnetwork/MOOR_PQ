@@ -1498,6 +1498,7 @@ int moor_relay_handle_create(moor_connection_t *conn,
     moor_crypto_wipe(dh2, 32);
     moor_crypto_wipe(key_seed, 32);
 
+    conn->circuit_refcount++;
     moor_circuit_register(circ);
     LOG_INFO("CREATE handled (CKE): circuit %u", cell->circuit_id);
     return 0;
@@ -1599,6 +1600,7 @@ int moor_relay_handle_create_pq(moor_connection_t *conn,
     moor_crypto_wipe(dh2, 32);
     moor_crypto_wipe(key_seed, 32);
 
+    conn->circuit_refcount++;
     moor_circuit_register(circ);
     return 0;
 }

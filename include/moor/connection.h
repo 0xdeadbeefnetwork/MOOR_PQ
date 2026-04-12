@@ -193,4 +193,8 @@ int moor_tcp_connect_nonblocking(const char *address, uint16_t port);
  * Returns number of connections reaped. */
 int moor_connection_reap_idle(int max_idle_sec);
 
+/* Send CELL_PADDING on connections that have circuits but have been idle
+ * for idle_threshold_sec.  Keeps relay-to-relay links alive. */
+void moor_connection_send_keepalive(int idle_threshold_sec);
+
 #endif /* MOOR_CONNECTION_H */

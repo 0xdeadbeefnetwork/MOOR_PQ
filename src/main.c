@@ -407,18 +407,92 @@ static void parse_args_into_config(moor_config_t *cfg, int argc, char **argv) {
 /* DA event callback */
 static moor_da_config_t g_da_config;
 
-/* DA dir port: each client gets its own thread so PUBLISH (with PoW
- * verification) doesn't block consensus fetches or vote exchange.
- * moor_da_handle_request uses da_lock/da_unlock internally to protect
- * consensus state — thread-safe by design. */
-typedef struct { int fd; } da_client_arg_t;
 
-static void *da_client_thread(void *arg) {
-    da_client_arg_t *a = (da_client_arg_t *)arg;
-    moor_da_handle_request(a->fd, &g_da_config);
-    close(a->fd);
-    free(a);
-    return NULL;
+/* ---- DA bounded thread pool ----
+ * Fixed pool of MOOR_DA_POOL_SIZE workers with a ring buffer queue.
+ * Replaces unbounded pthread_create/detach per connection.
+ * Accept is non-blocking (libevent), workers do blocking I/O.
+ * da_lock/da_unlock inside handle_request protects shared state. */
+typedef struct {
+    pthread_t       threads[MOOR_DA_POOL_SIZE];
+    int             queue[MOOR_DA_POOL_QUEUE_MAX];  /* ring buffer of fds */
+    int             q_head, q_tail, q_count;
+    pthread_mutex_t mutex;
+    pthread_cond_t  cond;
+    volatile int    stop;
+    volatile int    active;         /* threads currently handling a request */
+    uint64_t        total_served;
+    uint64_t        total_rejected;
+} da_pool_t;
+
+static da_pool_t g_da_pool;
+
+static void *da_pool_worker(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&g_da_pool.mutex);
+        while (g_da_pool.q_count == 0 && !g_da_pool.stop)
+            pthread_cond_wait(&g_da_pool.cond, &g_da_pool.mutex);
+        if (g_da_pool.stop && g_da_pool.q_count == 0) {
+            pthread_mutex_unlock(&g_da_pool.mutex);
+            return NULL;
+        }
+        int fd = g_da_pool.queue[g_da_pool.q_head];
+        g_da_pool.q_head = (g_da_pool.q_head + 1) % MOOR_DA_POOL_QUEUE_MAX;
+        g_da_pool.q_count--;
+        __sync_fetch_and_add(&g_da_pool.active, 1);
+        pthread_mutex_unlock(&g_da_pool.mutex);
+
+        moor_da_handle_request(fd, &g_da_config);
+        close(fd);
+
+        __sync_fetch_and_sub(&g_da_pool.active, 1);
+    }
+}
+
+static void da_pool_submit(int client_fd) {
+    pthread_mutex_lock(&g_da_pool.mutex);
+    if (g_da_pool.q_count >= MOOR_DA_POOL_QUEUE_MAX) {
+        g_da_pool.total_rejected++;
+        pthread_mutex_unlock(&g_da_pool.mutex);
+        send(client_fd, "BUSY\n", 5, MSG_NOSIGNAL);
+        close(client_fd);
+        LOG_WARN("DA: pool queue full, rejecting connection (%llu rejected total)",
+                 (unsigned long long)g_da_pool.total_rejected);
+        return;
+    }
+    g_da_pool.queue[g_da_pool.q_tail] = client_fd;
+    g_da_pool.q_tail = (g_da_pool.q_tail + 1) % MOOR_DA_POOL_QUEUE_MAX;
+    g_da_pool.q_count++;
+    g_da_pool.total_served++;
+    pthread_cond_signal(&g_da_pool.cond);
+    pthread_mutex_unlock(&g_da_pool.mutex);
+}
+
+static void da_pool_init(void) {
+    memset(&g_da_pool, 0, sizeof(g_da_pool));
+    pthread_mutex_init(&g_da_pool.mutex, NULL);
+    pthread_cond_init(&g_da_pool.cond, NULL);
+    for (int i = 0; i < MOOR_DA_POOL_SIZE; i++) {
+        if (pthread_create(&g_da_pool.threads[i], NULL, da_pool_worker, NULL) != 0)
+            LOG_ERROR("DA: failed to create pool worker %d", i);
+    }
+    LOG_INFO("DA: thread pool started (%d workers, queue %d)",
+             MOOR_DA_POOL_SIZE, MOOR_DA_POOL_QUEUE_MAX);
+}
+
+static void da_pool_shutdown(void) {
+    pthread_mutex_lock(&g_da_pool.mutex);
+    g_da_pool.stop = 1;
+    pthread_cond_broadcast(&g_da_pool.cond);
+    pthread_mutex_unlock(&g_da_pool.mutex);
+    for (int i = 0; i < MOOR_DA_POOL_SIZE; i++)
+        pthread_join(g_da_pool.threads[i], NULL);
+    pthread_mutex_destroy(&g_da_pool.mutex);
+    pthread_cond_destroy(&g_da_pool.cond);
+    LOG_INFO("DA: thread pool shut down (served %llu, rejected %llu)",
+             (unsigned long long)g_da_pool.total_served,
+             (unsigned long long)g_da_pool.total_rejected);
 }
 
 static void da_accept_cb(int fd, int events, void *arg) {
@@ -430,18 +504,7 @@ static void da_accept_cb(int fd, int events, void *arg) {
     if (client_fd < 0) return;
     moor_setsockopt_timeo(client_fd, SO_RCVTIMEO, 10);
     moor_setsockopt_timeo(client_fd, SO_SNDTIMEO, 10);
-
-    da_client_arg_t *a = malloc(sizeof(*a));
-    if (!a) { close(client_fd); return; }
-    a->fd = client_fd;
-
-    pthread_t t;
-    if (pthread_create(&t, NULL, da_client_thread, a) == 0) {
-        pthread_detach(t);
-    } else {
-        close(client_fd);
-        free(a);
-    }
+    da_pool_submit(client_fd);
 }
 
 static uint64_t g_da_last_epoch = 0;
@@ -548,10 +611,14 @@ static void da_probe_timer_cb(void *arg) {
     }
 }
 
-/* Connection reaper timer: cull idle connections every 30s */
+/* Connection reaper timer: cull idle connections every 30s.
+ * First send keepalive padding on connections with circuits that are
+ * going idle — prevents relay-to-relay links in multi-hop HS intro
+ * circuits from being reaped.  Then reap truly dead connections. */
 static void conn_reap_timer_cb(void *arg) {
     (void)arg;
-    moor_connection_reap_idle(120); /* 2 minutes idle = dead */
+    moor_connection_send_keepalive(45); /* pad connections idle > 45s */
+    moor_connection_reap_idle(120);     /* reap connections idle > 120s with no circuits */
 }
 
 /* Relay event callbacks */
@@ -1237,6 +1304,7 @@ static int run_da(void) {
     if (listen_fd < 0) return -1;
 
     moor_event_add(listen_fd, MOOR_EVENT_READ, da_accept_cb, NULL);
+    da_pool_init();
 
     /* Build initial consensus and exchange votes with peers */
     moor_da_build_consensus(&g_da_config);
@@ -1274,7 +1342,9 @@ static int run_da(void) {
     if (maybe_drop_privileges() != 0) return -1;
 #endif
     moor_sandbox_apply();
-    return moor_event_loop();
+    int ret = moor_event_loop();
+    da_pool_shutdown();
+    return ret;
 }
 
 static int run_relay(void) {
@@ -2511,7 +2581,13 @@ static void hs_blinded_key_rotation_cb(void *arg) {
 /* Send PADDING cells on intro circuit connections to keep NAT mappings alive.
  * Without this, the Pi's NAT router drops the TCP mapping after ~4 minutes
  * and intro circuits silently die. TCP keepalive doesn't help because many
- * NAT routers ignore keepalive-only ACKs. */
+ * NAT routers ignore keepalive-only ACKs.
+ *
+ * IMPORTANT: Do NOT circuit-encrypt (moor_circuit_encrypt_forward) CELL_PADDING.
+ * Relays skip circuit-layer decryption for CELL_PADDING (relay.c case
+ * CELL_PADDING: return 0), so encrypting would desync the forward nonce
+ * counter — every subsequent relay cell fails to decrypt and the circuit
+ * silently dies.  Send at the link layer only. */
 static void hs_intro_padding_cb(void *arg) {
     (void)arg;
     int hs_count = g_config.num_hidden_services;
@@ -2521,12 +2597,13 @@ static void hs_intro_padding_cb(void *arg) {
             moor_circuit_t *circ = g_hs_configs[h].intro_circuits[i];
             if (!circ || !circ->conn || circ->conn->state != CONN_STATE_OPEN)
                 continue;
+            /* Link-level padding: no circuit encryption, no nonce bump.
+             * The relay sees CELL_PADDING at the link layer and returns 0. */
             moor_cell_t pad;
             memset(&pad, 0, sizeof(pad));
             pad.circuit_id = circ->circuit_id;
             pad.command = CELL_PADDING;
-            if (moor_circuit_encrypt_forward(circ, &pad) == 0)
-                moor_connection_send_cell(circ->conn, &pad);
+            moor_connection_send_cell(circ->conn, &pad);
         }
     }
 }

@@ -1666,3 +1666,35 @@ int moor_connection_reap_idle(int max_idle_sec) {
         LOG_INFO("reaper: closed %d idle connections", reaped);
     return reaped;
 }
+
+/* Send CELL_PADDING on connections that have circuits but are going idle.
+ * Keeps relay-to-relay links alive so intermediate hops in multi-hop
+ * circuits (especially HS intro circuits) don't get reaped.  Without this,
+ * only the first hop gets application-level padding from the client —
+ * Guard→Middle and Middle→IntroRelay connections go idle and die. */
+void moor_connection_send_keepalive(int idle_threshold_sec) {
+    uint64_t now = (uint64_t)time(NULL);
+    int sent = 0;
+
+    conn_pool_lock();
+    for (int i = 0; i < MOOR_MAX_CONNECTIONS; i++) {
+        moor_connection_t *c = &g_conn_pool[i];
+        if (c->fd < 0 || c->state != CONN_STATE_OPEN) continue;
+        if (c->circuit_refcount <= 0) continue; /* no circuits — reaper handles */
+        if (c->last_activity == 0) continue;
+        if ((int64_t)(now - c->last_activity) < idle_threshold_sec) continue;
+
+        /* Connection has circuits but is going idle — send link-level padding */
+        moor_cell_t pad;
+        memset(&pad, 0, sizeof(pad));
+        pad.command = CELL_PADDING;
+        conn_pool_unlock();
+        moor_connection_send_cell(c, &pad);
+        conn_pool_lock();
+        sent++;
+    }
+    conn_pool_unlock();
+
+    if (sent > 0)
+        LOG_DEBUG("keepalive: padded %d idle connections", sent);
+}

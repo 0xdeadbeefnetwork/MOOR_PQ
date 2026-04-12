@@ -136,6 +136,8 @@ void moor_da_set_geoip(moor_geoip_db_t *db);
 
 /* Handle incoming directory request on a connection */
 int moor_da_handle_request(int client_fd, moor_da_config_t *config);
+int moor_da_handle_request_with_prefix(int client_fd, moor_da_config_t *config,
+                                        const char *prefix, size_t prefix_len);
 
 /* Add a relay descriptor to DA */
 int moor_da_add_relay(moor_da_config_t *config,

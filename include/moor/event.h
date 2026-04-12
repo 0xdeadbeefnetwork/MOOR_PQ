@@ -56,4 +56,7 @@ void moor_event_stop(void);
 /* Get current time in milliseconds */
 uint64_t moor_time_ms(void);
 
+/* Get the libevent event_base (for bufferevent, etc.) */
+struct event_base *moor_event_get_base(void);
+
 #endif /* MOOR_EVENT_H */

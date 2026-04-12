@@ -106,4 +106,8 @@
  * If a circuit exceeds this, it's killed to prevent memory exhaustion. */
 #define MOOR_CIRC_CELL_QUEUE_MAX  2500
 
+/* ===== INTERNAL -- DA Thread Pool ===== */
+#define MOOR_DA_POOL_SIZE        8      /* DA dir port worker threads */
+#define MOOR_DA_POOL_QUEUE_MAX   32     /* Pending connection queue depth */
+
 #endif /* MOOR_LIMITS_H */

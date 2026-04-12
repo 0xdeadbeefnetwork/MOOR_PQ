@@ -4,6 +4,9 @@
 #include "exit_notice.h"
 #include <sodium.h>
 #include <string.h>
+#ifndef _WIN32
+#include <fcntl.h>
+#endif
 
 /* Trusted DA public keys for consensus signature verification. */
 static uint8_t g_trusted_da_pks[16 * 32];
@@ -1710,12 +1713,42 @@ static int da_is_peer(int client_fd, const moor_da_config_t *config) {
     return 0;
 }
 
+/* Core dispatch — shared between blocking and bufferevent entry points */
+static int da_dispatch_request(int client_fd, moor_da_config_t *config,
+                                const char *cmd_buf, ssize_t n);
+
+int moor_da_handle_request_with_prefix(int client_fd, moor_da_config_t *config,
+                                        const char *prefix, size_t prefix_len) {
+    char cmd_buf[64];
+    memset(cmd_buf, 0, sizeof(cmd_buf));
+    ssize_t n = (ssize_t)prefix_len;
+    if (n > (ssize_t)(sizeof(cmd_buf) - 1))
+        n = (ssize_t)(sizeof(cmd_buf) - 1);
+    memcpy(cmd_buf, prefix, (size_t)n);
+
+    /* Restore blocking mode (bufferevent set non-blocking) */
+#ifndef _WIN32
+    int flags = fcntl(client_fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(client_fd, F_SETFL, flags & ~O_NONBLOCK);
+#endif
+    moor_setsockopt_timeo(client_fd, SO_RCVTIMEO, 10);
+    moor_setsockopt_timeo(client_fd, SO_SNDTIMEO, 10);
+
+    return da_dispatch_request(client_fd, config, cmd_buf, n);
+}
+
 int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
     char cmd_buf[64];
     memset(cmd_buf, 0, sizeof(cmd_buf));
 
     ssize_t n = recv(client_fd, cmd_buf, sizeof(cmd_buf) - 1, 0);
     if (n <= 0) return -1;
+
+    return da_dispatch_request(client_fd, config, cmd_buf, n);
+}
+
+static int da_dispatch_request(int client_fd, moor_da_config_t *config,
+                                const char *cmd_buf, ssize_t n) {
 
     /* HTTP metrics dashboard -- lock to safely iterate relay list */
     if (n >= 5 && strncmp(cmd_buf, "GET /", 5) == 0) {
