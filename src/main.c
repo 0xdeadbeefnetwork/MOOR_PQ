@@ -1455,8 +1455,13 @@ static int run_relay(void) {
         }
     }
 
-    /* Self-test: verify our own OR port is reachable (2s delay for listener startup) */
-    g_selftest_timer_id = moor_event_add_timer(2000, relay_selftest_timer_cb, NULL);
+    /* Self-test: verify our own OR port is reachable.
+     * SKIP for bridges — the self-test connects without a transport,
+     * which triggers the bridge's transport handshake on a raw socket.
+     * The self-test's connection allocates from the same pool as real
+     * clients; if both are in-flight, the pool slot gets poisoned. */
+    if (!g_is_bridge)
+        g_selftest_timer_id = moor_event_add_timer(2000, relay_selftest_timer_cb, NULL);
 
     /* Re-fetch consensus after 15s to pick up relays that registered after us.
      * After first success, interval increases to CONSENSUS_INTERVAL/2 (30 min). */
