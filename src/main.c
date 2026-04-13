@@ -1416,13 +1416,22 @@ static int run_da(void) {
     }
 
     /* DA-to-DA relay sync: every 5 minutes, pull relay lists from peers */
-    moor_event_add_timer(300 * 1000, da_sync_timer_cb, NULL);
+    if (moor_event_add_timer(300 * 1000, da_sync_timer_cb, NULL) < 0) {
+        LOG_ERROR("FATAL: failed to register DA sync timer");
+        return -1;
+    }
 
     /* Relay liveness probing: every 15 minutes, verify relays are reachable */
-    moor_event_add_timer(900 * 1000, da_probe_timer_cb, NULL);
+    if (moor_event_add_timer(900 * 1000, da_probe_timer_cb, NULL) < 0) {
+        LOG_ERROR("FATAL: failed to register DA probe timer");
+        return -1;
+    }
 
     /* Connection reaper for DA mode */
-    moor_event_add_timer(30000, conn_reap_timer_cb, NULL);
+    if (moor_event_add_timer(30000, conn_reap_timer_cb, NULL) < 0) {
+        LOG_ERROR("FATAL: failed to register connection reaper timer");
+        return -1;
+    }
 
     LOG_INFO("directory authority running on %s:%u", g_bind_addr, g_dir_port);
 #ifndef _WIN32
@@ -1556,13 +1565,24 @@ static int run_relay(void) {
     /* Re-fetch consensus after 15s to pick up relays that registered after us.
      * After first success, interval increases to CONSENSUS_INTERVAL/2 (30 min). */
     g_relay_consensus_retry_id = moor_event_add_timer(15000, relay_consensus_retry_cb, NULL);
+    if (g_relay_consensus_retry_id < 0) {
+        LOG_ERROR("FATAL: failed to register consensus retry timer");
+        return -1;
+    }
 
-    /* Periodic re-registration */
-    moor_event_add_timer(MOOR_CONSENSUS_INTERVAL * 1000 / 2,
-                         relay_periodic_cb, NULL);
+    /* Periodic re-registration — if this timer fails, the relay
+     * silently stops re-registering and gets reaped after 3 hours. */
+    if (moor_event_add_timer(MOOR_CONSENSUS_INTERVAL * 1000 / 2,
+                         relay_periodic_cb, NULL) < 0) {
+        LOG_ERROR("FATAL: failed to register periodic re-registration timer");
+        return -1;
+    }
 
     /* Circuit timeout enforcement: check every 10 seconds */
-    moor_event_add_timer(10000, circuit_timeout_cb, NULL);
+    if (moor_event_add_timer(10000, circuit_timeout_cb, NULL) < 0) {
+        LOG_ERROR("FATAL: failed to register circuit timeout timer");
+        return -1;
+    }
 
     /* Observed bandwidth sampling: every 10 seconds (Tor-aligned).
      * Tracks actual throughput so relays advertise realistic bandwidth. */
@@ -2675,6 +2695,10 @@ static volatile uint64_t g_hs_cons_refresh_started = 0;
 
 static void *hs_consensus_refresh_thread(void *arg) {
     (void)arg;
+    if (!g_hs_consensus) {
+        __sync_lock_release(&g_hs_cons_refresh_running);
+        return NULL;
+    }
     moor_consensus_t *fresh = calloc(1, sizeof(moor_consensus_t));
     if (!fresh) { __sync_lock_release(&g_hs_cons_refresh_running); return NULL; }
     if (moor_client_fetch_consensus_multi(fresh, g_da_list, g_num_das) == 0) {
@@ -2983,11 +3007,14 @@ static int run_hs(void) {
         g_hs_configs[h].skip_dht_publish = 1;
 
     /* R10-CC3: Register periodic timers for HS maintenance */
-    moor_event_add_timer(10 * 60 * 1000, hs_consensus_refresh_cb, NULL);
-    moor_event_add_timer(5 * 60 * 1000, hs_blinded_key_rotation_cb, NULL);
-    moor_event_add_timer(30 * 1000, hs_intro_rotation_cb, NULL);
-    moor_event_add_timer(45 * 1000, hs_intro_padding_cb, NULL);
-    moor_event_add_timer(5 * 60 * 1000, hs_desc_republish_cb, NULL);
+    if (moor_event_add_timer(10 * 60 * 1000, hs_consensus_refresh_cb, NULL) < 0 ||
+        moor_event_add_timer(5 * 60 * 1000, hs_blinded_key_rotation_cb, NULL) < 0 ||
+        moor_event_add_timer(30 * 1000, hs_intro_rotation_cb, NULL) < 0 ||
+        moor_event_add_timer(45 * 1000, hs_intro_padding_cb, NULL) < 0 ||
+        moor_event_add_timer(5 * 60 * 1000, hs_desc_republish_cb, NULL) < 0) {
+        LOG_ERROR("FATAL: failed to register HS timers");
+        return -1;
+    }
 
 #ifndef _WIN32
     if (maybe_drop_privileges() != 0) return -1;

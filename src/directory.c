@@ -1004,6 +1004,10 @@ static void da_update_published_snapshot_unlocked(moor_da_config_t *config) {
     size_t buf_sz = moor_consensus_wire_size(&config->consensus);
     if (buf_sz < 1024) buf_sz = 1024;
     uint8_t *buf = malloc(buf_sz);
+    if (!buf) {
+        LOG_WARN("DA: snapshot update malloc failed (%zu bytes), serving stale consensus",
+                 buf_sz);
+    }
     if (buf) {
         int len = moor_consensus_serialize(buf, buf_sz, &config->consensus);
         if (len > 0) {
