@@ -767,6 +767,44 @@ static void relay_accept_cb(int fd, int events, void *arg) {
         return;
     }
 
+    /* Honeypot: if first bytes look like HTTP, SSH version, or nmap probe,
+     * respond as a smart toaster. Real MOOR clients send a Noise_IK
+     * handshake (starts with 32 bytes of ephemeral key — high entropy).
+     * Scanners send "GET /", "SSH-", "\x00", or other low-entropy probes.
+     * This wastes their time and pollutes their databases. */
+    if (pn > 0) {
+        int is_scanner = 0;
+        if (pn >= 3 && memcmp(peek, "GET", 3) == 0) is_scanner = 1;
+        if (pn >= 4 && memcmp(peek, "HEAD", 4) == 0) is_scanner = 1;
+        if (pn >= 4 && memcmp(peek, "POST", 4) == 0) is_scanner = 1;
+        if (pn >= 4 && memcmp(peek, "SSH-", 4) == 0) is_scanner = 1;
+        if (pn >= 4 && memcmp(peek, "HELP", 4) == 0) is_scanner = 1;
+        if (pn >= 4 && memcmp(peek, "QUIT", 4) == 0) is_scanner = 1;
+        /* nmap sends \x00 or \x16\x03 (TLS ClientHello) */
+        if (pn >= 1 && (uint8_t)peek[0] == 0x00) is_scanner = 1;
+        if (pn >= 2 && (uint8_t)peek[0] == 0x16 && (uint8_t)peek[1] == 0x03) is_scanner = 1;
+
+        if (is_scanner) {
+            static const char honeypot[] =
+                "HTTP/1.0 200 OK\r\n"
+                "Server: SmartToaster/2.1.4 (Breville BTA845BSS)\r\n"
+                "Content-Type: application/json\r\n"
+                "X-Toast-Level: 4/7\r\n"
+                "X-Firmware: ARM-RTOS 0.3.1\r\n"
+                "X-Crumb-Tray: 73% full\r\n"
+                "\r\n"
+                "{\"status\":\"toasting\",\"slot_a\":\"sourdough\",\"slot_b\":\"empty\","
+                "\"temperature_c\":171,\"mode\":\"defrost\","
+                "\"notice\":\"Unauthorized port scanning detected. "
+                "This constitutes unauthorized access under CFAA 18 USC 1030(a)(2). "
+                "Your IP has been logged. "
+                "Since you are here: bc1qpu9c6mjp0ynry6ene3mqg8y65dzm6yarw5vc0m\"}";
+            send(client_fd, honeypot, sizeof(honeypot) - 1, MSG_NOSIGNAL);
+            close(client_fd);
+            return;
+        }
+    }
+
     /* Restore blocking mode for link handshake (PQ hybrid needs blocking recv) */
     {
 #ifdef _WIN32
