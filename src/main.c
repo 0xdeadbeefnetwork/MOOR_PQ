@@ -516,8 +516,12 @@ static int g_da_consensus_timer_id = -1;
  * Atomic flags prevent overlapping threads — if the previous one is
  * still running when the timer fires again, we skip rather than pile up. */
 static volatile int g_vote_exchange_running = 0;
+static volatile uint64_t g_vote_exchange_started = 0;
 static volatile int g_sync_running = 0;
+static volatile uint64_t g_sync_started = 0;
 static volatile int g_probe_running = 0;
+static volatile uint64_t g_probe_started = 0;
+#define DA_THREAD_MAX_SEC 120  /* force-reset stuck DA threads after 2 min */
 
 static void *da_vote_exchange_thread(void *arg) {
     (void)arg;
@@ -532,8 +536,18 @@ static void da_consensus_timer_cb(void *arg) {
     moor_da_build_consensus(&g_da_config);
 
     /* Run vote exchange in a detached thread to avoid blocking the
-     * event loop.  Skip if previous exchange is still running. */
+     * event loop.  Skip if previous exchange is still running.
+     * Watchdog: force-reset if stuck longer than DA_THREAD_MAX_SEC. */
+    if (g_vote_exchange_running) {
+        uint64_t elapsed = (uint64_t)time(NULL) - g_vote_exchange_started;
+        if (elapsed > DA_THREAD_MAX_SEC) {
+            LOG_WARN("DA: vote exchange thread stuck for %llus, force-resetting",
+                     (unsigned long long)elapsed);
+            __sync_lock_release(&g_vote_exchange_running);
+        }
+    }
     if (__sync_lock_test_and_set(&g_vote_exchange_running, 1) == 0) {
+        g_vote_exchange_started = (uint64_t)time(NULL);
         pthread_t vt;
         if (pthread_create(&vt, NULL, da_vote_exchange_thread, NULL) == 0)
             pthread_detach(vt);
@@ -577,7 +591,16 @@ static void *da_sync_thread(void *arg) {
 
 static void da_sync_timer_cb(void *arg) {
     (void)arg;
+    if (g_sync_running) {
+        uint64_t elapsed = (uint64_t)time(NULL) - g_sync_started;
+        if (elapsed > DA_THREAD_MAX_SEC) {
+            LOG_WARN("DA: sync thread stuck for %llus, force-resetting",
+                     (unsigned long long)elapsed);
+            __sync_lock_release(&g_sync_running);
+        }
+    }
     if (__sync_lock_test_and_set(&g_sync_running, 1) == 0) {
+        g_sync_started = (uint64_t)time(NULL);
         pthread_t t;
         if (pthread_create(&t, NULL, da_sync_thread, NULL) == 0)
             pthread_detach(t);
@@ -602,7 +625,16 @@ static void *da_probe_thread(void *arg) {
 
 static void da_probe_timer_cb(void *arg) {
     (void)arg;
+    if (g_probe_running) {
+        uint64_t elapsed = (uint64_t)time(NULL) - g_probe_started;
+        if (elapsed > DA_THREAD_MAX_SEC) {
+            LOG_WARN("DA: probe thread stuck for %llus, force-resetting",
+                     (unsigned long long)elapsed);
+            __sync_lock_release(&g_probe_running);
+        }
+    }
     if (__sync_lock_test_and_set(&g_probe_running, 1) == 0) {
+        g_probe_started = (uint64_t)time(NULL);
         pthread_t t;
         if (pthread_create(&t, NULL, da_probe_thread, NULL) == 0)
             pthread_detach(t);

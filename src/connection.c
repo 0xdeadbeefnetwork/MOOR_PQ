@@ -217,12 +217,21 @@ int moor_tcp_connect_simple(const char *address, uint16_t port) {
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
+    /* Try numeric-only first (instant, no DNS). Fall back to DNS
+     * only if needed. Prevents getaddrinfo from blocking 30+ seconds
+     * on broken DNS, which hangs any thread calling this function and
+     * can kill the entire network (stuck thread never releases flag). */
+    hints.ai_flags = AI_NUMERICHOST;
 
     char port_str[8];
     snprintf(port_str, sizeof(port_str), "%u", port);
 
-    if (getaddrinfo(address, port_str, &hints, &res) != 0)
-        return -1;
+    if (getaddrinfo(address, port_str, &hints, &res) != 0) {
+        /* Not a numeric IP — try with DNS (may block) */
+        hints.ai_flags = 0;
+        if (getaddrinfo(address, port_str, &hints, &res) != 0)
+            return -1;
+    }
 
     int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (fd < 0) {
