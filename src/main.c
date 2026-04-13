@@ -773,16 +773,24 @@ static void relay_accept_cb(int fd, int events, void *arg) {
      * Scanners send "GET /", "SSH-", "\x00", or other low-entropy probes.
      * This wastes their time and pollutes their databases. */
     if (pn > 0) {
+        /* Only match DEFINITE scanner signatures — ASCII protocol probes
+         * that can NEVER be a valid Noise_IK handshake. Noise_IK starts
+         * with 32 bytes of X25519 ephemeral key (high entropy). We must
+         * NOT match on single-byte patterns (0x00, 0x16) because a legit
+         * ephemeral key could start with any byte value.
+         * Match only multi-byte ASCII strings that are impossible as
+         * valid Curve25519 point encodings in context. */
         int is_scanner = 0;
-        if (pn >= 3 && memcmp(peek, "GET", 3) == 0) is_scanner = 1;
-        if (pn >= 4 && memcmp(peek, "HEAD", 4) == 0) is_scanner = 1;
-        if (pn >= 4 && memcmp(peek, "POST", 4) == 0) is_scanner = 1;
+        if (pn >= 4 && memcmp(peek, "GET ", 4) == 0) is_scanner = 1;
+        if (pn >= 5 && memcmp(peek, "HEAD ", 5) == 0) is_scanner = 1;
+        if (pn >= 5 && memcmp(peek, "POST ", 5) == 0) is_scanner = 1;
         if (pn >= 4 && memcmp(peek, "SSH-", 4) == 0) is_scanner = 1;
-        if (pn >= 4 && memcmp(peek, "HELP", 4) == 0) is_scanner = 1;
-        if (pn >= 4 && memcmp(peek, "QUIT", 4) == 0) is_scanner = 1;
-        /* nmap sends \x00 or \x16\x03 (TLS ClientHello) */
-        if (pn >= 1 && (uint8_t)peek[0] == 0x00) is_scanner = 1;
-        if (pn >= 2 && (uint8_t)peek[0] == 0x16 && (uint8_t)peek[1] == 0x03) is_scanner = 1;
+        if (pn >= 5 && memcmp(peek, "HELP\r", 5) == 0) is_scanner = 1;
+        if (pn >= 5 && memcmp(peek, "HELP\n", 5) == 0) is_scanner = 1;
+        if (pn >= 5 && memcmp(peek, "QUIT\r", 5) == 0) is_scanner = 1;
+        if (pn >= 5 && memcmp(peek, "QUIT\n", 5) == 0) is_scanner = 1;
+        if (pn >= 6 && memcmp(peek, "EHLO ", 5) == 0) is_scanner = 1;
+        if (pn >= 8 && memcmp(peek, "OPTIONS ", 8) == 0) is_scanner = 1;
 
         if (is_scanner) {
             /* Rotate between honeypot personas based on time.
