@@ -317,9 +317,11 @@ static void extend_complete_cb(int fd, int events, void *arg) {
     extend_work_t *w;
     while ((w = extend_pop_result()) != NULL) {
         /* Find the circuit — if prev_conn disconnected, circuit was freed.
-         * Check state first: a freed/poisoned connection has state=NONE, fd=-1.
-         * Then check generation to detect slot reuse (#CWE-362). */
-        if (w->prev_conn->state == CONN_STATE_NONE ||
+         * Check NULL first (could be cleared by nullify_conn), then state
+         * (freed/poisoned connection has state=NONE), then generation to
+         * detect slot reuse (#CWE-362). */
+        if (!w->prev_conn ||
+            w->prev_conn->state == CONN_STATE_NONE ||
             w->prev_conn->generation != w->prev_conn_generation) {
             LOG_WARN("EXTEND: prev_conn reused (gen %u != %u), discarding result",
                      w->prev_conn->generation, w->prev_conn_generation);

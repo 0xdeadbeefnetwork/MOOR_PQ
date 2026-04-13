@@ -252,6 +252,8 @@ int moor_node_descriptor_serialize(uint8_t *out, size_t out_len,
     }
     if (has_v5)
         needed += DESC_V5_EXTRA;
+    if (is_v2)
+        needed += 2; /* V6: protocol_version */
     if (out_len < needed) return -1;
 
     size_t off = 0;

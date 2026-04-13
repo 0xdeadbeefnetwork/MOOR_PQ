@@ -1543,8 +1543,13 @@ static void async_connect_write_cb(int fd, int events, void *arg) {
              * Callers use this to decide whether to back off or retry immediately. */
             int status = (err == ECONNREFUSED || err == ENETUNREACH ||
                           err == EHOSTUNREACH) ? -2 : -1;
-            if (conn->hs_state && conn->hs_state->on_complete)
-                conn->hs_state->on_complete(conn, status, conn->hs_state->on_complete_arg);
+            /* Save + detach hs_state before callback (same UAF guard as success path) */
+            moor_hs_state_t *saved_hs = conn->hs_state;
+            conn->hs_state = NULL;
+            if (saved_hs && saved_hs->on_complete)
+                saved_hs->on_complete(conn, status, saved_hs->on_complete_arg);
+            moor_crypto_wipe(saved_hs, sizeof(*saved_hs));
+            free(saved_hs);
             return;
         }
 
@@ -1590,19 +1595,18 @@ static void async_connect_write_cb(int fd, int events, void *arg) {
             setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE,
                        (const char *)&keepalive, sizeof(keepalive));
 
-            if (conn->hs_state && conn->hs_state->on_complete)
-                conn->hs_state->on_complete(conn, 0, conn->hs_state->on_complete_arg);
-        }
-
-        /* Clean up handshake state — but on_complete may have freed the
-         * connection (poisoned with 0xDE), making conn->hs_state a poison
-         * value that passes NULL checks.  Use the idempotent guard. */
-        if (conn->fd < 0 && conn->state == CONN_STATE_NONE && conn->generation > 0)
-            return;  /* conn was freed by on_complete */
-        if (conn->hs_state) {
-            moor_crypto_wipe(conn->hs_state, sizeof(moor_hs_state_t));
-            free(conn->hs_state);
+            /* Save + detach hs_state BEFORE calling on_complete.
+             * The callback may free the connection (poison with 0xDE),
+             * making conn->hs_state a garbage pointer that passes
+             * NULL checks. By clearing it first, we own the cleanup. */
+            moor_hs_state_t *saved_hs = conn->hs_state;
             conn->hs_state = NULL;
+
+            if (saved_hs && saved_hs->on_complete)
+                saved_hs->on_complete(conn, 0, saved_hs->on_complete_arg);
+
+            moor_crypto_wipe(saved_hs, sizeof(*saved_hs));
+            free(saved_hs);
         }
     }
 }
