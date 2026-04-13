@@ -46,7 +46,11 @@ int moor_consensus_copy(moor_consensus_t *dst, const moor_consensus_t *src) {
     /* Allocate and copy relay array */
     uint32_t cap = src->num_relays > 0 ? src->num_relays : 1;
     dst->relays = calloc(cap, sizeof(moor_node_descriptor_t));
-    if (!dst->relays) return -1;
+    if (!dst->relays) {
+        dst->num_relays = 0;
+        dst->relay_capacity = 0;
+        return -1;
+    }
     dst->relay_capacity = cap;
     if (src->num_relays > 0 && src->relays)
         memcpy(dst->relays, src->relays,
@@ -803,10 +807,11 @@ static uint32_t parse_flags(const char *s) {
 /* Ensure relay array has capacity for at least n+1 entries */
 static int cons_ensure_cap(moor_consensus_t *cons, uint32_t needed) {
     if (cons->relays && cons->relay_capacity >= needed) return 0;
+    if (needed > MOOR_MAX_RELAYS) return -1;  /* check BEFORE doubling loop */
     uint32_t new_cap = cons->relay_capacity ? cons->relay_capacity : 256;
-    while (new_cap < needed) new_cap *= 2;
+    while (new_cap < needed && new_cap <= MOOR_MAX_RELAYS / 2) new_cap *= 2;
+    if (new_cap < needed) new_cap = needed;
     if (new_cap > MOOR_MAX_RELAYS) new_cap = MOOR_MAX_RELAYS;
-    if (needed > MOOR_MAX_RELAYS) return -1;
     moor_node_descriptor_t *grown = realloc(cons->relays,
         (size_t)new_cap * sizeof(moor_node_descriptor_t));
     if (!grown) return -1;

@@ -396,7 +396,11 @@ void moor_skips_run(void) {
     uint32_t min_rtt_us = UINT32_MAX;
     for (int i = g_pending_count - 1; i >= 0; i--) {
         moor_channel_t *chan = g_pending[i];
-        if (!chan || chan->state != CHAN_STATE_OPEN ||
+        if (!chan) {
+            pending_remove(i);
+            continue;
+        }
+        if (chan->state != CHAN_STATE_OPEN ||
             !chan->conn || chan->conn->state != CONN_STATE_OPEN) {
             chan->sched_state = SCHED_CHAN_IDLE;
             pending_remove(i);
