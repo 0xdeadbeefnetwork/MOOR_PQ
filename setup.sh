@@ -14,11 +14,11 @@ main() {
 
 set -euo pipefail
 
+STDIN_FD=0
 if [[ ! -t 0 ]]; then
-    exec 3</dev/tty || { echo "Error: cannot read from terminal (use --role/--nickname flags for non-interactive)"; exit 1; }
-    STDIN_FD=3
-else
-    STDIN_FD=0
+    # Non-interactive (piped). Try /dev/tty for prompts, but don't
+    # fail here — if all args are provided via flags, no prompts needed.
+    exec 3</dev/tty 2>/dev/null && STDIN_FD=3 || STDIN_FD=""
 fi
 
 REPO_URL="https://github.com/0xdeadbeefnetwork/MOOR_PQ"
@@ -81,55 +81,73 @@ cat << 'BANNER'
 
 BANNER
 
-# ---- interactive prompts ----
+# ---- interactive prompts (skipped if all required args provided) ----
+
+# Helper: prompt only if we have a terminal
+ask() {
+    local var="$1" prompt="$2" default="${3:-}"
+    if [[ -n "$STDIN_FD" ]]; then
+        read -rp "$prompt" "$var" <&$STDIN_FD
+    elif [[ -n "$default" ]]; then
+        eval "$var='$default'"
+    else
+        die "$var is required (no terminal for prompt — pass via flags)"
+    fi
+}
 
 if [[ -z "$ROLE" ]]; then
-    echo " What kind of node do you want to run?"
-    echo ""
-    echo "   1) relay     - General relay, DA assigns flags based on performance"
-    echo "   2) middle    - Middle-only relay (never guard or exit)"
-    echo "   3) exit      - Exit relay (forwards traffic to the internet)"
-    echo "   4) guard     - Guard relay (entry point for circuits)"
-    echo "   5) bridge    - Bridge relay (unlisted, censorship circumvention)"
-    echo ""
-    read -rp " Choose [1-5] (default: 1): " choice <&$STDIN_FD
-    case "${choice:-1}" in
-        1|relay)  ROLE="relay" ;;
-        2|middle) ROLE="middle" ;;
-        3|exit)   ROLE="exit" ;;
-        4|guard)  ROLE="guard" ;;
-        5|bridge) ROLE="bridge" ;;
-        *) die "Invalid choice." ;;
-    esac
+    if [[ -z "$STDIN_FD" ]]; then
+        ROLE="relay"  # default when non-interactive
+    else
+        echo " What kind of node do you want to run?"
+        echo ""
+        echo "   1) relay     - General relay, DA assigns flags based on performance"
+        echo "   2) middle    - Middle-only relay (never guard or exit)"
+        echo "   3) exit      - Exit relay (forwards traffic to the internet)"
+        echo "   4) guard     - Guard relay (entry point for circuits)"
+        echo "   5) bridge    - Bridge relay (unlisted, censorship circumvention)"
+        echo ""
+        read -rp " Choose [1-5] (default: 1): " choice <&$STDIN_FD
+        case "${choice:-1}" in
+            1|relay)  ROLE="relay" ;;
+            2|middle) ROLE="middle" ;;
+            3|exit)   ROLE="exit" ;;
+            4|guard)  ROLE="guard" ;;
+            5|bridge) ROLE="bridge" ;;
+            *) die "Invalid choice." ;;
+        esac
+    fi
 fi
 
 if [[ "$ROLE" == "bridge" && -z "$TRANSPORT" ]]; then
-    echo ""
-    echo " Which pluggable transport?"
-    echo ""
-    echo "   1) shitstorm  - Chrome TLS 1.3 fingerprint (recommended, hardest to block)"
-    echo "   2) nether     - Minecraft protocol camouflage"
-    echo "   3) mirage     - TLS 1.3 record framing with configurable SNI"
-    echo "   4) shade      - Elligator2 statistical evasion"
-    echo "   5) scramble   - Entropy evasion with HTTP prefix"
-    echo "   6) speakeasy  - SSH protocol camouflage"
-    echo ""
-    read -rp " Choose [1-6] (default: 1): " tchoice <&$STDIN_FD
-    case "${tchoice:-1}" in
-        1|shitstorm) TRANSPORT="shitstorm" ;;
-        2|nether)    TRANSPORT="nether" ;;
-        3|mirage)    TRANSPORT="mirage" ;;
-        4|shade)     TRANSPORT="shade" ;;
-        5|scramble)  TRANSPORT="scramble" ;;
-        6|speakeasy) TRANSPORT="speakeasy" ;;
-        *) die "Invalid transport." ;;
-    esac
+    if [[ -z "$STDIN_FD" ]]; then
+        TRANSPORT="shitstorm"
+    else
+        echo ""
+        echo " Which pluggable transport?"
+        echo ""
+        echo "   1) shitstorm  - Chrome TLS 1.3 fingerprint (recommended, hardest to block)"
+        echo "   2) nether     - Minecraft protocol camouflage"
+        echo "   3) mirage     - TLS 1.3 record framing with configurable SNI"
+        echo "   4) shade      - Elligator2 statistical evasion"
+        echo "   5) scramble   - Entropy evasion with HTTP prefix"
+        echo "   6) speakeasy  - SSH protocol camouflage"
+        echo ""
+        read -rp " Choose [1-6] (default: 1): " tchoice <&$STDIN_FD
+        case "${tchoice:-1}" in
+            1|shitstorm) TRANSPORT="shitstorm" ;;
+            2|nether)    TRANSPORT="nether" ;;
+            3|mirage)    TRANSPORT="mirage" ;;
+            4|shade)     TRANSPORT="shade" ;;
+            5|scramble)  TRANSPORT="scramble" ;;
+            6|speakeasy) TRANSPORT="speakeasy" ;;
+            *) die "Invalid transport." ;;
+        esac
+    fi
 fi
 
 if [[ -z "$NICKNAME" ]]; then
-    echo ""
-    read -rp " Node nickname: " NICKNAME <&$STDIN_FD
-    [[ -n "$NICKNAME" ]] || die "Nickname required."
+    ask NICKNAME " Node nickname: "
 fi
 NICKNAME=$(echo "$NICKNAME" | tr -cd 'A-Za-z0-9_')
 [[ -n "$NICKNAME" ]] || die "Nickname must contain at least one alphanumeric character."
@@ -140,24 +158,26 @@ if [[ -z "$ADVERTISE" ]]; then
     ADVERTISE=$(detect_ip)
     if [[ -n "$ADVERTISE" ]]; then
         echo "$ADVERTISE"
-        read -rp " Use this IP? [Y/n]: " yn <&$STDIN_FD
-        if [[ "${yn:-y}" =~ ^[Nn] ]]; then
-            read -rp " Enter your public IP: " ADVERTISE <&$STDIN_FD
+        if [[ -n "$STDIN_FD" ]]; then
+            read -rp " Use this IP? [Y/n]: " yn <&$STDIN_FD
+            if [[ "${yn:-y}" =~ ^[Nn] ]]; then
+                read -rp " Enter your public IP: " ADVERTISE <&$STDIN_FD
+            fi
         fi
     else
         echo "couldn't detect"
-        read -rp " Enter your public IP: " ADVERTISE <&$STDIN_FD
+        ask ADVERTISE " Enter your public IP: "
     fi
     [[ -n "$ADVERTISE" ]] || die "Public IP required."
 fi
 
-if [[ -z "$CONTACT_INFO" ]]; then
+if [[ -n "$STDIN_FD" && -z "$CONTACT_INFO" ]]; then
     echo ""
     read -rp " Contact info (email/URL, optional, press Enter to skip): " CONTACT_INFO <&$STDIN_FD
 fi
 
-# Ask about enclave if not specified
-if [[ -z "$ENCLAVE" ]]; then
+# Ask about enclave only interactively
+if [[ -n "$STDIN_FD" && -z "$ENCLAVE" ]]; then
     echo ""
     read -rp " Use an enclave file? (path, or Enter for default network): " ENCLAVE <&$STDIN_FD
 fi
@@ -172,8 +192,10 @@ echo "  Address:   $ADVERTISE:$OR_PORT"
 [[ -n "$CONTACT_INFO" ]] && echo "  Contact:   $CONTACT_INFO"
 echo " ----------------------------------------"
 echo ""
-read -rp " Look good? [Y/n]: " confirm <&$STDIN_FD
-[[ "${confirm:-y}" =~ ^[Yy]|^$ ]] || { echo " Aborted."; exit 0; }
+if [[ -n "$STDIN_FD" ]]; then
+    read -rp " Look good? [Y/n]: " confirm <&$STDIN_FD
+    [[ "${confirm:-y}" =~ ^[Yy]|^$ ]] || { echo " Aborted."; exit 0; }
+fi
 
 # ---- install dependencies ----
 
