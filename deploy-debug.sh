@@ -371,7 +371,7 @@ if [[ -f "$AWS_KEY" ]]; then
                 if scp -i "$AWS_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -q \
                     "$AWS_TARBALL" ubuntu@${ip}:/tmp/moor-src.tar.gz 2>/dev/null && \
                    $AWS_SSH ubuntu@${ip} \
-                    'cd /opt/moor && sudo tar xzf /tmp/moor-src.tar.gz && sudo make clean >/dev/null 2>&1 && sudo make -j$(nproc) 2>&1 | tail -1 && sudo install -m 755 moor /usr/local/bin/moor && sudo mkdir -p /var/lib/moor/keys && sudo chmod 755 /var/lib/moor && sudo chmod 700 /var/lib/moor/keys && sudo systemctl restart moor' 2>/dev/null; then
+                    'cd /opt/moor && sudo tar xzf /tmp/moor-src.tar.gz && sudo make clean >/dev/null 2>&1 && sudo make -j$(nproc) 2>&1 | tail -1 && sudo install -m 755 moor /usr/local/bin/moor && sudo mkdir -p /var/lib/moor/keys && sudo chmod 755 /var/lib/moor && sudo chmod 700 /var/lib/moor/keys && sudo systemctl restart moor && sleep 2 && systemctl is-active moor >/dev/null 2>&1' 2>/dev/null; then
                     echo "$ip"
                     return 0
                 fi
@@ -389,19 +389,25 @@ if [[ -f "$AWS_KEY" ]]; then
         done
         wait
 
-        # Verify every AWS node is actually running the new binary
-        echo -e "${YELLOW}==> Verifying AWS nodes (5s settle)...${NC}"
-        sleep 5
+        # Verify every AWS node: check binary is fresh AND service is active.
+        # The deploy function already verifies inside its SSH session, so
+        # this is a second pass to catch any that slipped through.
+        echo -e "${YELLOW}==> Verifying AWS nodes (15s settle)...${NC}"
+        sleep 15
+        DEPLOY_TIME=$(date +%s)
         AWS_OK=0
         AWS_FAIL_LIST=""
         for ip in "${AWS_IPS[@]}"; do
-            status=$(ssh -i "$AWS_KEY" -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
-                ubuntu@${ip} "systemctl is-active moor 2>/dev/null" 2>/dev/null || echo "dead")
-            if [[ "$status" == "active" ]]; then
+            result=$(ssh -i "$AWS_KEY" -o ConnectTimeout=15 -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+                ubuntu@${ip} "systemctl is-active moor 2>/dev/null && stat -c '%Y' /usr/local/bin/moor 2>/dev/null" 2>/dev/null)
+            status=$(echo "$result" | head -1)
+            bin_ts=$(echo "$result" | tail -1)
+            bin_age=$(( DEPLOY_TIME - ${bin_ts:-0} ))
+            if [[ "$status" == "active" && $bin_age -lt 600 ]]; then
                 ok "$ip"
                 AWS_OK=$((AWS_OK + 1))
             else
-                fail "$ip ($status)"
+                fail "$ip (status=$status, binary ${bin_age}s old)"
                 AWS_FAIL_LIST="$AWS_FAIL_LIST $ip"
                 ALL_OK=0
             fi
