@@ -518,6 +518,12 @@ static int da_add_relay_unlocked(moor_da_config_t *config,
             config->consensus.relays[i].first_seen = saved_first_seen;
             config->consensus.relays[i].probe_failures = saved_probe_failures;
             config->consensus.relays[i].verified_bandwidth = saved_vbw;
+            /* Force-refresh published timestamp to DA's local time.
+             * Don't rely on relay's clock — if relay's clock is wrong
+             * or the descriptor was cached/replayed, the stale reaper
+             * would evict a healthy relay. The DA knows the relay is
+             * alive RIGHT NOW because it just sent a valid PUBLISH. */
+            config->consensus.relays[i].published = (uint64_t)time(NULL);
             if (g_da_geoip) {
                 const moor_geoip_entry_t *ge = moor_geoip_lookup(g_da_geoip, desc->address);
                 if (ge) {
@@ -537,6 +543,7 @@ static int da_add_relay_unlocked(moor_da_config_t *config,
             config->consensus.relays[i].or_port == desc->or_port) {
             memcpy(&config->consensus.relays[i], desc, sizeof(*desc));
             config->consensus.relays[i].first_seen = (uint64_t)time(NULL);
+            config->consensus.relays[i].published = (uint64_t)time(NULL);
             LOG_INFO("DA: replaced stale relay at %s:%u (new identity key)",
                      desc->address, desc->or_port);
             return 0;
@@ -565,6 +572,7 @@ static int da_add_relay_unlocked(moor_da_config_t *config,
     uint32_t idx = config->consensus.num_relays++;
     memcpy(&config->consensus.relays[idx], desc, sizeof(*desc));
     config->consensus.relays[idx].first_seen = (uint64_t)time(NULL);
+    config->consensus.relays[idx].published = (uint64_t)time(NULL);
 
     /* GeoIP lookup for new relay: try IPv4 first, fall back to IPv6 */
     if (g_da_geoip) {
@@ -786,7 +794,7 @@ static int da_build_consensus_unlocked(moor_da_config_t *config) {
     for (uint32_t i = 0; i < config->consensus.num_relays; ) {
         if (now > config->consensus.relays[i].published &&
             now - config->consensus.relays[i].published > stale_threshold) {
-            LOG_INFO("DA: evicting stale relay %s:%u (last seen %llus ago)",
+            LOG_WARN("DA: evicting stale relay %s:%u (last seen %llus ago)",
                      config->consensus.relays[i].address,
                      config->consensus.relays[i].or_port,
                      (unsigned long long)(now - config->consensus.relays[i].published));
