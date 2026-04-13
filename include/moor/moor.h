@@ -73,6 +73,13 @@
 /* Consensus parameters (tunable via consensus) */
 #define MOOR_MAX_CONSENSUS_PARAMS  32
 
+/* Protocol version: bump whenever the descriptor wire format or signing
+ * changes.  DAs reject descriptors below MOOR_MIN_PROTOCOL_VERSION.
+ * This prevents old binaries from joining the network and causing
+ * signature verification failures during DA-to-DA sync. */
+#define MOOR_PROTOCOL_VERSION       3   /* current: v0.8.1 descriptor format */
+#define MOOR_MIN_PROTOCOL_VERSION   3   /* minimum accepted by DAs */
+
 /* Node descriptor features bitmask */
 #define NODE_FEATURE_PQ         (1u << 0)  /* Supports PQ circuit crypto */
 #define NODE_FEATURE_FAMILY     (1u << 1)  /* Has relay family declarations */

@@ -442,6 +442,15 @@ static int da_add_relay_unlocked(moor_da_config_t *config,
         return -1;
     }
 
+    /* Reject old protocol versions that would desync descriptor signatures
+     * during DA-to-DA sync.  Relays must upgrade to join the network. */
+    if (desc->protocol_version < MOOR_MIN_PROTOCOL_VERSION) {
+        LOG_WARN("DA: rejecting descriptor from %s -- protocol version %u "
+                 "(minimum %u)", desc->address,
+                 desc->protocol_version, MOOR_MIN_PROTOCOL_VERSION);
+        return -1;
+    }
+
     /* Reject relays advertising private/reserved addresses */
     if (da_is_private_address(desc->address)) {
         LOG_WARN("DA: rejecting descriptor with private address %s", desc->address);

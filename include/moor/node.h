@@ -31,6 +31,8 @@ typedef struct {
     uint64_t onion_key_published;   /* When current onion key was generated */
     /* V5 fields (contact info) */
     char     contact_info[128];     /* Operator contact (email, URL, etc.) */
+    /* V6 fields (protocol version) */
+    uint16_t protocol_version;      /* MOOR_PROTOCOL_VERSION at build time */
     /* Local-only (not serialized on wire) */
     uint64_t first_seen;            /* DA-local: when relay first appeared */
     uint8_t  probe_failures;        /* DA-local: consecutive probe failures */

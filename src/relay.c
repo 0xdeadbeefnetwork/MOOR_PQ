@@ -3696,6 +3696,8 @@ int moor_relay_register(const moor_relay_config_t *config) {
     desc.features |= NODE_FEATURE_PQ;
     /* CELL_KEM_CT wire format (v0.8+) -- required by DAs to join network */
     desc.features |= NODE_FEATURE_CELL_KEM;
+    /* Protocol version: DAs reject descriptors below MOOR_MIN_PROTOCOL_VERSION */
+    desc.protocol_version = MOOR_PROTOCOL_VERSION;
     memcpy(desc.kem_pk, config->kem_pk, MOOR_KEM_PK_LEN);
 
     /* Copy key rotation fields */

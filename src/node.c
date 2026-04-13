@@ -320,6 +320,12 @@ int moor_node_descriptor_serialize(uint8_t *out, size_t out_len,
         memcpy(out + off, desc->contact_info, 128); off += 128;
     }
 
+    /* V6: protocol version (always written if V2+) */
+    if (is_v2) {
+        out[off++] = (uint8_t)(desc->protocol_version >> 8);
+        out[off++] = (uint8_t)(desc->protocol_version);
+    }
+
     return (int)off;
 }
 
@@ -419,6 +425,12 @@ int moor_node_descriptor_deserialize(moor_node_descriptor_t *desc,
                             desc->contact_info[c] = '_';
                 }
             }
+        }
+
+        /* V6 extension: protocol version (2 bytes, after all other fields) */
+        if (off + 2 <= data_len) {
+            desc->protocol_version = ((uint16_t)data[off] << 8) | data[off + 1];
+            off += 2;
         }
     }
 
