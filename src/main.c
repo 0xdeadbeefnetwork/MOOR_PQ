@@ -1432,10 +1432,12 @@ static int run_relay(void) {
     }
 
     /* Fetch consensus so relay can resolve EXTEND addresses (#183) */
+    moor_bootstrap_report(BOOT_REQUESTING_CONS);
     {
         moor_consensus_t relay_cons = {0};
         if (moor_client_fetch_consensus_multi(&relay_cons, g_da_list, g_num_das) == 0) {
             moor_relay_set_consensus(&relay_cons);
+            moor_bootstrap_report(BOOT_HAVE_CONSENSUS);
             LOG_INFO("relay: fetched consensus (%u relays)", relay_cons.num_relays);
         } else {
             LOG_WARN("relay: failed to fetch initial consensus");
@@ -1448,6 +1450,7 @@ static int run_relay(void) {
     if (!g_is_bridge) {
         if (moor_relay_register(&g_relay_cfg) == 0) {
             g_reg_registered = 1;
+            moor_bootstrap_report(BOOT_DONE);
         } else {
             LOG_WARN("relay: initial registration failed, will retry with backoff");
             g_reg_retry_timer_id = moor_event_add_timer(

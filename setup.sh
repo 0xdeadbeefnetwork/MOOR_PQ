@@ -14,11 +14,17 @@ main() {
 
 set -euo pipefail
 
+# Detect if we can prompt the user. Three cases:
+#   1. Interactive terminal (./setup.sh) → stdin works
+#   2. Piped with tty (curl | sudo bash in terminal) → /dev/tty works
+#   3. Piped without tty (ssh remote sudo) → no prompts, flags required
 STDIN_FD=0
 if [[ ! -t 0 ]]; then
-    # Non-interactive (piped). Try /dev/tty for prompts, but don't
-    # fail here — if all args are provided via flags, no prompts needed.
-    exec 3</dev/tty 2>/dev/null && STDIN_FD=3 || STDIN_FD=""
+    STDIN_FD=""
+    if (: </dev/tty) 2>/dev/null; then
+        exec 3</dev/tty
+        STDIN_FD=3
+    fi
 fi
 
 REPO_URL="https://github.com/0xdeadbeefnetwork/MOOR_PQ"
