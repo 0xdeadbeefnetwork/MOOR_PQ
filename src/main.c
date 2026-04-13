@@ -836,6 +836,19 @@ static void reg_retry_cb(void *arg) {
     moor_event_set_timer_interval(g_reg_retry_timer_id, g_reg_retry_interval_ms);
 }
 
+/* Relay periodic: re-register + consensus refresh.
+ * These involve blocking TCP to DAs (up to 45s with timeouts).
+ * Run in a background thread so the event loop stays responsive
+ * for circuit cells and incoming connections. */
+static volatile int g_relay_periodic_running = 0;
+
+static void *relay_periodic_thread(void *arg) {
+    (void)arg;
+    moor_relay_periodic();
+    __sync_lock_release(&g_relay_periodic_running);
+    return NULL;
+}
+
 static void relay_periodic_cb(void *arg) {
     (void)arg;
     /* Pick up selftest result (written by selftest thread, read here
@@ -845,18 +858,19 @@ static void relay_periodic_cb(void *arg) {
         g_selftest_done = 0;
         g_relay_cfg.bandwidth = g_selftest_bw;
         g_bandwidth = g_selftest_bw;
-        if (!g_is_bridge)
-            moor_relay_register(&g_relay_cfg);
+        /* Registration with new bandwidth runs in the periodic thread below */
     }
-    /* Sample observed bandwidth for stats reporting, but do NOT let it
-     * override the self-test capacity.  The old code did:
-     *   if (observed < bandwidth) bandwidth = observed;
-     * This caused a death spiral: idle relay → low observed → low
-     * advertised → less traffic → observed stays low forever.
-     * The self-test already measures actual capacity with 0.7x derating.
-     * Observed BW is tracked for monitoring only. */
     moor_monitor_sample_observed_bw();
-    moor_relay_periodic();
+
+    /* Run blocking registration + consensus fetch in a background thread.
+     * Skip if the previous periodic is still running (DA unreachable). */
+    if (__sync_lock_test_and_set(&g_relay_periodic_running, 1) == 0) {
+        pthread_t t;
+        if (pthread_create(&t, NULL, relay_periodic_thread, NULL) == 0)
+            pthread_detach(t);
+        else
+            __sync_lock_release(&g_relay_periodic_running);
+    }
 }
 
 /* One-shot relay self-test after listener starts.
