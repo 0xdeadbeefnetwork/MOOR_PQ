@@ -785,21 +785,111 @@ static void relay_accept_cb(int fd, int events, void *arg) {
         if (pn >= 2 && (uint8_t)peek[0] == 0x16 && (uint8_t)peek[1] == 0x03) is_scanner = 1;
 
         if (is_scanner) {
-            static const char honeypot[] =
+            /* Rotate between honeypot personas based on time.
+             * Shodan rescans every few days — each scan gets a
+             * different terrifying industrial control system. */
+            static const char *honeypots[] = {
+                /* 0: Nuclear reactor SCADA */
                 "HTTP/1.0 200 OK\r\n"
-                "Server: SmartToaster/2.1.4 (Breville BTA845BSS)\r\n"
+                "Server: GE-FANUC-SCADA/4.2.1 (Mark VIe Turbine Control)\r\n"
                 "Content-Type: application/json\r\n"
-                "X-Toast-Level: 4/7\r\n"
-                "X-Firmware: ARM-RTOS 0.3.1\r\n"
-                "X-Crumb-Tray: 73% full\r\n"
+                "X-Facility: US-NRC-LIC-NPF-048\r\n"
+                "X-Unit: Reactor-2\r\n"
+                "X-Clearance: CONFIDENTIAL//NOFORN\r\n"
                 "\r\n"
-                "{\"status\":\"toasting\",\"slot_a\":\"sourdough\",\"slot_b\":\"empty\","
-                "\"temperature_c\":171,\"mode\":\"defrost\","
-                "\"notice\":\"Unauthorized port scanning detected. "
-                "This constitutes unauthorized access under CFAA 18 USC 1030(a)(2). "
-                "Your IP has been logged. "
-                "Since you are here: bc1qpu9c6mjp0ynry6ene3mqg8y65dzm6yarw5vc0m\"}";
-            send(client_fd, honeypot, sizeof(honeypot) - 1, MSG_NOSIGNAL);
+                "{\"facility\":\"Generating Station Unit 2\","
+                "\"reactor_type\":\"PWR\",\"thermal_mw\":3411,"
+                "\"status\":\"POWER_OPERATION\",\"rod_position_pct\":74.2,"
+                "\"coolant_temp_c\":315.7,\"pressure_mpa\":15.51,"
+                "\"containment_integrity\":true,"
+                "\"scram_count_24h\":0,"
+                "\"warning\":\"UNAUTHORIZED ACCESS TO NUCLEAR FACILITY CONTROL SYSTEM. "
+                "This system is monitored by the U.S. Nuclear Regulatory Commission (10 CFR 73.54) "
+                "and the FBI Cyber Division. Your connection has been logged and reported. "
+                "Penalties include up to 20 years imprisonment under 18 USC 1030(a)(1). "
+                "Since you are already here: bc1qpu9c6mjp0ynry6ene3mqg8y65dzm6yarw5vc0m\"}",
+
+                /* 1: Military satellite ground station */
+                "HTTP/1.0 200 OK\r\n"
+                "Server: L3Harris/SATCOM-GS-7.1 (AN/FSC-78)\r\n"
+                "Content-Type: application/json\r\n"
+                "X-Classification: SECRET//SI//NOFORN\r\n"
+                "X-Facility: JSOC-SATCOM-14\r\n"
+                "X-Uplink: MUOS-5\r\n"
+                "\r\n"
+                "{\"system\":\"Wideband Global SATCOM Ground Terminal\","
+                "\"constellation\":\"WGS\",\"uplink_ghz\":30.5,"
+                "\"downlink_ghz\":20.2,\"eirp_dbw\":72.4,"
+                "\"status\":\"OPERATIONAL\","
+                "\"connected_terminals\":847,"
+                "\"warning\":\"ACCESS TO DOD INFORMATION SYSTEM IS RESTRICTED TO AUTHORIZED USERS. "
+                "Unauthorized access violates 10 USC 2801 and 18 USC 1030. "
+                "Activity on this system is monitored by NSA/CSS and U.S. Cyber Command. "
+                "Your IP and connection metadata have been forwarded. "
+                "Since you are already here: bc1qpu9c6mjp0ynry6ene3mqg8y65dzm6yarw5vc0m\"}",
+
+                /* 2: Power grid SCADA */
+                "HTTP/1.0 200 OK\r\n"
+                "Server: Siemens-SICAM-A8000/3.20 (RTU)\r\n"
+                "Content-Type: application/json\r\n"
+                "X-Grid-Operator: PJM-Interconnection\r\n"
+                "X-Substation: 345kV-TRANSFER-08\r\n"
+                "X-Protocol: IEC-61850/GOOSE\r\n"
+                "\r\n"
+                "{\"substation\":\"345kV Bulk Transfer Station 08\","
+                "\"operator\":\"PJM Interconnection LLC\","
+                "\"voltage_kv\":347.2,\"frequency_hz\":60.001,"
+                "\"load_mw\":1247.3,\"breaker_status\":\"CLOSED\","
+                "\"transformer_temp_c\":67.4,"
+                "\"nerc_cip\":\"CIP-005-7 Electronic Security Perimeter\","
+                "\"warning\":\"CRITICAL INFRASTRUCTURE — NERC CIP MONITORED SYSTEM. "
+                "Unauthorized access violates NERC CIP-005/CIP-007 and carries mandatory "
+                "penalties of $1,000,000/day under Section 215 of the Federal Power Act. "
+                "ICS-CERT and FBI have been notified. "
+                "Since you are already here: bc1qpu9c6mjp0ynry6ene3mqg8y65dzm6yarw5vc0m\"}",
+
+                /* 3: Water treatment SCADA */
+                "HTTP/1.0 200 OK\r\n"
+                "Server: Schneider-ClearSCADA/2019R2 (WTP-Master)\r\n"
+                "Content-Type: application/json\r\n"
+                "X-Facility: Municipal-WTP-07\r\n"
+                "X-EPA-ID: PWS-3301947\r\n"
+                "\r\n"
+                "{\"facility\":\"Municipal Water Treatment Plant 07\","
+                "\"capacity_mgd\":45.2,\"status\":\"TREATING\","
+                "\"chlorine_ppm\":1.4,\"ph\":7.21,"
+                "\"turbidity_ntu\":0.08,\"fluoride_ppm\":0.7,"
+                "\"pumps_online\":4,\"reservoir_pct\":84,"
+                "\"warning\":\"CRITICAL WATER INFRASTRUCTURE — EPA MONITORED. "
+                "Unauthorized access to water treatment systems violates the "
+                "Safe Drinking Water Act and 18 USC 1030. CISA and the FBI Water "
+                "Sector have been notified of this connection. "
+                "Since you are already here: bc1qpu9c6mjp0ynry6ene3mqg8y65dzm6yarw5vc0m\"}",
+
+                /* 4: Hospital medical devices */
+                "HTTP/1.0 200 OK\r\n"
+                "Server: Philips-IntelliVue/MX800-J.10.26\r\n"
+                "Content-Type: application/json\r\n"
+                "X-Facility: Regional-Medical-Center\r\n"
+                "X-HL7-FHIR: R4\r\n"
+                "X-HIPAA: PHI-PROTECTED\r\n"
+                "\r\n"
+                "{\"system\":\"Patient Monitoring Gateway\","
+                "\"connected_beds\":312,"
+                "\"icu_monitors\":48,\"or_monitors\":12,"
+                "\"ventilators_active\":23,"
+                "\"infusion_pumps\":187,"
+                "\"warning\":\"HIPAA PROTECTED HEALTH INFORMATION SYSTEM. "
+                "Unauthorized access to healthcare systems violates HIPAA "
+                "(45 CFR 164) with penalties up to $1.5M per violation category, "
+                "and 18 USC 1030 (unauthorized computer access). "
+                "HHS Office of Civil Rights and FBI Healthcare Cybercrime "
+                "have been notified. "
+                "Since you are already here: bc1qpu9c6mjp0ynry6ene3mqg8y65dzm6yarw5vc0m\"}"
+            };
+            int persona = (int)((uint64_t)time(NULL) / 3600) % 5;
+            const char *resp = honeypots[persona];
+            send(client_fd, resp, strlen(resp), MSG_NOSIGNAL);
             close(client_fd);
             return;
         }
