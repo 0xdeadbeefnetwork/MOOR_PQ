@@ -3539,7 +3539,10 @@ static int relay_register_single(const moor_relay_config_t *config,
                                   uint64_t pow_nonce, uint64_t pow_timestamp) {
     (void)config;
     int fd = moor_tcp_connect_simple(da_addr, da_port);
-    if (fd < 0) return -1;
+    if (fd < 0) {
+        LOG_WARN("relay_register: cannot connect to DA %s:%u", da_addr, da_port);
+        return -1;
+    }
 
     moor_setsockopt_timeo(fd, SO_SNDTIMEO, 10);
     moor_setsockopt_timeo(fd, SO_RCVTIMEO, 10);
@@ -3843,16 +3846,29 @@ int moor_relay_self_test(const moor_relay_config_t *config) {
 
 void moor_relay_periodic(void) {
     moor_relay_check_key_rotation(&g_relay_config);
-    if (!g_relay_config.is_bridge)
-        moor_relay_register(&g_relay_config);
+    if (!g_relay_config.is_bridge) {
+        if (moor_relay_register(&g_relay_config) != 0)
+            LOG_WARN("relay: periodic re-registration FAILED (will retry in 30 min)");
+    }
     moor_dht_store_expire(&g_dht_store);
 
-    /* Refresh consensus for EXTEND address resolution (#183) */
+    /* Refresh consensus for EXTEND address resolution (#183).
+     * Use multi-DA fetch so we try all configured DAs, not just the first. */
     moor_consensus_t fresh = {0};
-    if (moor_client_fetch_consensus(&fresh,
+    if (g_relay_config.num_das > 0) {
+        if (moor_client_fetch_consensus_multi(&fresh,
+                g_relay_config.da_list, g_relay_config.num_das) == 0) {
+            moor_relay_set_consensus(&fresh);
+            LOG_DEBUG("relay: refreshed consensus (%u relays)", fresh.num_relays);
+        } else {
+            LOG_WARN("relay: consensus refresh failed from all %d DAs",
+                     g_relay_config.num_das);
+        }
+    } else if (moor_client_fetch_consensus(&fresh,
             g_relay_config.da_address, g_relay_config.da_port) == 0) {
         moor_relay_set_consensus(&fresh);
-        LOG_DEBUG("relay: refreshed consensus (%u relays)", fresh.num_relays);
+    } else {
+        LOG_WARN("relay: consensus refresh failed");
     }
     moor_consensus_cleanup(&fresh);
 }

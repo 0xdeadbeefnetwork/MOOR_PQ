@@ -2658,10 +2658,11 @@ static int da_exchange_votes_unlocked(moor_da_config_t *config) {
         uint8_t our_body_hash[32];
         consensus_body_hash(our_body_hash, &config->consensus);
 
+        int vote_ok = 0;
         if (our_has_pq) {
             /* Send VOTE_PQ: body_hash(32) + identity_pk(32) + ed25519_sig(64) +
              * pq_pk(1952) + pq_sig(3293) */
-            da_send_all(fd, (const uint8_t *)"VOTE_PQ\n", 8);
+            if (da_send_all(fd, (const uint8_t *)"VOTE_PQ\n", 8) != 0) goto vote_fail;
             size_t pq_vote_sz = 32 + 32 + 64 + MOOR_MLDSA_PK_LEN + MOOR_MLDSA_SIG_LEN;
             uint8_t *vote_data = malloc(pq_vote_sz);
             if (vote_data) {
@@ -2679,18 +2680,27 @@ static int da_exchange_votes_unlocked(moor_da_config_t *config) {
                        config->consensus.da_sigs[our_slot].pq_signature,
                        MOOR_MLDSA_SIG_LEN);
                 voff += MOOR_MLDSA_SIG_LEN;
-                da_send_all(fd, vote_data, voff);
+                int rc = da_send_all(fd, vote_data, voff);
                 free(vote_data);
+                if (rc != 0) goto vote_fail;
             }
         } else {
             /* Classic VOTE: body_hash(32) + identity_pk(32) + signature(64) */
-            da_send_all(fd, (const uint8_t *)"VOTE\n", 5);
+            if (da_send_all(fd, (const uint8_t *)"VOTE\n", 5) != 0) goto vote_fail;
             uint8_t vote_data[128];
             memcpy(vote_data, our_body_hash, 32);
             memcpy(vote_data + 32, config->identity_pk, 32);
             memcpy(vote_data + 64,
                    config->consensus.da_sigs[our_slot].signature, 64);
-            da_send_all(fd, vote_data, 128);
+            if (da_send_all(fd, vote_data, 128) != 0) goto vote_fail;
+        }
+        vote_ok = 1;
+vote_fail:
+        if (!vote_ok) {
+            LOG_WARN("DA: vote send FAILED to peer %s:%u",
+                     config->peers[p].address, config->peers[p].port);
+            close(fd);
+            continue;
         }
 
         char resp[16];
@@ -2978,7 +2988,11 @@ int moor_da_run(moor_da_config_t *config) {
 int moor_client_fetch_consensus(moor_consensus_t *cons,
                                 const char *da_address, uint16_t da_port) {
     int fd = moor_tcp_connect_simple(da_address, da_port);
-    if (fd < 0) return -1;
+    if (fd < 0) {
+        LOG_WARN("consensus fetch: cannot connect to DA %s:%u",
+                 da_address, da_port);
+        return -1;
+    }
 
     moor_set_socket_timeout(fd, MOOR_DA_REQUEST_TIMEOUT);
     send(fd, "CONSENSUS\n", 10, MSG_NOSIGNAL);
