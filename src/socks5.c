@@ -428,6 +428,13 @@ static void hs_pending_fail(hs_pending_connect_t *pending) {
         }
     }
 
+    /* Remove event BEFORE destroying circuit/connection.
+     * If we don't, the stale event fires on the freed fd — either
+     * crashing on poisoned memory or, worse, firing the callback on
+     * a DIFFERENT connection that reused the fd number. */
+    if (pending->rp_conn && pending->rp_conn->fd >= 0)
+        moor_event_remove(pending->rp_conn->fd);
+
     /* Clean up RP circuit.  moor_circuit_destroy handles connection
      * closure when refcount hits 0 -- don't close manually (UAF if
      * destroy already freed the conn and the pool slot was reused). */
@@ -464,6 +471,13 @@ static void hs_rp_read_cb(int fd, int events, void *arg) {
         return;
     }
     if (ret == 0) return;
+
+    /* Guard: rp_circ may have been freed by timeout (hs_pending_fail)
+     * between when we found the pending entry and now. */
+    if (!pending->rp_circ) {
+        hs_pending_fail(pending);
+        return;
+    }
 
     /* Multiplexed connection: dispatch cells for other circuits inline (#198) */
     if (cell.circuit_id != pending->rp_circ->circuit_id) {
