@@ -390,15 +390,18 @@ if [[ -f "$AWS_KEY" ]]; then
         wait
 
         # Verify every AWS node is actually running the new binary
-        echo -e "${YELLOW}==> Verifying AWS nodes...${NC}"
+        echo -e "${YELLOW}==> Verifying AWS nodes (5s settle)...${NC}"
+        sleep 5
         AWS_OK=0
         AWS_FAIL_LIST=""
         for ip in "${AWS_IPS[@]}"; do
-            if $AWS_SSH ubuntu@${ip} "systemctl is-active moor >/dev/null 2>&1" 2>/dev/null; then
+            status=$(ssh -i "$AWS_KEY" -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+                ubuntu@${ip} "systemctl is-active moor 2>/dev/null" 2>/dev/null || echo "dead")
+            if [[ "$status" == "active" ]]; then
                 ok "$ip"
                 AWS_OK=$((AWS_OK + 1))
             else
-                fail "$ip"
+                fail "$ip ($status)"
                 AWS_FAIL_LIST="$AWS_FAIL_LIST $ip"
                 ALL_OK=0
             fi
