@@ -135,6 +135,7 @@ static int wait_for_readable(int fd, int timeout_ms)
 static moor_relay_config_t g_relay_config;
 static moor_consensus_t g_relay_consensus = {0};
 static int g_relay_has_consensus = 0;
+static pthread_rwlock_t g_relay_consensus_lock = PTHREAD_RWLOCK_INITIALIZER;
 static moor_dns_cache_t g_dns_cache;
 
 /* === Async EXTEND: worker thread for non-blocking relay EXTEND ===
@@ -1067,16 +1068,28 @@ typedef struct {
 static rp_cookie_entry_t g_rp_cookies[MAX_RP_COOKIES];
 
 void moor_relay_set_consensus(const moor_consensus_t *cons) {
+    pthread_rwlock_wrlock(&g_relay_consensus_lock);
     moor_consensus_copy(&g_relay_consensus, cons);
     g_relay_has_consensus = 1;
+    pthread_rwlock_unlock(&g_relay_consensus_lock);
 }
 
 const uint8_t *moor_relay_get_identity_pk(void) {
     return g_relay_config.identity_pk;
 }
 
+/* Caller must hold read lock if accessing returned pointer's fields.
+ * For quick checks (has_consensus), the volatile flag is sufficient. */
 const moor_consensus_t *moor_relay_get_consensus(void) {
     return g_relay_has_consensus ? &g_relay_consensus : NULL;
+}
+
+void moor_relay_consensus_rdlock(void) {
+    pthread_rwlock_rdlock(&g_relay_consensus_lock);
+}
+
+void moor_relay_consensus_unlock(void) {
+    pthread_rwlock_unlock(&g_relay_consensus_lock);
 }
 
 /* Map exit target FDs back to their circuit+stream for data return.
@@ -1715,6 +1728,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                     if (relay.data[z] != 0) { addr_is_zero = 0; break; }
                 }
                 if (addr_is_zero && g_relay_has_consensus) {
+                    pthread_rwlock_rdlock(&g_relay_consensus_lock);
                     for (uint32_t ri = 0; ri < g_relay_consensus.num_relays; ri++) {
                         if (sodium_memcmp(g_relay_consensus.relays[ri].identity_pk,
                                          next_identity_pk, 32) == 0) {
@@ -1725,6 +1739,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                             break;
                         }
                     }
+                    pthread_rwlock_unlock(&g_relay_consensus_lock);
                 }
 
                 /* Reject EXTEND to self — prevents circuit loops (#188) */
@@ -1896,6 +1911,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                 if (!have_addr || (next_addr[0] == '0' && next_addr[1] == '.' &&
                     next_addr[2] == '0' && next_addr[3] == '.')) {
                     if (g_relay_has_consensus) {
+                        pthread_rwlock_rdlock(&g_relay_consensus_lock);
                         for (uint32_t ri = 0; ri < g_relay_consensus.num_relays; ri++) {
                             if (sodium_memcmp(g_relay_consensus.relays[ri].identity_pk,
                                              next_identity_pk, 32) == 0) {
@@ -1906,6 +1922,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                                 break;
                             }
                         }
+                        pthread_rwlock_unlock(&g_relay_consensus_lock);
                     }
                 }
 
@@ -2926,6 +2943,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                 if (relay.data_length >= 32 &&
                     g_relay_consensus.num_relays > 0) {
                     uint64_t tp = (uint64_t)time(NULL) / MOOR_TIME_PERIOD_SECS;
+                    pthread_rwlock_rdlock(&g_relay_consensus_lock);
                     int responsible =
                         moor_dht_is_responsible(g_relay_config.identity_pk,
                                                 relay.data, &g_relay_consensus,
@@ -2937,6 +2955,7 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                                                 relay.data, &g_relay_consensus,
                                                 g_relay_consensus.srv_current,
                                                 tp > 0 ? tp - 1 : 0);
+                    pthread_rwlock_unlock(&g_relay_consensus_lock);
                     if (!responsible) {
                         LOG_WARN("DHT STORE: rejected -- not a responsible replica");
                         return -1;
