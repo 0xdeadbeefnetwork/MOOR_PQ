@@ -1529,8 +1529,13 @@ static void async_connect_write_cb(int fd, int events, void *arg) {
             close(fd);
             conn->fd = -1;
             conn->state = CONN_STATE_NONE;
+            /* -2 = instant reject (ECONNREFUSED, ENETUNREACH, EHOSTUNREACH)
+             * -1 = timeout or other failure
+             * Callers use this to decide whether to back off or retry immediately. */
+            int status = (err == ECONNREFUSED || err == ENETUNREACH ||
+                          err == EHOSTUNREACH) ? -2 : -1;
             if (conn->hs_state && conn->hs_state->on_complete)
-                conn->hs_state->on_complete(conn, -1, conn->hs_state->on_complete_arg);
+                conn->hs_state->on_complete(conn, status, conn->hs_state->on_complete_arg);
             return;
         }
 

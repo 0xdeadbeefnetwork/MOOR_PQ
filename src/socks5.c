@@ -214,10 +214,18 @@ static void prebuilt_build_complete(moor_circuit_t *circ, int status, void *arg)
     g_inflight_builds--;
 
     if (status != 0) {
-        g_consecutive_build_failures++;
-        prebuilt_adjust_interval();
-        LOG_WARN("prebuilt async circuit build failed (backoff: %d consecutive)",
-                 g_consecutive_build_failures);
+        /* Don't penalize instant failures (ECONNREFUSED, DNS fail) —
+         * the guard is just unreachable, try another one immediately.
+         * Only back off on timeout failures (slow guard, network down). */
+        if (status == -2) {
+            /* -2 = instant reject (ECONNREFUSED/ENETUNREACH) — retry NOW */
+            LOG_WARN("prebuilt: guard unreachable, trying another");
+        } else {
+            g_consecutive_build_failures++;
+            prebuilt_adjust_interval();
+            LOG_WARN("prebuilt async circuit build failed (backoff: %d consecutive)",
+                     g_consecutive_build_failures);
+        }
         /* cbuild_finish already cleaned up conn refcount + freed circuit */
         return;
     }

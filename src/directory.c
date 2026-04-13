@@ -1759,8 +1759,13 @@ int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
 static int da_dispatch_request(int client_fd, moor_da_config_t *config,
                                 const char *cmd_buf, ssize_t n) {
 
-    /* HTTP metrics dashboard -- lock to safely iterate relay list */
+    /* HTTP metrics dashboard -- lock to safely iterate relay list.
+     * Tighten send timeout: a slow-read attacker could hold the
+     * consensus lock for the full 10s socket timeout, blocking ALL
+     * relay registrations and vote exchange.  2s is enough for any
+     * legitimate browser to accept the dashboard HTML. */
     if (n >= 5 && strncmp(cmd_buf, "GET /", 5) == 0) {
+        moor_setsockopt_timeo(client_fd, SO_SNDTIMEO, 2);
         da_lock(config);
         if (strstr(cmd_buf, "/api") || strstr(cmd_buf, "/json"))
             da_serve_metrics_json(client_fd, config);
@@ -2475,6 +2480,23 @@ static int da_dispatch_request(int client_fd, moor_da_config_t *config,
 
         moor_node_descriptor_t desc;
         if (moor_node_descriptor_deserialize(&desc, desc_buf, len) > 0) {
+            /* Verify signature — never trust peer DA's word alone.
+             * Without this, a compromised peer can inject forged relays
+             * into the consensus via PROPAGATE flooding. */
+            if (moor_node_verify_descriptor(&desc) != 0) {
+                LOG_WARN("DA: PROPAGATE descriptor has bad signature, rejecting");
+                send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
+                free(desc_buf);
+                return 0;
+            }
+            /* Reject old protocol versions */
+            if (desc.protocol_version < MOOR_MIN_PROTOCOL_VERSION) {
+                LOG_WARN("DA: PROPAGATE descriptor protocol version %u < %u",
+                         desc.protocol_version, MOOR_MIN_PROTOCOL_VERSION);
+                send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
+                free(desc_buf);
+                return 0;
+            }
             da_lock(config);
             if (da_add_relay_unlocked(config, &desc) == 0) {
                 LOG_INFO("DA: accepted propagated descriptor from peer");
