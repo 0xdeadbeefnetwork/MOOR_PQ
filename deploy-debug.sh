@@ -367,20 +367,60 @@ if [[ -f "$AWS_KEY" ]]; then
 
         aws_deploy_node() {
             local ip="$1"
-            scp -i "$AWS_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -q \
-                "$AWS_TARBALL" ubuntu@${ip}:/tmp/moor-src.tar.gz && \
-            $AWS_SSH ubuntu@${ip} \
-                'cd /opt/moor && sudo tar xzf /tmp/moor-src.tar.gz && sudo make -j$(nproc) 2>&1 | tail -1 && sudo install -m 755 moor /usr/local/bin/moor && sudo mkdir -p /var/lib/moor/keys && sudo chmod 755 /var/lib/moor && sudo chmod 700 /var/lib/moor/keys && sudo systemctl restart moor' && \
-            echo "$ip"
+            for attempt in 1 2 3; do
+                if scp -i "$AWS_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -q \
+                    "$AWS_TARBALL" ubuntu@${ip}:/tmp/moor-src.tar.gz 2>/dev/null && \
+                   $AWS_SSH ubuntu@${ip} \
+                    'cd /opt/moor && sudo tar xzf /tmp/moor-src.tar.gz && sudo make clean >/dev/null 2>&1 && sudo make -j$(nproc) 2>&1 | tail -1 && sudo install -m 755 moor /usr/local/bin/moor && sudo mkdir -p /var/lib/moor/keys && sudo chmod 755 /var/lib/moor && sudo chmod 700 /var/lib/moor/keys && sudo systemctl restart moor' 2>/dev/null; then
+                    echo "$ip"
+                    return 0
+                fi
+                [ $attempt -lt 3 ] && sleep 5
+            done
+            echo "FAIL:$ip"
+            return 1
         }
 
+        # Deploy in parallel with per-node tracking
+        declare -a AWS_PIDS
         for ip in "${AWS_IPS[@]}"; do
             aws_deploy_node "$ip" &
+            AWS_PIDS+=($!)
         done
         wait
+
+        # Verify every AWS node is actually running the new binary
+        echo -e "${YELLOW}==> Verifying AWS nodes...${NC}"
+        AWS_OK=0
+        AWS_FAIL_LIST=""
+        for ip in "${AWS_IPS[@]}"; do
+            if $AWS_SSH ubuntu@${ip} "systemctl is-active moor >/dev/null 2>&1" 2>/dev/null; then
+                ok "$ip"
+                AWS_OK=$((AWS_OK + 1))
+            else
+                fail "$ip"
+                AWS_FAIL_LIST="$AWS_FAIL_LIST $ip"
+                ALL_OK=0
+            fi
+        done
+
+        # Retry failed nodes sequentially (parallel scp often fails on some regions)
+        if [[ -n "$AWS_FAIL_LIST" ]]; then
+            echo -e "${YELLOW}==> Retrying failed AWS nodes sequentially...${NC}"
+            for ip in $AWS_FAIL_LIST; do
+                info "retrying $ip..."
+                if aws_deploy_node "$ip" | grep -qv FAIL; then
+                    ok "$ip (retry succeeded)"
+                    AWS_OK=$((AWS_OK + 1))
+                else
+                    fail "$ip (retry failed)"
+                fi
+            done
+        fi
+
         rm -f "$AWS_TARBALL"
-        ok "AWS nodes deployed (${#AWS_IPS[@]})"
-        NODE_COUNT=$((NODE_COUNT + ${#AWS_IPS[@]}))
+        ok "AWS: $AWS_OK/${#AWS_IPS[@]} nodes deployed"
+        NODE_COUNT=$((NODE_COUNT + AWS_OK))
     fi
 fi
 
