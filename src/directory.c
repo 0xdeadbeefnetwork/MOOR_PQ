@@ -1011,9 +1011,14 @@ static void da_update_published_snapshot_unlocked(moor_da_config_t *config) {
     if (buf) {
         int len = moor_consensus_serialize(buf, buf_sz, &config->consensus);
         if (len > 0) {
-            free(config->published_buf);
+            /* Atomic swap: install new BEFORE freeing old. If a reader
+             * is in the middle of sending published_buf to a client,
+             * freeing first would UAF. Swap pointer + length together
+             * so readers always see a consistent pair. */
+            uint8_t *old = config->published_buf;
             config->published_buf = buf;
             config->published_len = len;
+            free(old);
             LOG_DEBUG("DA: published snapshot updated (%d sigs)",
                       config->consensus.num_da_sigs);
         } else {
@@ -2188,8 +2193,14 @@ static int da_dispatch_request(int client_fd, moor_da_config_t *config,
         uint8_t our_body_hash[32];
         if (consensus_body_hash(our_body_hash, &config->consensus) != 0 ||
             sodium_memcmp(our_body_hash, peer_body_hash, 32) != 0) {
+            /* Bodies diverged — our relay set differs from peer's.
+             * Rebuild consensus from current relay set, then re-exchange.
+             * Without this, the DAs stay diverged until the next sync
+             * timer fires (5 minutes), creating a split-brain window. */
+            da_build_consensus_unlocked(config);
+            da_update_published_snapshot_unlocked(config);
             da_unlock(config);
-            LOG_WARN("DA: vote valid but consensus bodies diverged, rebuilding");
+            LOG_WARN("DA: vote bodies diverged, rebuilt consensus");
             send(client_fd, "DIVERGED\n", 9, MSG_NOSIGNAL);
             return 0;
         }
@@ -2299,12 +2310,15 @@ static int da_dispatch_request(int client_fd, moor_da_config_t *config,
             send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
             return 0;
         }
-        /* Check if their body matches ours — if not, consensus diverged */
+        /* Check if their body matches ours — if not, consensus diverged.
+         * Rebuild to converge (same fix as VOTE path). */
         uint8_t our_body_hash[32];
         if (consensus_body_hash(our_body_hash, &config->consensus) != 0 ||
             sodium_memcmp(our_body_hash, peer_body_hash, 32) != 0) {
+            da_build_consensus_unlocked(config);
+            da_update_published_snapshot_unlocked(config);
             da_unlock(config);
-            LOG_WARN("DA: PQ vote valid but consensus bodies diverged");
+            LOG_WARN("DA: PQ vote bodies diverged, rebuilt consensus");
             free(vote_buf);
             send(client_fd, "DIVERGED\n", 9, MSG_NOSIGNAL);
             return 0;
@@ -3133,6 +3147,13 @@ int moor_client_fetch_consensus(moor_consensus_t *cons,
             }
             LOG_WARN("consensus: no trusted DA keys configured, "
                      "verification is weak");
+        }
+        /* Reject empty consensus — if all relays were reaped or the DA
+         * is broken, an empty signed consensus would make the client
+         * think the network has no relays and stop building circuits. */
+        if (cons->num_relays == 0) {
+            LOG_ERROR("consensus has 0 relays, rejecting");
+            return -1;
         }
         LOG_INFO("fetched consensus: %u relays (%u DA sigs verified)",
                  cons->num_relays, cons->num_da_sigs);
