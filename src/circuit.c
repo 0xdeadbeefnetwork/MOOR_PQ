@@ -4213,6 +4213,13 @@ int moor_circuit_build_handle_extended(moor_circuit_t *circ,
 /* Called when async guard connection completes (Step 4) */
 static void cbuild_on_connect(moor_connection_t *conn, int status, void *arg) {
     moor_circuit_t *circ = (moor_circuit_t *)arg;
+    /* Validate circuit is still alive — it may have been freed by
+     * timeout or DESTROY while the async connect was in progress.
+     * A freed circuit has circuit_id == 0 (set by circ_cleanup). */
+    if (!circ || circ->circuit_id == 0) {
+        LOG_WARN("cbuild_on_connect: circuit already freed (stale callback)");
+        return;
+    }
     moor_cbuild_ctx_t *ctx = circ->build_ctx;
     if (!ctx || ctx->cancelled) { cbuild_finish(circ, -1); return; }
 

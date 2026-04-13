@@ -839,8 +839,16 @@ static void reg_retry_cb(void *arg) {
 /* Relay periodic: re-register + consensus refresh.
  * These involve blocking TCP to DAs (up to 45s with timeouts).
  * Run in a background thread so the event loop stays responsive
- * for circuit cells and incoming connections. */
+ * for circuit cells and incoming connections.
+ *
+ * IMPORTANT: if the thread hangs (DNS/TCP blocks indefinitely),
+ * the atomic flag stays set and NO future registrations happen,
+ * silently killing the relay after the 3-hour reap threshold.
+ * Track the start time so the timer can detect a stuck thread
+ * and force-reset the flag. */
 static volatile int g_relay_periodic_running = 0;
+static volatile uint64_t g_relay_periodic_started = 0;
+#define RELAY_PERIODIC_MAX_SEC 120  /* force-reset flag after 2 min */
 
 static void *relay_periodic_thread(void *arg) {
     (void)arg;
@@ -863,8 +871,20 @@ static void relay_periodic_cb(void *arg) {
     moor_monitor_sample_observed_bw();
 
     /* Run blocking registration + consensus fetch in a background thread.
-     * Skip if the previous periodic is still running (DA unreachable). */
+     * Skip if the previous periodic is still running — BUT detect stuck
+     * threads that never released the flag (hung DNS/TCP connect) and
+     * force-reset after RELAY_PERIODIC_MAX_SEC so the relay doesn't
+     * silently stop re-registering and get reaped from the consensus. */
+    if (g_relay_periodic_running) {
+        uint64_t elapsed = (uint64_t)time(NULL) - g_relay_periodic_started;
+        if (elapsed > RELAY_PERIODIC_MAX_SEC) {
+            LOG_WARN("relay: periodic thread stuck for %llus, force-resetting",
+                     (unsigned long long)elapsed);
+            __sync_lock_release(&g_relay_periodic_running);
+        }
+    }
     if (__sync_lock_test_and_set(&g_relay_periodic_running, 1) == 0) {
+        g_relay_periodic_started = (uint64_t)time(NULL);
         pthread_t t;
         if (pthread_create(&t, NULL, relay_periodic_thread, NULL) == 0)
             pthread_detach(t);
