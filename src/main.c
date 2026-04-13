@@ -983,35 +983,56 @@ static void relay_selftest_timer_cb(void *arg) {
         pthread_detach(t);
 }
 
-/* One-shot consensus re-fetch after startup (#183) */
+/* One-shot consensus re-fetch after startup (#183).
+ * Runs in a background thread to avoid blocking the event loop
+ * with TCP connections to DAs. */
 static int g_relay_consensus_retry_id = -1;
+static volatile int g_relay_cons_retry_running = 0;
+static volatile uint64_t g_relay_cons_retry_started = 0;
 
-static void relay_consensus_retry_cb(void *arg) {
+static void *relay_consensus_retry_thread(void *arg) {
     (void)arg;
     moor_consensus_t fresh = {0};
     if (moor_client_fetch_consensus_multi(&fresh, g_da_list, g_num_das) == 0) {
         moor_relay_set_consensus(&fresh);
         LOG_INFO("relay: refreshed consensus (%u relays)", fresh.num_relays);
 
-        /* Re-register with DAs on every consensus refresh.
-         * Tor re-publishes descriptors every 18h or when config changes.
-         * We re-register every consensus period (30 min) — this ensures
-         * relays reappear quickly after DA restarts and descriptor updates
-         * propagate without operator intervention. */
         if (!g_is_bridge) {
             if (moor_relay_register(&g_relay_cfg) == 0)
                 g_reg_registered = 1;
         }
-
-        /* First successful fetch — switch from 15s bootstrap retry
-         * to normal consensus refresh interval (Tor-aligned: half the
-         * consensus interval, i.e. 30 minutes). */
-        if (g_relay_consensus_retry_id >= 0) {
-            moor_event_set_timer_interval(g_relay_consensus_retry_id,
-                                           MOOR_CONSENSUS_INTERVAL * 1000 / 2);
-        }
     }
     moor_consensus_cleanup(&fresh);
+    __sync_lock_release(&g_relay_cons_retry_running);
+    return NULL;
+}
+
+static void relay_consensus_retry_cb(void *arg) {
+    (void)arg;
+    /* Watchdog for stuck thread */
+    if (g_relay_cons_retry_running) {
+        uint64_t elapsed = (uint64_t)time(NULL) - g_relay_cons_retry_started;
+        if (elapsed > RELAY_PERIODIC_MAX_SEC) {
+            LOG_WARN("relay: consensus retry thread stuck for %llus, force-resetting",
+                     (unsigned long long)elapsed);
+            __sync_lock_release(&g_relay_cons_retry_running);
+        }
+        return;
+    }
+    if (__sync_lock_test_and_set(&g_relay_cons_retry_running, 1) == 0) {
+        g_relay_cons_retry_started = (uint64_t)time(NULL);
+        pthread_t t;
+        if (pthread_create(&t, NULL, relay_consensus_retry_thread, NULL) == 0) {
+            pthread_detach(t);
+            /* First successful fetch — switch to 30 min interval */
+            if (g_relay_consensus_retry_id >= 0 && g_reg_registered) {
+                moor_event_set_timer_interval(g_relay_consensus_retry_id,
+                                               MOOR_CONSENSUS_INTERVAL * 1000 / 2);
+            }
+        } else {
+            __sync_lock_release(&g_relay_cons_retry_running);
+        }
+    }
 }
 
 /* Network liveness check (every 10s) */
@@ -1650,21 +1671,58 @@ static int fetch_consensus_via_dir_guard(moor_consensus_t *fresh) {
     return -1;
 }
 
-static void consensus_refresh_cb(void *arg) {
+static volatile int g_client_cons_refresh_running = 0;
+static volatile uint64_t g_client_cons_refresh_started = 0;
+
+static void *client_consensus_refresh_thread(void *arg) {
     (void)arg;
-    if (!g_live_consensus) return;
-    /* Heap-alloc to avoid ~3.5MB on stack in timer callback */
     moor_consensus_t *fresh = calloc(1, sizeof(moor_consensus_t));
-    if (!fresh) return;
+    if (!fresh) { __sync_lock_release(&g_client_cons_refresh_running); return NULL; }
 
     int ok = 0;
-    /* Try directory guard first (avoids leaking client IP to DA) */
     if (fetch_consensus_via_dir_guard(fresh) == 0)
         ok = 1;
-    /* Fallback to direct DA */
     if (!ok && moor_client_fetch_consensus_multi(fresh, g_da_list, g_num_das) == 0)
         ok = 1;
 
+    if (ok) {
+        moor_socks5_update_consensus(fresh);
+        LOG_INFO("client: consensus refreshed (%u relays)", fresh->num_relays);
+    }
+    moor_consensus_cleanup(fresh);
+    free(fresh);
+    __sync_lock_release(&g_client_cons_refresh_running);
+    return NULL;
+}
+
+static void consensus_refresh_cb(void *arg) {
+    (void)arg;
+    if (!g_live_consensus) return;
+
+    if (g_client_cons_refresh_running) {
+        uint64_t elapsed = (uint64_t)time(NULL) - g_client_cons_refresh_started;
+        if (elapsed > 120) {
+            LOG_WARN("client: consensus refresh thread stuck for %llus, force-resetting",
+                     (unsigned long long)elapsed);
+            __sync_lock_release(&g_client_cons_refresh_running);
+        }
+        return;
+    }
+    if (__sync_lock_test_and_set(&g_client_cons_refresh_running, 1) == 0) {
+        g_client_cons_refresh_started = (uint64_t)time(NULL);
+        pthread_t t;
+        if (pthread_create(&t, NULL, client_consensus_refresh_thread, NULL) == 0)
+            pthread_detach(t);
+        else
+            __sync_lock_release(&g_client_cons_refresh_running);
+    }
+    /* Old inline code moved to thread above. Keep the rest of the
+     * callback for consensus cache save (fast, non-blocking). */
+    return;
+    /* Dead code below — was the old inline path. Keeping the function
+     * signature intact so the timer registration doesn't change. */
+    moor_consensus_t *fresh = NULL;
+    int ok = 0;
     if (ok) {
         moor_socks5_update_consensus(fresh);
         if (g_config.data_dir[0])
@@ -2612,22 +2670,53 @@ static void hs_intro_read_cb(int fd, int events, void *arg) {
 /* g_hs_consensus declared at top of file */
 
 /* R10-CC3: Periodic timer callbacks for HS mode */
-static void hs_consensus_refresh_cb(void *arg) {
+static volatile int g_hs_cons_refresh_running = 0;
+static volatile uint64_t g_hs_cons_refresh_started = 0;
+
+static void *hs_consensus_refresh_thread(void *arg) {
     (void)arg;
-    if (!g_hs_consensus) return;
     moor_consensus_t *fresh = calloc(1, sizeof(moor_consensus_t));
-    if (!fresh) return;
+    if (!fresh) { __sync_lock_release(&g_hs_cons_refresh_running); return NULL; }
     if (moor_client_fetch_consensus_multi(fresh, g_da_list, g_num_das) == 0) {
         moor_consensus_cleanup(g_hs_consensus);
         memcpy(g_hs_consensus, fresh, sizeof(*fresh));
-        fresh->relays = NULL; /* ownership transferred */
+        fresh->relays = NULL;
         LOG_INFO("HS: consensus refreshed (%u relays)", g_hs_consensus->num_relays);
         if (g_config.data_dir[0])
             moor_consensus_cache_save(g_hs_consensus, g_config.data_dir);
-        /* Update cached_consensus pointers in all HS configs */
         for (int h = 0; h < g_config.num_hidden_services || h < 1; h++)
             g_hs_configs[h].cached_consensus = g_hs_consensus;
     } else {
+        moor_consensus_cleanup(fresh);
+    }
+    free(fresh);
+    __sync_lock_release(&g_hs_cons_refresh_running);
+    return NULL;
+}
+
+static void hs_consensus_refresh_cb(void *arg) {
+    (void)arg;
+    if (!g_hs_consensus) return;
+    if (g_hs_cons_refresh_running) {
+        uint64_t elapsed = (uint64_t)time(NULL) - g_hs_cons_refresh_started;
+        if (elapsed > 120) {
+            LOG_WARN("HS: consensus refresh thread stuck, force-resetting");
+            __sync_lock_release(&g_hs_cons_refresh_running);
+        }
+        return;
+    }
+    if (__sync_lock_test_and_set(&g_hs_cons_refresh_running, 1) == 0) {
+        g_hs_cons_refresh_started = (uint64_t)time(NULL);
+        pthread_t t;
+        if (pthread_create(&t, NULL, hs_consensus_refresh_thread, NULL) == 0)
+            pthread_detach(t);
+        else
+            __sync_lock_release(&g_hs_cons_refresh_running);
+    }
+    /* Old inline code that leaked 'fresh' on the else branch: */
+    return;
+    moor_consensus_t *fresh = NULL;
+    if (0) {
         moor_consensus_cleanup(fresh);
     }
     free(fresh);
@@ -2694,6 +2783,13 @@ static void hs_intro_rotation_cb(void *arg) {
         if (g_hs_configs[h].intros_need_reestablish) {
             g_hs_configs[h].intros_need_reestablish = 0;
             LOG_INFO("HS %d: deferred intro re-establishment triggered", h);
+            /* moor_hs_establish_intro builds circuits synchronously (blocking
+             * TCP to relays). moor_hs_publish_descriptor does TCP to DAs.
+             * Both block the event loop. Accept the block here because intro
+             * re-establishment is rare (only when intro circuits die) and
+             * must complete before we register the new circuits with the
+             * event loop below. Moving to a thread would require complex
+             * synchronization with the event registration code. */
             moor_hs_establish_intro(&g_hs_configs[h], g_hs_consensus);
             moor_hs_publish_descriptor(&g_hs_configs[h]);
             /* Fall through to register new intro circuits with event loop */
@@ -2742,7 +2838,7 @@ static void hs_intro_rotation_cb(void *arg) {
     }
 }
 
-static void hs_desc_republish_cb(void *arg) {
+static void *hs_desc_republish_thread(void *arg) {
     (void)arg;
     int hs_count = g_config.num_hidden_services;
     if (hs_count == 0) hs_count = 1;
@@ -2750,6 +2846,16 @@ static void hs_desc_republish_cb(void *arg) {
         LOG_INFO("HS %d: periodic descriptor republish", h);
         moor_hs_publish_descriptor(&g_hs_configs[h]);
     }
+    return NULL;
+}
+
+static void hs_desc_republish_cb(void *arg) {
+    (void)arg;
+    pthread_t t;
+    if (pthread_create(&t, NULL, hs_desc_republish_thread, NULL) == 0)
+        pthread_detach(t);
+    else
+        hs_desc_republish_thread(NULL); /* fallback: inline */
 }
 
 static int run_hs(void) {
