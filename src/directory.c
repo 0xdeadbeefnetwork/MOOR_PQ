@@ -519,12 +519,10 @@ static int da_add_relay_unlocked(moor_da_config_t *config,
             config->consensus.relays[i].first_seen = saved_first_seen;
             config->consensus.relays[i].probe_failures = saved_probe_failures;
             config->consensus.relays[i].verified_bandwidth = saved_vbw;
-            /* Force-refresh published timestamp to DA's local time.
-             * Don't rely on relay's clock — if relay's clock is wrong
-             * or the descriptor was cached/replayed, the stale reaper
-             * would evict a healthy relay. The DA knows the relay is
-             * alive RIGHT NOW because it just sent a valid PUBLISH. */
-            config->consensus.relays[i].published = (uint64_t)time(NULL);
+            /* Track when relay last registered (DA-local, for stale reaper).
+             * Do NOT overwrite desc->published — it's part of the relay's
+             * Ed25519 signature and must be preserved for DA-to-DA sync. */
+            config->consensus.relays[i].last_registered = (uint64_t)time(NULL);
             if (g_da_geoip) {
                 const moor_geoip_entry_t *ge = moor_geoip_lookup(g_da_geoip, desc->address);
                 if (ge) {
@@ -544,7 +542,7 @@ static int da_add_relay_unlocked(moor_da_config_t *config,
             config->consensus.relays[i].or_port == desc->or_port) {
             memcpy(&config->consensus.relays[i], desc, sizeof(*desc));
             config->consensus.relays[i].first_seen = (uint64_t)time(NULL);
-            config->consensus.relays[i].published = (uint64_t)time(NULL);
+            config->consensus.relays[i].last_registered = (uint64_t)time(NULL);
             LOG_INFO("DA: replaced stale relay at %s:%u (new identity key)",
                      desc->address, desc->or_port);
             return 0;
@@ -573,7 +571,7 @@ static int da_add_relay_unlocked(moor_da_config_t *config,
     uint32_t idx = config->consensus.num_relays++;
     memcpy(&config->consensus.relays[idx], desc, sizeof(*desc));
     config->consensus.relays[idx].first_seen = (uint64_t)time(NULL);
-    config->consensus.relays[idx].published = (uint64_t)time(NULL);
+    config->consensus.relays[idx].last_registered = (uint64_t)time(NULL);
 
     /* GeoIP lookup for new relay: try IPv4 first, fall back to IPv6 */
     if (g_da_geoip) {
@@ -832,12 +830,13 @@ static int da_build_consensus_unlocked(moor_da_config_t *config) {
     uint64_t stale_threshold = MOOR_CONSENSUS_INTERVAL * 3;
     uint32_t reaped = 0;
     for (uint32_t i = 0; i < config->consensus.num_relays; ) {
-        if (now > config->consensus.relays[i].published &&
-            now - config->consensus.relays[i].published > stale_threshold) {
+        uint64_t last_seen = config->consensus.relays[i].last_registered;
+        if (last_seen == 0) last_seen = config->consensus.relays[i].published;
+        if (now > last_seen && now - last_seen > stale_threshold) {
             LOG_WARN("DA: evicting stale relay %s:%u (last seen %llus ago)",
                      config->consensus.relays[i].address,
                      config->consensus.relays[i].or_port,
-                     (unsigned long long)(now - config->consensus.relays[i].published));
+                     (unsigned long long)(now - last_seen));
             /* Swap with last entry and shrink */
             config->consensus.relays[i] =
                 config->consensus.relays[config->consensus.num_relays - 1];
@@ -2890,13 +2889,52 @@ int moor_da_sync_relays(moor_da_config_t *config) {
             moor_node_descriptor_t desc;
             if (moor_node_descriptor_deserialize(&desc, resp_data + off, dlen) > 0) {
                 if (moor_node_verify_descriptor(&desc) != 0) {
-                    LOG_WARN("DA sync: rejecting descriptor %s:%u nick=%s "
-                             "flags=0x%08x bw=%llu features=0x%x (invalid signature)",
-                             desc.address, desc.or_port,
-                             desc.nickname[0] ? desc.nickname : "?",
-                             desc.flags,
-                             (unsigned long long)desc.bandwidth,
-                             desc.features);
+                    /* Diagnostic: find exact byte that differs from what our
+                     * local copy would produce for the same relay */
+                    int diag_match = -1;
+                    for (uint32_t j = 0; j < config->consensus.num_relays; j++) {
+                        if (sodium_memcmp(config->consensus.relays[j].identity_pk,
+                                         desc.identity_pk, 32) == 0) {
+                            diag_match = (int)j;
+                            break;
+                        }
+                    }
+                    if (diag_match >= 0) {
+                        uint8_t buf_local[2048], buf_peer[2048];
+                        size_t len_local = moor_node_descriptor_signable_serialize(
+                            buf_local, &config->consensus.relays[diag_match]);
+                        size_t len_peer = moor_node_descriptor_signable_serialize(
+                            buf_peer, &desc);
+                        int first_diff = -1;
+                        size_t cmp_len = len_local < len_peer ? len_local : len_peer;
+                        for (size_t b = 0; b < cmp_len; b++) {
+                            if (buf_local[b] != buf_peer[b]) { first_diff = (int)b; break; }
+                        }
+                        if (len_local != len_peer)
+                            LOG_WARN("DA sync DIAG: %s signable len mismatch local=%zu peer=%zu",
+                                     desc.nickname, len_local, len_peer);
+                        if (first_diff >= 0)
+                            LOG_WARN("DA sync DIAG: %s first diff at byte %d "
+                                     "local=0x%02x peer=0x%02x (local sig valid=%d)",
+                                     desc.nickname, first_diff,
+                                     buf_local[first_diff], buf_peer[first_diff],
+                                     moor_node_verify_descriptor(
+                                         &config->consensus.relays[diag_match]) == 0);
+                        else if (len_local == len_peer) {
+                            int local_ok = moor_node_verify_descriptor(
+                                &config->consensus.relays[diag_match]) == 0;
+                            LOG_WARN("DA sync DIAG: %s signable IDENTICAL len=%zu "
+                                     "sig=%02x%02x LOCAL_VERIFY=%s",
+                                     desc.nickname, len_local,
+                                     desc.signature[0], desc.signature[1],
+                                     local_ok ? "PASS" : "FAIL");
+                        }
+                    } else {
+                        LOG_WARN("DA sync DIAG: %s not in our consensus (new relay)",
+                                 desc.nickname);
+                    }
+                    LOG_WARN("DA sync: rejecting descriptor %s:%u (invalid signature)",
+                             desc.address, desc.or_port);
                     off += dlen;
                     continue;
                 }
@@ -3037,7 +3075,7 @@ int moor_da_probe_relays(moor_da_config_t *config) {
             if (relay->probe_failures >= 3) {
                 LOG_WARN("DA probe: relay %s:%u unreachable (%u consecutive failures), evicting",
                          relay->address, relay->or_port, relay->probe_failures);
-                relay->published = 0;
+                relay->last_registered = 0; /* triggers stale reaper */
                 dead_count++;
             } else {
                 LOG_INFO("DA probe: relay %s:%u missed probe (%u/3)",
