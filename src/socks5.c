@@ -197,6 +197,11 @@ static void hs_connect_complete_cb(int fd, int events, void *arg) {
             if (r->hs_kem_available)
                 memcpy(g_hs_pending[slot].hs_kem_pk, r->hs_kem_pk, 1184);
 
+            /* Adopt worker's circuit into main thread tracking.
+             * Worker skipped circ_array_add so nullify_conn couldn't
+             * find it.  Now the main thread owns it. */
+            moor_circuit_adopt(r->rp_circ);
+
             /* Register RP connection for async RENDEZVOUS2 wait */
             if (r->rp_circ->conn) {
                 r->rp_circ->conn->on_other_cell = extend_dispatch_cell;

@@ -378,6 +378,7 @@ void moor_circuit_teardown_for_conn(moor_connection_t *conn);
 /* Register/unregister circuit in the hash table (must call after setting conn/prev_conn/next_conn) */
 void moor_circuit_register(moor_circuit_t *circ);
 void moor_circuit_unregister(moor_circuit_t *circ);
+void moor_circuit_adopt(moor_circuit_t *circ);  /* adopt worker circuit into main thread */
 
 /* Find circuit by circuit_id on a given connection (O(1) hash table lookup) */
 moor_circuit_t *moor_circuit_find(uint32_t circuit_id,

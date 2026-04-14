@@ -211,6 +211,7 @@ void moor_circuit_register(moor_circuit_t *circ) {
     circ_pool_unlock();
 }
 
+
 void moor_circuit_unregister(moor_circuit_t *circ) {
     circ_pool_lock();
     circ_unregister_unlocked(circ);
@@ -359,6 +360,28 @@ moor_circuit_t *moor_circuit_alloc(void) {
     return circ;
 }
 
+/* Adopt a worker-created circuit into the main thread's tracking array.
+ * Worker threads skip circ_array_add so they're invisible to the main
+ * thread during build.  Once the main thread takes ownership (e.g. HS
+ * connect completion), the circuit MUST be tracked so nullify_conn and
+ * close_all_marked can find it. Also registers in hash table. */
+void moor_circuit_adopt(moor_circuit_t *circ) {
+    if (!circ) return;
+    circ_pool_lock();
+    /* Check not already tracked (idempotent) */
+    int found = 0;
+    for (int i = 0; i < g_circuits_count; i++) {
+        if (g_circuits[i] == circ) { found = 1; break; }
+    }
+    if (!found) {
+        circ_array_add(circ);
+        moor_monitor_stats()->circuits_created++;
+        moor_monitor_stats()->circuits_active++;
+    }
+    circ_register_unlocked(circ);
+    circ_pool_unlock();
+}
+
 /* circ_cleanup_unlocked: make circuit logically dead.  Memory stays valid.
  * Sets circuit_id = 0 so close_all_marked can detect already-cleaned entries. */
 static void circ_cleanup_unlocked(moor_circuit_t *circ) {
@@ -420,6 +443,19 @@ static void circ_release_unlocked(moor_circuit_t *circ) {
 
 void moor_circuit_free(moor_circuit_t *circ) {
     if (!circ) return;
+
+    /* Worker threads: direct free without touching shared state */
+    {
+        extern int moor_is_worker(void);
+        if (moor_is_worker()) {
+            moor_circ_queue_clear(&circ->cell_queue_n);
+            moor_circ_queue_clear(&circ->cell_queue_p);
+            moor_crypto_wipe(circ, sizeof(*circ));
+            free(circ);
+            return;
+        }
+    }
+
     circ_pool_lock();
     /* If in pending close list, don't free — close_all_marked handles it.
      * This prevents dangling pointers in the pending list. */
@@ -2070,6 +2106,28 @@ int moor_circuit_maybe_send_sendme(moor_circuit_t *circ, uint16_t stream_id) {
 
 int moor_circuit_destroy(moor_circuit_t *circ) {
     if (!circ || circ->circuit_id == 0) return -1;
+
+    /* Worker threads: immediate cleanup.  Worker circuits are NOT in
+     * g_circuits[] or g_circ_ht[] and must NOT be added to g_pending_close
+     * (main thread would access the circuit's heap conn after free). */
+    {
+        extern int moor_is_worker(void);
+        if (moor_is_worker()) {
+            moor_circ_queue_clear(&circ->cell_queue_n);
+            moor_circ_queue_clear(&circ->cell_queue_p);
+            for (int i = 0; i < 3; i++) {
+                moor_crypto_wipe(circ->hops[i].forward_key, 32);
+                moor_crypto_wipe(circ->hops[i].backward_key, 32);
+            }
+            moor_crypto_wipe(circ->e2e_send_key, 32);
+            moor_crypto_wipe(circ->e2e_recv_key, 32);
+            moor_crypto_wipe(circ->e2e_eph_sk, 32);
+            circ->circuit_id = 0;
+            free(circ);
+            return 0;
+        }
+    }
+
     /* Tor-aligned: just mark for close.  DESTROY cells, stream cleanup,
      * and slot free happen in moor_circuit_close_all_marked(). */
     moor_circuit_mark_for_close(circ, DESTROY_REASON_FINISHED);
