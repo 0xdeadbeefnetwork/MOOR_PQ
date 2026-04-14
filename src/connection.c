@@ -1706,7 +1706,8 @@ static int hs_encrypt_cell_raw(moor_connection_t *conn,
 static int hs_decrypt_cell_raw(moor_connection_t *conn, moor_cell_t *cell) {
     if (conn->recv_len < 2) return 0;
     uint16_t ct_len = ((uint16_t)conn->recv_buf[0] << 8) | conn->recv_buf[1];
-    if (ct_len < MOOR_MAC_LEN || ct_len > MOOR_CELL_SIZE + MOOR_MAC_LEN)
+    /* Strict: cell ciphertext must be exactly MOOR_CELL_SIZE + MAC */
+    if (ct_len != MOOR_CELL_SIZE + MOOR_MAC_LEN)
         return -1;
     if (conn->recv_len < (size_t)(2 + ct_len)) return 0;
 
@@ -1747,8 +1748,8 @@ static void handle_hs_sending(moor_connection_t *conn) {
         }
         return;
     }
-    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-        return; /* wait for next WRITE event */
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+        return; /* transient — wait for next event */
     hs_async_fail(conn);
 }
 
@@ -1761,7 +1762,7 @@ static void handle_hs_receiving(moor_connection_t *conn) {
                           hs->msg_expected - hs->msg_offset);
     if (n > 0) {
         hs->msg_offset += (size_t)n;
-    } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+    } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
         return;
     } else {
         hs_async_fail(conn);
@@ -1867,7 +1868,7 @@ static void handle_pq_sending(moor_connection_t *conn) {
                           hs->msg_expected - hs->msg_offset);
     if (n > 0) {
         hs->msg_offset += (size_t)n;
-    } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+    } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
         return;
     } else {
         hs_async_fail(conn);
@@ -1922,7 +1923,7 @@ static void handle_pq_receiving(moor_connection_t *conn) {
         } else if (n == 0) {
             hs_async_fail(conn);
             return;
-        } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
             hs_async_fail(conn);
             return;
         }
@@ -2093,6 +2094,8 @@ static void hs_async_cb(int fd, int events, void *arg) {
     moor_connection_t *conn = (moor_connection_t *)arg;
     (void)fd;
     (void)events;
+
+    if (!conn->hs_state) return; /* already completed/failed */
 
     switch (conn->state) {
     case CONN_STATE_TCP_CONNECTING:
