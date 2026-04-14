@@ -470,6 +470,24 @@ ssize_t moor_connection_recv_raw(moor_connection_t *conn,
 
 /* moor_connection_send_raw defined below (after connection pool) */
 
+/* Drain conn->recv_buf before falling back to socket recv.
+ * Used by handshake recv loops so pre-buffered bytes (e.g. from DA_LINK
+ * command parsing where TCP coalescing pulled in handshake bytes) are
+ * consumed before hitting the socket. */
+static ssize_t conn_recv_buffered(moor_connection_t *conn,
+                                   uint8_t *buf, size_t len) {
+    if (conn->recv_len > 0) {
+        size_t avail = conn->recv_len < len ? conn->recv_len : len;
+        memcpy(buf, conn->recv_buf, avail);
+        if (avail < conn->recv_len)
+            memmove(conn->recv_buf, conn->recv_buf + avail,
+                    conn->recv_len - avail);
+        conn->recv_len -= avail;
+        return (ssize_t)avail;
+    }
+    return conn_recv(conn, buf, len);
+}
+
 /*
  * Noise_IK link handshake.
  *
@@ -758,7 +776,7 @@ static int link_handshake_server(moor_connection_t *conn,
     uint8_t msg1[80]; /* e_pk(32) + encrypted_s(48) */
     size_t total = 0;
     while (total < 80) {
-        ssize_t n = conn_recv(conn, msg1 + total, 80 - total);
+        ssize_t n = conn_recv_buffered(conn, msg1 + total, 80 - total);
         if (n <= 0) {
             LOG_ERROR("Noise_IK server: msg1 recv failed");
             ret = -1; goto cleanup_server;

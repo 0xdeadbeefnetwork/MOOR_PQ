@@ -212,182 +212,158 @@ static ssize_t da_channel_recv(da_encrypted_channel_t *ch,
     return (ssize_t)pt_len;
 }
 
-/* Initiate encrypted channel to a peer DA */
+/* Initiate encrypted channel to a peer DA using Noise_IK + PQ Kyber.
+ * Sends "DA_LINK\n" prefix, then performs the same Noise_IK + Kyber768
+ * handshake relays use.  Full forward secrecy, mutual authentication,
+ * and post-quantum key exchange — replaces the prior hand-rolled DH. */
 static int da_channel_open(da_encrypted_channel_t *ch,
                            const char *peer_addr, uint16_t peer_port,
                            const uint8_t our_identity_pk[32],
                            const uint8_t our_identity_sk[64],
                            const uint8_t peer_identity_pk[32]) {
-    (void)our_identity_sk; /* initiator uses ephemeral key, not static sk */
     memset(ch, 0, sizeof(*ch));
     ch->fd = moor_tcp_connect_simple(peer_addr, peer_port);
     if (ch->fd < 0) return -1;
+
+    /* Send command prefix so the DA server dispatches to the
+     * DA_LINK handler before the Noise handshake begins. */
+    if (send(ch->fd, "DA_LINK\n", 8, MSG_NOSIGNAL) != 8) {
+        close(ch->fd); ch->fd = -1;
+        return -1;
+    }
+
+    /* Set up a temporary connection for the Noise_IK + PQ handshake.
+     * Stack-allocated — NOT in the connection pool. */
+    moor_connection_t conn;
+    memset(&conn, 0, sizeof(conn));
+    conn.fd = ch->fd;
+    conn.state = CONN_STATE_HANDSHAKING;
+
+    /* Noise_IK pre-message requires the responder's static key.
+     * link_handshake_client converts Ed25519 → Curve25519 internally. */
+    memcpy(conn.peer_identity, peer_identity_pk, 32);
+
+    moor_set_socket_timeout(ch->fd, 10);
+
+    if (link_handshake_client_pq(&conn, our_identity_pk, our_identity_sk) != 0) {
+        LOG_WARN("DA channel: Noise_IK+PQ handshake failed to %s:%u",
+                 peer_addr, peer_port);
+        close(ch->fd); ch->fd = -1;
+        moor_crypto_wipe(&conn, sizeof(conn));
+        return -1;
+    }
+
+    /* Copy post-PQ session keys and nonces into the DA channel struct.
+     * The data framing (length-prefix + nonce + AEAD) stays unchanged. */
+    memcpy(ch->send_key, conn.send_key, 32);
+    memcpy(ch->recv_key, conn.recv_key, 32);
+    ch->send_nonce = conn.send_nonce;
+    ch->recv_nonce = conn.recv_nonce;
+
+    /* Wipe handshake secrets from the temporary connection */
+    moor_crypto_wipe(conn.send_key, 32);
+    moor_crypto_wipe(conn.recv_key, 32);
+    moor_crypto_wipe(conn.our_kx_sk, 32);
+    moor_crypto_wipe(conn.our_kx_pk, 32);
+    if (conn.hs_state) {
+        moor_crypto_wipe(conn.hs_state, sizeof(moor_hs_state_t));
+        free(conn.hs_state);
+    }
+
+    /* Restore DA-friendly timeouts */
     moor_setsockopt_timeo(ch->fd, SO_SNDTIMEO, 5);
     moor_setsockopt_timeo(ch->fd, SO_RCVTIMEO, 5);
 
-    /* Generate ephemeral Curve25519 keypair */
-    uint8_t eph_pk[32], eph_sk[32];
-    moor_crypto_box_keygen(eph_pk, eph_sk);
-
-    /* Send: "DA_LINK\n" + our_identity_pk(32) + ephemeral_pk(32) */
-    uint8_t hello[64];
-    memcpy(hello, our_identity_pk, 32);
-    memcpy(hello + 32, eph_pk, 32);
-    if (send(ch->fd, "DA_LINK\n", 8, MSG_NOSIGNAL) != 8 ||
-        send(ch->fd, (char *)hello, 64, MSG_NOSIGNAL) != 64) {
-        close(ch->fd); ch->fd = -1;
-        moor_crypto_wipe(eph_sk, 32);
-        return -1;
-    }
-
-    /* Read response: peer_identity_pk(32) + "OK" */
-    uint8_t resp[34];
-    size_t got = 0;
-    while (got < 34) {
-        ssize_t n = recv(ch->fd, (char *)resp + got, 34 - got, 0);
-        if (n <= 0) { close(ch->fd); ch->fd = -1; return -1; }
-        got += n;
-    }
-
-    /* Verify it's the peer we expected */
-    if (sodium_memcmp(resp, peer_identity_pk, 32) != 0) {
-        LOG_WARN("DA channel: peer identity mismatch");
-        close(ch->fd); ch->fd = -1;
-        moor_crypto_wipe(eph_sk, 32);
-        return -1;
-    }
-
-    /* Derive session keys: DH(our_ephemeral, peer_static_curve) */
-    uint8_t peer_curve_pk[32];
-    if (moor_crypto_ed25519_to_curve25519_pk(peer_curve_pk, peer_identity_pk) != 0) {
-        LOG_ERROR("DA channel: ed25519_to_curve25519 failed (invalid peer key)");
-        close(ch->fd); ch->fd = -1;
-        moor_crypto_wipe(eph_sk, 32);
-        return -1;
-    }
-
-    uint8_t shared[32];
-    if (moor_crypto_dh(shared, eph_sk, peer_curve_pk) != 0) {
-        LOG_ERROR("DA channel: DH failed (invalid peer key)");
-        close(ch->fd); ch->fd = -1;
-        moor_crypto_wipe(eph_sk, 32);
-        return -1;
-    }
-    moor_crypto_wipe(eph_sk, 32);
-
-    /* HKDF: derive send_key and recv_key.
-     * Bind both identity keys + ephemeral key into the IKM to prevent
-     * unknown key-share attacks and provide channel binding.
-     * Forward secrecy: partial. Initiator contributes ephemeral key;
-     * responder uses static key. If responder's static key leaks,
-     * past sessions are decryptable. Acceptable for 2-DA operator
-     * model but not full FS. TODO: add responder ephemeral.
-     * ikm = "moor-da" || initiator_pk(32) || responder_pk(32) || eph_pk(32) */
-    uint8_t hkdf_ikm[7 + 32 + 32 + 32];
-    memcpy(hkdf_ikm, "moor-da", 7);
-    memcpy(hkdf_ikm + 7, our_identity_pk, 32);
-    memcpy(hkdf_ikm + 7 + 32, peer_identity_pk, 32);
-    memcpy(hkdf_ikm + 7 + 64, eph_pk, 32);
-    moor_crypto_hkdf(ch->send_key, ch->recv_key, shared,
-                     hkdf_ikm, sizeof(hkdf_ikm));
-    moor_crypto_wipe(shared, 32);
-    moor_crypto_wipe(hkdf_ikm, sizeof(hkdf_ikm));
-
-    ch->send_nonce = 0;
-    ch->recv_nonce = 0;
     return 0;
 }
 
-/* Accept encrypted channel from a peer DA (server side).
- * Called when we receive "DA_LINK\n" command.
- * Returns 0 on success with channel ready. */
+/* Accept encrypted channel from a peer DA using Noise_IK + PQ Kyber.
+ * Called when we receive "DA_LINK\n" command.  extra_data/extra_len carry
+ * any bytes the server's initial recv consumed beyond "DA_LINK\n" (TCP
+ * coalescing can pull Noise_IK msg1 bytes into the cmd_buf read).
+ * Returns 0 on success with channel ready and peer_pk_out set. */
 static int da_channel_accept(da_encrypted_channel_t *ch, int client_fd,
                               const uint8_t our_identity_pk[32],
                               const uint8_t our_identity_sk[64],
                               const moor_da_config_t *config,
-                              uint8_t peer_pk_out[32]) {
+                              uint8_t peer_pk_out[32],
+                              const uint8_t *extra_data, size_t extra_len) {
     memset(ch, 0, sizeof(*ch));
     ch->fd = client_fd;
 
-    /* Already consumed "DA_LINK\n" by the time we're called.
-     * Read: initiator_identity_pk(32) + ephemeral_pk(32) */
-    uint8_t init_data[64];
-    size_t got = 0;
-    while (got < 64) {
-        ssize_t n = recv(client_fd, (char *)init_data + got, 64 - got, 0);
-        if (n <= 0) return -1;
-        got += n;
+    /* Set up a temporary connection for the Noise_IK + PQ handshake.
+     * Stack-allocated — NOT in the connection pool. */
+    moor_connection_t conn;
+    memset(&conn, 0, sizeof(conn));
+    conn.fd = client_fd;
+    conn.state = CONN_STATE_HANDSHAKING;
+
+    /* Pre-buffer any bytes the cmd_buf recv consumed past "DA_LINK\n".
+     * link_handshake_server uses conn_recv_buffered which drains
+     * conn.recv_buf before hitting the socket. */
+    if (extra_data && extra_len > 0) {
+        if (extra_len > sizeof(conn.recv_buf)) extra_len = sizeof(conn.recv_buf);
+        memcpy(conn.recv_buf, extra_data, extra_len);
+        conn.recv_len = extra_len;
     }
 
-    uint8_t initiator_pk[32], eph_pk[32];
-    memcpy(initiator_pk, init_data, 32);
-    memcpy(eph_pk, init_data + 32, 32);
+    moor_set_socket_timeout(client_fd, 10);
 
-    /* Verify initiator is a known peer */
+    if (link_handshake_server_pq(&conn, our_identity_pk, our_identity_sk) != 0) {
+        LOG_WARN("DA: Noise_IK+PQ handshake failed (accept)");
+        moor_crypto_wipe(&conn, sizeof(conn));
+        return -1;
+    }
+
+    /* Verify the authenticated initiator is a trusted DA peer.
+     * conn.peer_identity holds the initiator's Curve25519 static pk
+     * (set by Noise_IK decryption of msg1). Convert each trusted peer's
+     * Ed25519 pk to Curve25519 for comparison. */
     int trusted = 0;
-    if (sodium_memcmp(our_identity_pk, initiator_pk, 32) == 0) {
+    uint8_t our_curve_pk[32];
+    moor_crypto_ed25519_to_curve25519_pk(our_curve_pk, our_identity_pk);
+    if (sodium_memcmp(our_curve_pk, conn.peer_identity, 32) == 0) {
+        LOG_WARN("DA channel: reject self-connect");
+        moor_crypto_wipe(&conn, sizeof(conn));
         return -1; /* reject self */
     }
     for (int p = 0; p < config->num_peers; p++) {
-        if (sodium_memcmp(config->peers[p].identity_pk, initiator_pk, 32) == 0) {
+        uint8_t peer_curve_pk[32];
+        if (moor_crypto_ed25519_to_curve25519_pk(peer_curve_pk,
+                config->peers[p].identity_pk) != 0)
+            continue;
+        if (sodium_memcmp(peer_curve_pk, conn.peer_identity, 32) == 0) {
             trusted = 1;
+            memcpy(peer_pk_out, config->peers[p].identity_pk, 32);
             break;
         }
     }
     if (!trusted) {
-        LOG_WARN("DA channel: reject unknown initiator");
+        LOG_WARN("DA channel: reject unknown initiator (Noise_IK authenticated "
+                 "but not in peer list)");
+        moor_crypto_wipe(&conn, sizeof(conn));
         return -1;
     }
 
-    memcpy(peer_pk_out, initiator_pk, 32);
+    /* Copy post-PQ session keys and nonces into the DA channel struct */
+    memcpy(ch->send_key, conn.send_key, 32);
+    memcpy(ch->recv_key, conn.recv_key, 32);
+    ch->send_nonce = conn.send_nonce;
+    ch->recv_nonce = conn.recv_nonce;
 
-    /* Derive session keys: DH(our_static_curve_sk, initiator_ephemeral_pk) */
-    uint8_t our_curve_sk[32];
-    if (moor_crypto_ed25519_to_curve25519_sk(our_curve_sk, our_identity_sk) != 0) {
-        LOG_ERROR("DA channel: ed25519_to_curve25519_sk failed");
-        moor_crypto_wipe(our_curve_sk, 32);
-        return -1;
+    /* Wipe handshake secrets */
+    moor_crypto_wipe(conn.send_key, 32);
+    moor_crypto_wipe(conn.recv_key, 32);
+    moor_crypto_wipe(conn.our_kx_sk, 32);
+    moor_crypto_wipe(conn.our_kx_pk, 32);
+    if (conn.hs_state) {
+        moor_crypto_wipe(conn.hs_state, sizeof(moor_hs_state_t));
+        free(conn.hs_state);
     }
 
-    uint8_t shared[32];
-    if (moor_crypto_dh(shared, our_curve_sk, eph_pk) != 0) {
-        LOG_ERROR("DA channel: DH failed (invalid initiator ephemeral key)");
-        moor_crypto_wipe(our_curve_sk, 32);
-        return -1;
-    }
-    moor_crypto_wipe(our_curve_sk, 32);
-
-    /* Note: initiator's send_key = our recv_key and vice versa.
-     * Bind both identity keys + ephemeral key into the IKM to prevent
-     * unknown key-share attacks and provide channel binding.
-     * Forward secrecy: partial. Initiator contributes ephemeral key;
-     * responder uses static key. If responder's static key leaks,
-     * past sessions are decryptable. Acceptable for 2-DA operator
-     * model but not full FS. TODO: add responder ephemeral.
-     * ikm = "moor-da" || initiator_pk(32) || responder_pk(32) || eph_pk(32)
-     * Same order as initiator: initiator = initiator_pk, responder = our_pk */
-    uint8_t hkdf_ikm[7 + 32 + 32 + 32];
-    memcpy(hkdf_ikm, "moor-da", 7);
-    memcpy(hkdf_ikm + 7, initiator_pk, 32);
-    memcpy(hkdf_ikm + 7 + 32, our_identity_pk, 32);
-    memcpy(hkdf_ikm + 7 + 64, eph_pk, 32);
-    moor_crypto_hkdf(ch->recv_key, ch->send_key, shared,
-                     hkdf_ikm, sizeof(hkdf_ikm));
-    moor_crypto_wipe(shared, 32);
-    moor_crypto_wipe(hkdf_ikm, sizeof(hkdf_ikm));
-
-    ch->send_nonce = 0;
-    ch->recv_nonce = 0;
-
-    /* Send back our identity_pk + "OK" */
-    uint8_t resp[34];
-    memcpy(resp, our_identity_pk, 32);
-    resp[32] = 'O';
-    resp[33] = 'K';
-    if (send(client_fd, (char *)resp, 34, MSG_NOSIGNAL) != 34) {
-        LOG_WARN("DA channel: failed to send accept response");
-        return -1;
-    }
+    /* Restore DA-friendly timeouts */
+    moor_setsockopt_timeo(client_fd, SO_RCVTIMEO, 5);
+    moor_setsockopt_timeo(client_fd, SO_SNDTIMEO, 5);
 
     return 0;
 }
@@ -1817,13 +1793,20 @@ static int da_dispatch_request(int client_fd, moor_da_config_t *config,
         return 0;
     }
 
-    /* Encrypted DA-to-DA channel: handles SYNC_RELAYS (and future cmds) */
+    /* Encrypted DA-to-DA channel: handles SYNC_RELAYS (and future cmds).
+     * Uses Noise_IK + PQ Kyber — same handshake as relay connections. */
     if (strncmp(cmd_buf, "DA_LINK\n", 8) == 0) {
         da_encrypted_channel_t ch;
         uint8_t peer_pk[32];
+        /* Pass any extra bytes beyond "DA_LINK\n" that the initial recv
+         * may have consumed (TCP coalescing into Noise msg1 bytes). */
+        size_t extra_len = (n > 8) ? (size_t)(n - 8) : 0;
+        const uint8_t *extra_data = extra_len ?
+            (const uint8_t *)(cmd_buf + 8) : NULL;
         if (da_channel_accept(&ch, client_fd, config->identity_pk,
-                              config->identity_sk, config, peer_pk) != 0) {
-            LOG_WARN("DA: encrypted channel handshake failed");
+                              config->identity_sk, config, peer_pk,
+                              extra_data, extra_len) != 0) {
+            LOG_WARN("DA: Noise_IK+PQ channel handshake failed");
             return -1;
         }
 
@@ -2552,7 +2535,11 @@ static int da_dispatch_request(int client_fd, moor_da_config_t *config,
             if (da_add_relay_unlocked(config, &desc) == 0) {
                 LOG_INFO("DA: accepted propagated descriptor from peer");
                 da_build_consensus_unlocked(config);
-                da_exchange_votes_unlocked(config);
+                /* Vote exchange removed: the sender's propagate thread
+                 * votes after propagation completes.  Voting here caused
+                 * overlapping cross-votes (DA2 votes back while DA1's
+                 * propagate thread is still running), producing body hash
+                 * mismatches and "PQ vote bodies diverged" warnings. */
                 da_unlock(config);
                 send(client_fd, "OK\n", 3, MSG_NOSIGNAL);
             } else {

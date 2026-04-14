@@ -165,6 +165,17 @@ int moor_connection_encrypt_cell(moor_connection_t *conn,
 
 /* Post-quantum hybrid handshake is always enabled (Kyber768 + Noise_IK) */
 
+/* Low-level PQ hybrid Noise_IK handshake (client/server).
+ * conn->fd must be set and connected. conn->peer_identity must be
+ * pre-set for client (Ed25519 pk of responder — converted internally).
+ * Returns 0 on success, -1 on failure. Sets conn->send_key/recv_key. */
+int link_handshake_client_pq(moor_connection_t *conn,
+                              const uint8_t our_identity_pk[32],
+                              const uint8_t our_identity_sk[64]);
+int link_handshake_server_pq(moor_connection_t *conn,
+                              const uint8_t our_identity_pk[32],
+                              const uint8_t our_identity_sk[64]);
+
 /* Create a TCP listen socket */
 int moor_listen(const char *bind_addr, uint16_t port);
 
