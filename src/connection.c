@@ -179,6 +179,11 @@ void moor_connection_free(moor_connection_t *conn) {
         moor_socks5_nullify_conn(conn);
         moor_hs_nullify_conn(conn);
         moor_hs_event_nullify_conn(conn);
+        /* Remove from conn hash table (belt-and-suspenders: workers should
+         * never be inserted, but remove just in case). */
+        conn_pool_lock();
+        conn_ht_remove(conn);
+        conn_pool_unlock();
         if (conn->transport && conn->transport_state) {
             conn->transport->transport_free(conn->transport_state);
             conn->transport_state = NULL;
@@ -1140,9 +1145,14 @@ int moor_connection_connect(moor_connection_t *conn,
     }
 
     conn->state = CONN_STATE_OPEN;
-    conn_pool_lock();
-    conn_ht_insert(conn);
-    conn_pool_unlock();
+    /* Worker connections must NOT enter the hash table — they're heap-allocated
+     * and freed directly.  A stale entry in conn_ht causes backward-shift
+     * rehash to dereference freed memory (SIGSEGV in conn_ht_insert). */
+    if (!moor_is_worker()) {
+        conn_pool_lock();
+        conn_ht_insert(conn);
+        conn_pool_unlock();
+    }
 
     /* Clear handshake timeout -- must not persist on data-path sockets */
     moor_set_socket_timeout(fd, 0);
@@ -1205,9 +1215,11 @@ int moor_connection_accept_fd(moor_connection_t *conn, int client_fd,
     }
 
     conn->state = CONN_STATE_OPEN;
-    conn_pool_lock();
-    conn_ht_insert(conn);
-    conn_pool_unlock();
+    if (!moor_is_worker()) {
+        conn_pool_lock();
+        conn_ht_insert(conn);
+        conn_pool_unlock();
+    }
 
     /* Clear handshake timeout -- must not persist on data-path sockets */
     moor_set_socket_timeout(client_fd, 0);
