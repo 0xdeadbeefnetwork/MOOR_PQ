@@ -142,6 +142,9 @@ int moor_da_handle_request_with_prefix(int client_fd, moor_da_config_t *config,
 /* Add a relay descriptor to DA */
 int moor_da_add_relay(moor_da_config_t *config,
                       const moor_node_descriptor_t *desc);
+/* Add relay without signature verification (trusted bootstrap import) */
+int moor_da_add_relay_trusted(moor_da_config_t *config,
+                              const moor_node_descriptor_t *desc);
 
 /* Build and sign a new consensus */
 int moor_da_build_consensus(moor_da_config_t *config);

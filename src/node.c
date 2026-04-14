@@ -659,14 +659,16 @@ int moor_consensus_serialize(uint8_t *out, size_t out_len,
             if (bcat(out, out_len, &off, tmp) < 0) return -1;
         }
 
-        /* w Bandwidth=N [Measured=M] */
+        /* w Bandwidth=N [Measured=M] [Features=F] */
         if (d->verified_bandwidth > 0)
-            snprintf(tmp, sizeof(tmp), "w Bandwidth=%llu Measured=%llu\n",
+            snprintf(tmp, sizeof(tmp), "w Bandwidth=%llu Measured=%llu Features=%u\n",
                      (unsigned long long)d->bandwidth,
-                     (unsigned long long)d->verified_bandwidth);
+                     (unsigned long long)d->verified_bandwidth,
+                     d->features);
         else
-            snprintf(tmp, sizeof(tmp), "w Bandwidth=%llu\n",
-                     (unsigned long long)d->bandwidth);
+            snprintf(tmp, sizeof(tmp), "w Bandwidth=%llu Features=%u\n",
+                     (unsigned long long)d->bandwidth,
+                     d->features);
         if (bcat(out, out_len, &off, tmp) < 0) return -1;
 
         /* g CC ASN */
@@ -937,6 +939,8 @@ int moor_consensus_deserialize(moor_consensus_t *cons,
             if (p) measured = strtoull(p + 9, NULL, 10);
             cons->relays[current_relay].bandwidth = (uint64_t)bw;
             cons->relays[current_relay].verified_bandwidth = (uint64_t)measured;
+            p = strstr(line, "Features=");
+            if (p) cons->relays[current_relay].features = (uint32_t)strtoul(p + 9, NULL, 10);
         }
         /* GeoIP: "g CC ASN" */
         else if (line[0] == 'g' && line[1] == ' ' && current_relay >= 0 && !in_footer) {

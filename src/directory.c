@@ -1,6 +1,7 @@
 #include "moor/moor.h"
 #include "moor/transport.h"
 #include "moor/geoip.h"
+#include "moor/bw_auth.h"
 #include "exit_notice.h"
 #include <sodium.h>
 #include <string.h>
@@ -598,6 +599,45 @@ int moor_da_add_relay(moor_da_config_t *config,
     return ret;
 }
 
+/* Trusted import: skip descriptor signature verification.
+ * Used for bootstrap from peer DA's text consensus, which is lossy
+ * (doesn't preserve all signed fields like features, prev_onion_pk).
+ * Relays re-register with fresh PUBLISH descriptors within 30 minutes. */
+int moor_da_add_relay_trusted(moor_da_config_t *config,
+                              const moor_node_descriptor_t *desc) {
+    da_lock(config);
+    /* Skip signature verification — caller trusts the source.
+     * Still enforce feature requirements and duplicate detection
+     * (handled by da_add_relay_core, which is the part of
+     * da_add_relay_unlocked after the sig check). */
+    int ret = -1;
+
+    /* Feature check (same as da_add_relay_unlocked) */
+    if ((desc->features & NODE_FEATURES_REQUIRED) != NODE_FEATURES_REQUIRED) {
+        da_unlock(config);
+        return -1;
+    }
+
+    /* Duplicate/update check + insertion (same logic as da_add_relay_unlocked) */
+    for (uint32_t i = 0; i < config->consensus.num_relays; i++) {
+        if (sodium_memcmp(config->consensus.relays[i].identity_pk,
+                         desc->identity_pk, 32) == 0) {
+            if (desc->published > config->consensus.relays[i].published)
+                memcpy(&config->consensus.relays[i], desc, sizeof(*desc));
+            da_unlock(config);
+            return 0;
+        }
+    }
+    if (config->consensus.num_relays < MOOR_MAX_RELAYS) {
+        memcpy(&config->consensus.relays[config->consensus.num_relays],
+               desc, sizeof(*desc));
+        config->consensus.num_relays++;
+        ret = 0;
+    }
+    da_unlock(config);
+    return ret;
+}
+
 /*
  * Build the raw consensus body bytes (timestamps + relay descriptors).
  * Caller must free *body_out. Returns 0 on success, -1 on error.
@@ -822,26 +862,10 @@ static int da_build_consensus_unlocked(moor_da_config_t *config) {
     /* Recompute relay flags from measured data -- relays cannot self-assign */
     moor_da_compute_flags_statistical(config);
 
-    /* Tor-aligned bandwidth consensus: prefer DA-measured (verified_bandwidth)
-     * over relay self-reported bandwidth.  When measured bandwidth is available,
-     * cap self-reported at 1.5x measured to prevent inflation.
-     * In a multi-DA setup, this runs independently on each DA — the vote
-     * exchange ensures relay sets converge, and each DA measures independently.
-     * Like Tor's dirserv_get_credible_bandwidth_kb(). */
-    for (uint32_t i = 0; i < config->consensus.num_relays; i++) {
-        moor_node_descriptor_t *r = &config->consensus.relays[i];
-        if (r->verified_bandwidth > 0) {
-            uint64_t cap = (uint64_t)((double)r->verified_bandwidth * 1.5);
-            if (r->bandwidth > cap) {
-                LOG_DEBUG("bandwidth: capping %s:%u from %llu to %llu (measured=%llu)",
-                         r->address, r->or_port,
-                         (unsigned long long)r->bandwidth,
-                         (unsigned long long)cap,
-                         (unsigned long long)r->verified_bandwidth);
-                r->bandwidth = cap;
-            }
-        }
-    }
+    /* Tor-aligned: never mutate desc->bandwidth (relay-signed field).
+     * DA-adjusted bandwidth is computed on-the-fly via
+     * moor_bw_auth_effective(bandwidth, verified_bandwidth) wherever needed.
+     * This preserves the relay's descriptor signature through DA sync. */
 
     /* Tor-aligned: compute bandwidth weights for path selection.
      * These are embedded in the consensus so all clients use identical values.
@@ -850,7 +874,7 @@ static int da_build_consensus_unlocked(moor_da_config_t *config) {
         int64_t G = 0, M = 0, E = 0, D = 0, T;
         for (uint32_t i = 0; i < config->consensus.num_relays; i++) {
             moor_node_descriptor_t *r = &config->consensus.relays[i];
-            int64_t bw = (int64_t)r->bandwidth;
+            int64_t bw = (int64_t)moor_bw_auth_effective(r->bandwidth, r->verified_bandwidth);
             int is_guard = (r->flags & NODE_FLAG_GUARD) != 0;
             int is_exit  = (r->flags & NODE_FLAG_EXIT) != 0;
             if (is_guard && is_exit)      D += bw;
@@ -1048,7 +1072,7 @@ int moor_da_build_microdesc_consensus(moor_microdesc_consensus_t *mc,
         memcpy(m->identity_pk, d->identity_pk, 32);
         memcpy(m->onion_pk, d->onion_pk, 32);
         m->flags = d->flags;
-        m->bandwidth = d->bandwidth;
+        m->bandwidth = moor_bw_auth_effective(d->bandwidth, d->verified_bandwidth);
         m->features = d->features;
         memcpy(m->family_id, d->family_id, 32);
         m->country_code = d->country_code;
@@ -1413,7 +1437,7 @@ static void da_serve_metrics(int fd, moor_da_config_t *config) {
     uint32_t n_guard = 0, n_exit = 0, n_fast = 0, n_stable = 0, n_pq = 0;
     for (uint32_t i = 0; i < nr; i++) {
         moor_node_descriptor_t *r = &cons->relays[i];
-        total_bw += r->bandwidth;
+        total_bw += moor_bw_auth_effective(r->bandwidth, r->verified_bandwidth);
         total_vbw += r->verified_bandwidth;
         if (r->flags & NODE_FLAG_GUARD) n_guard++;
         if (r->flags & NODE_FLAG_EXIT)  n_exit++;
@@ -1653,7 +1677,9 @@ static void da_serve_metrics_json(int fd, moor_da_config_t *config) {
     moor_consensus_t *cons = &config->consensus;
     uint32_t nr = cons->num_relays;
     uint64_t total_bw = 0;
-    for (uint32_t i = 0; i < nr; i++) total_bw += cons->relays[i].bandwidth;
+    for (uint32_t i = 0; i < nr; i++)
+        total_bw += moor_bw_auth_effective(cons->relays[i].bandwidth,
+                                           cons->relays[i].verified_bandwidth);
 
     APPEND("{\"version\":\"%s\",\"relays\":%u,\"total_bandwidth\":%llu,"
            "\"da_signatures\":%u,\"hs_descriptors\":%u,\"consensus_age\":%llu,"
@@ -2864,7 +2890,13 @@ int moor_da_sync_relays(moor_da_config_t *config) {
             moor_node_descriptor_t desc;
             if (moor_node_descriptor_deserialize(&desc, resp_data + off, dlen) > 0) {
                 if (moor_node_verify_descriptor(&desc) != 0) {
-                    LOG_WARN("DA sync: rejecting descriptor with invalid signature");
+                    LOG_WARN("DA sync: rejecting descriptor %s:%u nick=%s "
+                             "flags=0x%08x bw=%llu features=0x%x (invalid signature)",
+                             desc.address, desc.or_port,
+                             desc.nickname[0] ? desc.nickname : "?",
+                             desc.flags,
+                             (unsigned long long)desc.bandwidth,
+                             desc.features);
                     off += dlen;
                     continue;
                 }
@@ -4170,20 +4202,21 @@ void moor_da_compute_flags_statistical(moor_da_config_t *config) {
 
     for (uint32_t i = 0; i < n; i++) {
         moor_node_descriptor_t *r = &config->consensus.relays[i];
-        uint64_t bw_kb = r->bandwidth / 1000;
+        uint64_t eff_bw = moor_bw_auth_effective(r->bandwidth, r->verified_bandwidth);
+        uint64_t bw_kb = eff_bw / 1000;
         if (bw_kb < DA_MIN_BW_KB) continue;
 
         uint64_t base = r->first_seen ? r->first_seen : r->published;
         uint64_t uptime = (now > base) ? (now - base) : 0;
 
-        bws[n_active] = r->bandwidth;
+        bws[n_active] = eff_bw;
         uptimes[n_active] = uptime;
         time_knowns[n_active] = uptime; /* time_known ≈ uptime for small networks */
         n_active++;
 
         /* Guard candidate BWs (exclude exits for threshold calc, like Tor) */
         if (!(r->flags & NODE_FLAG_EXIT)) {
-            guard_bws[n_guard_cand++] = r->bandwidth;
+            guard_bws[n_guard_cand++] = eff_bw;
         }
     }
 
@@ -4235,13 +4268,14 @@ void moor_da_compute_flags_statistical(moor_da_config_t *config) {
         moor_node_descriptor_t *r = &config->consensus.relays[i];
         uint64_t base = r->first_seen ? r->first_seen : r->published;
         uint64_t uptime = (now > base) ? (now - base) : 0;
-        uint64_t bw_kb = r->bandwidth / 1000;
+        uint64_t eff_bw = moor_bw_auth_effective(r->bandwidth, r->verified_bandwidth);
+        uint64_t bw_kb = eff_bw / 1000;
 
         /* Skip relays below minimum bandwidth */
         int active = (bw_kb >= DA_MIN_BW_KB);
 
         /* Fast: bandwidth >= 12.5th percentile */
-        if (active && r->bandwidth >= fast_bw)
+        if (active && eff_bw >= fast_bw)
             r->flags |= NODE_FLAG_FAST;
         else
             r->flags &= ~NODE_FLAG_FAST;
@@ -4263,7 +4297,7 @@ void moor_da_compute_flags_statistical(moor_da_config_t *config) {
         } else if ((r->flags & NODE_FLAG_GUARD) &&
             (r->flags & NODE_FLAG_FAST) &&
             (r->flags & NODE_FLAG_STABLE) &&
-            r->bandwidth >= guard_bw_threshold &&
+            eff_bw >= guard_bw_threshold &&
             uptime >= guard_tk) {
             /* Large network: keep Guard if criteria met */
         } else if (r->flags & NODE_FLAG_GUARD) {

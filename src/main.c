@@ -1625,8 +1625,13 @@ static int run_da(void) {
                 if (moor_client_fetch_consensus(peer_cons,
                         g_da_config.peers[p].address,
                         g_da_config.peers[p].port) == 0) {
+                    /* Import without signature verification: the text consensus
+                     * format is lossy (doesn't preserve all signed descriptor
+                     * fields like features, prev_onion_pk, onion_key_version).
+                     * Relays re-register directly within 30 minutes with fresh
+                     * PUBLISH descriptors that pass full verification. */
                     for (uint32_t i = 0; i < peer_cons->num_relays; i++)
-                        moor_da_add_relay(&g_da_config, &peer_cons->relays[i]);
+                        moor_da_add_relay_trusted(&g_da_config, &peer_cons->relays[i]);
                     LOG_INFO("DA: bootstrapped %u relays from peer %s:%u",
                              peer_cons->num_relays,
                              g_da_config.peers[p].address,
