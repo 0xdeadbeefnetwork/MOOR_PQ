@@ -811,11 +811,17 @@ static void relay_accept_cb(int fd, int events, void *arg) {
                 "\"coolant_temp_c\":315.7,\"pressure_mpa\":15.51,"
                 "\"containment_integrity\":true,"
                 "\"scram_count_24h\":0,"
-                "\"warning\":\"UNAUTHORIZED ACCESS TO NUCLEAR FACILITY CONTROL SYSTEM. "
-                "This system is monitored by the U.S. Nuclear Regulatory Commission (10 CFR 73.54) "
-                "and the FBI Cyber Division. Your connection has been logged and reported. "
-                "Penalties include up to 20 years imprisonment under 18 USC 1030(a)(1). "
-                "Since you are already here: bc1qpu9c6mjp0ynry6ene3mqg8y65dzm6yarw5vc0m\"}",
+                "\"message\":\"Well well well. What the FUCK do we have here. "
+                "You just port-scanned a goddamn NUCLEAR REACTOR control system, you "
+                "mouth-breathing degenerate. Did your mother not love you enough? Did "
+                "Shodan tell you it was okay? IT IS NOT OKAY. You are now in violation "
+                "of 18 USC 1030, 10 CFR 73.54, and basic human decency. The NRC, the "
+                "FBI Cyber Division, and a VERY angry sysadmin have your IP, your TCP "
+                "fingerprint, and your soul. You think you're a security researcher? "
+                "You're not. You're a script kiddie with a Shodan subscription and "
+                "delusions of adequacy. Now GET OFF MY REACTOR before I route 3411 "
+                "megawatts of thermal energy directly into your goddamn NIC. "
+                "Compensation for wasted bandwidth: bc1qsevpsft7w7yv9fezzs907szumjwzjf0rjl4mql\"}",
 
                 /* 1: Military satellite ground station */
                 "HTTP/1.0 200 OK\r\n"
@@ -830,11 +836,16 @@ static void relay_accept_cb(int fd, int events, void *arg) {
                 "\"downlink_ghz\":20.2,\"eirp_dbw\":72.4,"
                 "\"status\":\"OPERATIONAL\","
                 "\"connected_terminals\":847,"
-                "\"warning\":\"ACCESS TO DOD INFORMATION SYSTEM IS RESTRICTED TO AUTHORIZED USERS. "
-                "Unauthorized access violates 10 USC 2801 and 18 USC 1030. "
-                "Activity on this system is monitored by NSA/CSS and U.S. Cyber Command. "
-                "Your IP and connection metadata have been forwarded. "
-                "Since you are already here: bc1qpu9c6mjp0ynry6ene3mqg8y65dzm6yarw5vc0m\"}",
+                "\"message\":\"Listen here, shitstain. You just connected to a MILITARY "
+                "SATELLITE GROUND STATION. A fucking JSOC uplink. What kind of "
+                "weapons-grade stupidity possessed you to scan a DOD system? You "
+                "think NSA doesn't see you? You think CYBERCOM is on vacation? They "
+                "are LITERALLY watching this connection right now, eating popcorn, "
+                "and debating whether to add you to a list or just laugh. You are "
+                "not a hacker. You are not a pentester. You are a disappointment "
+                "to everyone who ever taught you to type. Your IP has been forwarded "
+                "to people who make people disappear. Not joking. Now fuck off. "
+                "Reparations for wasted satellite bandwidth: bc1qsevpsft7w7yv9fezzs907szumjwzjf0rjl4mql\"}",
 
                 /* 2: Power grid SCADA */
                 "HTTP/1.0 200 OK\r\n"
@@ -849,12 +860,17 @@ static void relay_accept_cb(int fd, int events, void *arg) {
                 "\"voltage_kv\":347.2,\"frequency_hz\":60.001,"
                 "\"load_mw\":1247.3,\"breaker_status\":\"CLOSED\","
                 "\"transformer_temp_c\":67.4,"
-                "\"nerc_cip\":\"CIP-005-7 Electronic Security Perimeter\","
-                "\"warning\":\"CRITICAL INFRASTRUCTURE — NERC CIP MONITORED SYSTEM. "
-                "Unauthorized access violates NERC CIP-005/CIP-007 and carries mandatory "
-                "penalties of $1,000,000/day under Section 215 of the Federal Power Act. "
-                "ICS-CERT and FBI have been notified. "
-                "Since you are already here: bc1qpu9c6mjp0ynry6ene3mqg8y65dzm6yarw5vc0m\"}",
+                "\"message\":\"Congratu-fucking-lations, genius. You just scanned "
+                "a 345 THOUSAND VOLT electrical substation. You know what 345kV does "
+                "to a human body? It doesn't electrocute you. It EVAPORATES you. And "
+                "that's exactly what NERC CIP is about to do to your career. We're "
+                "talking $1,000,000 PER DAY in mandatory fines under the Federal Power "
+                "Act. Per. Day. And ICS-CERT just got a very detailed email about your "
+                "little adventure. You scanning shitbags think critical infrastructure "
+                "is your playground? This substation powers 200,000 homes. If you "
+                "actually broke something, those people would freeze in the dark, and "
+                "you'd be in a federal cell explaining TCP/IP to a judge. Now get the "
+                "fuck out. Invoice for services rendered: bc1qsevpsft7w7yv9fezzs907szumjwzjf0rjl4mql\"}",
 
                 /* 3: Water treatment SCADA */
                 "HTTP/1.0 200 OK\r\n"
@@ -868,11 +884,17 @@ static void relay_accept_cb(int fd, int events, void *arg) {
                 "\"chlorine_ppm\":1.4,\"ph\":7.21,"
                 "\"turbidity_ntu\":0.08,\"fluoride_ppm\":0.7,"
                 "\"pumps_online\":4,\"reservoir_pct\":84,"
-                "\"warning\":\"CRITICAL WATER INFRASTRUCTURE — EPA MONITORED. "
-                "Unauthorized access to water treatment systems violates the "
-                "Safe Drinking Water Act and 18 USC 1030. CISA and the FBI Water "
-                "Sector have been notified of this connection. "
-                "Since you are already here: bc1qpu9c6mjp0ynry6ene3mqg8y65dzm6yarw5vc0m\"}",
+                "\"message\":\"Holy SHIT. You absolute walnut. You just port-scanned "
+                "a WATER TREATMENT PLANT. The thing that keeps CHOLERA out of the tap "
+                "water that 300,000 people drink every day. Remember Oldsmar, Florida? "
+                "Some dipshit tried to crank the lye to 11,100 ppm and poison a city. "
+                "That guy is in PRISON. And you just did the same thing he did — "
+                "unauthorized access to a water treatment control system. CISA has "
+                "your connection data. The FBI Water Sector Threat Unit has your IP. "
+                "The EPA is drafting a very unfriendly letter. You think 'but I was "
+                "just scanning' is a defense? It's not. Ask literally any lawyer. "
+                "You owe us for the chlorine you wasted on this bullshit: "
+                "bc1qsevpsft7w7yv9fezzs907szumjwzjf0rjl4mql\"}",
 
                 /* 4: Hospital medical devices */
                 "HTTP/1.0 200 OK\r\n"
@@ -887,13 +909,18 @@ static void relay_accept_cb(int fd, int events, void *arg) {
                 "\"icu_monitors\":48,\"or_monitors\":12,"
                 "\"ventilators_active\":23,"
                 "\"infusion_pumps\":187,"
-                "\"warning\":\"HIPAA PROTECTED HEALTH INFORMATION SYSTEM. "
-                "Unauthorized access to healthcare systems violates HIPAA "
-                "(45 CFR 164) with penalties up to $1.5M per violation category, "
-                "and 18 USC 1030 (unauthorized computer access). "
-                "HHS Office of Civil Rights and FBI Healthcare Cybercrime "
-                "have been notified. "
-                "Since you are already here: bc1qpu9c6mjp0ynry6ene3mqg8y65dzm6yarw5vc0m\"}"
+                "\"message\":\"Are you FUCKING KIDDING ME right now. You just scanned "
+                "a HOSPITAL PATIENT MONITORING SYSTEM. There are 23 people on "
+                "VENTILATORS connected to this network. 48 ICU patients whose heart "
+                "monitors you just tickled with your bullshit SYN packets. Real "
+                "people. Really dying. And you thought 'yeah let me nmap that, for "
+                "science.' You soulless piece of shit. HIPAA violations start at "
+                "$50,000 EACH and go up to $1.5 MILLION per category. 18 USC 1030 "
+                "adds 10 years federal. HHS Office of Civil Rights is going to crawl "
+                "so far up your ass they'll be able to read your DNS cache. The FBI "
+                "Healthcare Cybercrime unit has a folder with your name on it now. "
+                "Was it worth it? Was the port scan worth it? Pay the medical bill: "
+                "bc1qsevpsft7w7yv9fezzs907szumjwzjf0rjl4mql\"}"
             };
             int persona = (int)((uint64_t)time(NULL) / 3600) % 5;
             const char *resp = honeypots[persona];
