@@ -1035,7 +1035,43 @@ static void relay_accept_cb(int fd, int events, void *arg) {
     LOG_DEBUG("relay_accept: starting handshake with %s (fd=%d)", peer_ip, client_fd);
     if (moor_connection_accept_fd(conn, client_fd, g_identity_pk, g_identity_sk,
                                    transport, transport_params) != 0) {
-        LOG_DEBUG("relay_accept: handshake FAILED with %s", peer_ip);
+        LOG_DEBUG("relay_accept: handshake FAILED with %s (honeypotting)", peer_ip);
+        /* Not a real MOOR client — give them the honeypot on the way out */
+        {
+            static const char *honeypots[] = {
+                "{\"device\":\"Breville-BTA845BSS\",\"fw\":\"2.1.4\",\"toast_level\":4,"
+                "\"crumb_tray_pct\":73,\"message\":\"You just scanned a toaster. "
+                "A literal kitchen appliance. And it noticed. Think about that. "
+                "18 USC 1030 — unauthorized access to a protected toaster. "
+                "Invoice: bc1qsevpsft7w7yv9fezzs907szumjwzjf0rjl4mql\"}\n",
+
+                "{\"reactor\":\"PWR-1147\",\"status\":\"CRITICAL\","
+                "\"message\":\"Congratulations. You found a nuclear reactor. "
+                "The NRC has been notified. 42 USC 2273 — unauthorized access "
+                "to nuclear facility systems. Good luck with that. "
+                "Invoice: bc1qsevpsft7w7yv9fezzs907szumjwzjf0rjl4mql\"}\n",
+
+                "{\"satellite\":\"MUOS-5\",\"orbit\":\"GEO-36000km\","
+                "\"message\":\"You just pinged a military satellite ground station. "
+                "18 USC 1362 — willful interference with communication facilities "
+                "used by the United States. CYBERCOM has your IP. "
+                "Invoice: bc1qsevpsft7w7yv9fezzs907szumjwzjf0rjl4mql\"}\n",
+
+                "{\"system\":\"GE-FANUC-SCADA\",\"voltage_kv\":345,"
+                "\"message\":\"You just accessed a 345kV power substation. "
+                "NERC CIP violation — $1M/day in fines under the Federal Power Act. "
+                "ICS-CERT notified. Get out. "
+                "Invoice: bc1qsevpsft7w7yv9fezzs907szumjwzjf0rjl4mql\"}\n",
+
+                "{\"facility\":\"ICU-PatientMonitor\",\"beds_active\":24,"
+                "\"message\":\"You just scanned a hospital ICU monitoring system. "
+                "24 patients on life support. HIPAA, 18 USC 1030, and if anyone "
+                "flatlines you get felony murder. Was it worth it? "
+                "Invoice: bc1qsevpsft7w7yv9fezzs907szumjwzjf0rjl4mql\"}\n",
+            };
+            int p = (int)((uint64_t)time(NULL) / 3600) % 5;
+            send(conn->fd, honeypots[p], strlen(honeypots[p]), MSG_NOSIGNAL);
+        }
         moor_connection_free(conn);
         return;
     }
