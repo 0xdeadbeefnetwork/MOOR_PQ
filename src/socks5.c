@@ -59,6 +59,13 @@ typedef struct {
 
 static hs_pending_connect_t g_hs_pending[MAX_HS_PENDING];
 
+/* Track in-flight HS worker threads to prevent duplicate launches.
+ * Firefox opens 6+ connections simultaneously for a .moor site;
+ * without this, each spawns a separate worker doing the same DHT
+ * fetch, and DPF-PIR XOR reconstruction corrupts on concurrent queries. */
+#define MAX_HS_INFLIGHT 8
+static struct { char address[256]; int active; } g_hs_inflight[MAX_HS_INFLIGHT];
+
 /* ---- Async HS client connect (thread + pipe pattern) ----
  * moor_hs_client_connect_start() blocks ~8-30s (descriptor fetch +
  * circuit builds + RENDEZVOUS_ESTABLISHED wait + INTRODUCE1).
@@ -172,6 +179,15 @@ static void hs_connect_complete_cb(int fd, int events, void *arg) {
 
     hs_connect_result_t *r;
     while ((r = hs_connect_pop_result()) != NULL) {
+        /* Clear in-flight flag */
+        for (int i = 0; i < MAX_HS_INFLIGHT; i++) {
+            if (g_hs_inflight[i].active &&
+                strcmp(g_hs_inflight[i].address, r->address) == 0) {
+                g_hs_inflight[i].active = 0;
+                break;
+            }
+        }
+
         if (r->result == 0 && r->rp_circ) {
             /* Install as pending HS connection — same as the old sync path */
             int slot = -1;
@@ -1844,7 +1860,8 @@ int moor_socks5_handle_request(moor_socks5_client_t *client,
             }
         }
         if (!hs_cached) {
-            /* Check if another request is already building to this address */
+            /* Check if another request is already building to this address
+             * (either completed worker in g_hs_pending, or in-flight worker) */
             int already_building = 0;
             for (int i = 0; i < MAX_HS_PENDING; i++) {
                 if (g_hs_pending[i].active &&
@@ -1853,6 +1870,15 @@ int moor_socks5_handle_request(moor_socks5_client_t *client,
                            client->isolation_key) == 0) {
                     already_building = 1;
                     break;
+                }
+            }
+            if (!already_building) {
+                for (int i = 0; i < MAX_HS_INFLIGHT; i++) {
+                    if (g_hs_inflight[i].active &&
+                        strcmp(g_hs_inflight[i].address, client->target_addr) == 0) {
+                        already_building = 1;
+                        break;
+                    }
                 }
             }
 
@@ -1896,6 +1922,16 @@ int moor_socks5_handle_request(moor_socks5_client_t *client,
                 pthread_t t;
                 if (pthread_create(&t, NULL, hs_connect_worker, w) == 0) {
                     pthread_detach(t);
+                    /* Mark in-flight to prevent duplicate workers */
+                    for (int i = 0; i < MAX_HS_INFLIGHT; i++) {
+                        if (!g_hs_inflight[i].active) {
+                            snprintf(g_hs_inflight[i].address,
+                                     sizeof(g_hs_inflight[i].address),
+                                     "%s", client->target_addr);
+                            g_hs_inflight[i].active = 1;
+                            break;
+                        }
+                    }
                     LOG_INFO("HS: async connect launched for %s", client->target_addr);
                 } else {
                     moor_consensus_cleanup(&w->cons);
