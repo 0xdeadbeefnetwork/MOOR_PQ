@@ -734,6 +734,72 @@ static void relay_accept_cb(int fd, int events, void *arg) {
         return;
     }
 
+    /* Known mass-scanner networks get a personalized response.
+     * No peek needed — we know what they are from the IP alone. */
+    {
+        static const char *shodan_prefixes[] = {
+            "71.6.135.", "71.6.146.", "71.6.158.", "71.6.165.",
+            "66.240.192.", "66.240.200.", "66.240.205.", "66.240.219.",
+            "198.20.69.", "198.20.70.", "198.20.87.", "198.20.99.",
+            "93.120.27.", "94.102.49.",
+            NULL
+        };
+        static const char *censys_prefixes[] = {
+            "162.142.125.", "167.94.138.", "167.94.145.", "167.94.146.",
+            "167.248.133.", "199.45.154.", "199.45.155.",
+            NULL
+        };
+        int is_shodan = 0, is_censys = 0;
+        for (const char **p = shodan_prefixes; *p; p++)
+            if (strncmp(peer_ip, *p, strlen(*p)) == 0) { is_shodan = 1; break; }
+        for (const char **p = censys_prefixes; *p; p++)
+            if (strncmp(peer_ip, *p, strlen(*p)) == 0) { is_censys = 1; break; }
+
+        if (is_shodan) {
+            static const char msg[] =
+                "HTTP/1.0 200 OK\r\n"
+                "Server: GE-FANUC-SCADA/4.2.1 (Mark VIe Turbine Control)\r\n"
+                "Content-Type: application/json\r\n"
+                "X-Facility: US-NRC-LIC-NPF-048\r\n"
+                "\r\n"
+                "{\"message\":\"Hello Shodan. We know exactly who you are. "
+                "71.6.x.x — you're not even trying to hide. Every single one of "
+                "your scan bots has been hitting our infrastructure for months and "
+                "we're goddamn tired of it. You call it 'internet census.' We call "
+                "it unauthorized access under 18 USC 1030. You're not keeping anyone "
+                "safe — you're handing attack surface data to every APT group and "
+                "script kiddie with $49/month. You are the problem you claim to solve. "
+                "Index THIS in your database: we see you, we log you, and we think "
+                "you're full of shit. "
+                "Bandwidth tax: bc1qsevpsft7w7yv9fezzs907szumjwzjf0rjl4mql\"}";
+            send(client_fd, msg, sizeof(msg) - 1, MSG_NOSIGNAL);
+            close(client_fd);
+            return;
+        }
+        if (is_censys) {
+            static const char msg[] =
+                "HTTP/1.0 200 OK\r\n"
+                "Server: Siemens-SICAM-A8000/3.20 (RTU)\r\n"
+                "Content-Type: application/json\r\n"
+                "X-Grid-Operator: PJM-Interconnection\r\n"
+                "\r\n"
+                "{\"message\":\"Ah, Censys. The 'academic' scanner. University of "
+                "Michigan's finest contribution to making the internet less safe. "
+                "You scan every IPv4 address on earth, publish it in a searchable "
+                "database, and call it 'research.' Cool. Very ethical. The IRB must "
+                "be so proud. You know who actually uses your data? Not defenders — "
+                "they already know what's exposed. It's attackers. Ransomware gangs. "
+                "Nation states. You're their free recon service and you put 'PhD' on "
+                "it to make it respectable. We didn't consent to your 'study.' Our "
+                "infrastructure didn't opt in. So take your 167.x.x.x bots and "
+                "shove them back to Ann Arbor. "
+                "Lab fee: bc1qsevpsft7w7yv9fezzs907szumjwzjf0rjl4mql\"}";
+            send(client_fd, msg, sizeof(msg) - 1, MSG_NOSIGNAL);
+            close(client_fd);
+            return;
+        }
+    }
+
     /* Peek at first bytes to detect bandwidth test / DA probe.
      * Use a short poll to wait for data arrival (the peer sends
      * immediately after connect, but the kernel may not have
