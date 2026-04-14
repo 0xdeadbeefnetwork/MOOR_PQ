@@ -337,6 +337,15 @@ moor_circuit_t *moor_circuit_alloc(void) {
 
     circ_init_fields(circ);
 
+    /* Worker threads: skip tracking array (invisible to main thread).
+     * Prevents main thread's timeout/close/padding handlers from touching
+     * worker's circuits. */
+    {
+        extern int moor_is_worker(void);  /* connection.c */
+        if (moor_is_worker())
+            return circ;
+    }
+
     circ_pool_lock();
     if (circ_array_add(circ) != 0) {
         circ_pool_unlock();
@@ -2348,22 +2357,53 @@ int moor_circuit_build(moor_circuit_t *circ,
                                     NULL, NULL) != 0) {
             return -1;
         }
+        /* If skip_guard_reuse: clear peer_identity after connect so the
+         * channel system (moor_connection_find_by_identity) can't discover
+         * this connection from another thread.  Without this, the main
+         * thread's channel mux attaches circuits to our connection, sending
+         * cells that advance the nonce — desynchronizing the relay's
+         * decrypt state and breaking our CREATE cell. */
+        if (skip_guard_reuse)
+            memset(guard_conn->peer_identity, 0, 32);
     }
     guard_conn->circuit_refcount++;
 
-    /* CREATE with guard — use PQ hybrid if relay supports Kyber768 */
+    /* CREATE with guard — use PQ hybrid if relay supports Kyber768.
+     * Fallback to classical if PQ CREATE fails (some relays don't handle
+     * CREATE_PQ on standalone connections vs channel-multiplexed ones). */
     memcpy(circ->hops[0].node_id, guard->identity_pk, 32);
+    int create_ok = 0;
     if ((guard->features & NODE_FEATURE_PQ) && !sodium_is_zero(guard->kem_pk, 1184)) {
-        if (moor_circuit_create_pq(circ, guard->identity_pk, guard->onion_pk, guard->kem_pk) != 0)
-            return -1;
+        if (moor_circuit_create_pq(circ, guard->identity_pk, guard->onion_pk, guard->kem_pk) == 0) {
+            create_ok = 1;
+        } else {
+            /* PQ failed — reconnect and try classical.  The connection state
+             * is corrupted after a failed PQ exchange (nonces advanced). */
+            LOG_WARN("PQ CREATE failed, falling back to classical CKE");
+            if (guard_conn->fd >= 0) {
+                close(guard_conn->fd);
+                guard_conn->fd = -1;
+            }
+            guard_conn->state = CONN_STATE_NONE;
+            guard_conn->send_nonce = 0;
+            guard_conn->recv_nonce = 0;
+            memcpy(guard_conn->peer_identity, guard->identity_pk, 32);
+            if (moor_connection_connect(guard_conn, guard->address, guard->or_port,
+                                        our_identity_pk, our_identity_sk,
+                                        NULL, NULL) == 0) {
+                if (moor_circuit_create(circ, guard->identity_pk, guard->onion_pk) == 0)
+                    create_ok = 1;
+            }
+        }
     } else {
         /* R10-ADV2: Warn on possible PQ downgrade */
         if (!sodium_is_zero(guard->kem_pk, 1184))
             LOG_WARN("relay %s:%u lost PQ capability -- possible downgrade attack",
                      guard->address, guard->or_port);
-        if (moor_circuit_create(circ, guard->identity_pk, guard->onion_pk) != 0)
-            return -1;
+        if (moor_circuit_create(circ, guard->identity_pk, guard->onion_pk) == 0)
+            create_ok = 1;
     }
+    if (!create_ok) return -1;
 
     /* Select exit first (exclude guard) -- reserve it so middle selection
      * doesn't consume the only exit relay.
@@ -3795,6 +3835,14 @@ static void cbuild_finish(moor_circuit_t *circ, int status) {
                 circ->chan->state != CHAN_STATE_CLOSED)
                 moor_channel_mark_for_close(circ->chan);
             circ->chan = NULL;
+        }
+        /* Disarm any pending async connect callback that holds a pointer
+         * to this circuit.  Without this, the async connect completes later
+         * and fires cbuild_on_connect with a freed circuit pointer (UAF).
+         * The connection's hs_state stores the circuit as on_complete_arg. */
+        if (circ->conn && circ->conn->hs_state) {
+            circ->conn->hs_state->on_complete_arg = NULL;
+            circ->conn->hs_state->on_complete = NULL;
         }
         /* Failure: clean up connection refcount safely */
         moor_connection_t *conn = circ->conn;

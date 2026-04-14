@@ -377,7 +377,7 @@ int moor_config_set(moor_config_t *cfg, const char *key, const char *value) {
                 cfg->da_port = cfg->da_list[0].port;
             }
         } else {
-            snprintf(cfg->da_address, sizeof(cfg->da_address), "%.63s", value);
+            snprintf(cfg->da_address, sizeof(cfg->da_address), "%s", value);
         }
     }
     else if (strcmp(key, "DAPort") == 0) {

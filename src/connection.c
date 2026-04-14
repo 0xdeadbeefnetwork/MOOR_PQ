@@ -4,6 +4,22 @@
 #include <stdlib.h>
 #include <errno.h>
 
+/* Worker thread isolation key. Threads call pthread_setspecific to mark
+ * themselves as workers. moor_circuit_alloc and moor_connection_alloc
+ * check this to return heap-only objects invisible to the main thread. */
+#include <pthread.h>
+pthread_key_t moor_worker_key;
+static pthread_once_t worker_key_once = PTHREAD_ONCE_INIT;
+static void worker_key_init(void) { pthread_key_create(&moor_worker_key, NULL); }
+void moor_worker_isolate(void) {
+    pthread_once(&worker_key_once, worker_key_init);
+    pthread_setspecific(moor_worker_key, (void*)1);
+}
+int moor_is_worker(void) {
+    pthread_once(&worker_key_once, worker_key_init);
+    return pthread_getspecific(moor_worker_key) != NULL;
+}
+
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -117,6 +133,15 @@ void moor_connection_init_pool(void) {
 }
 
 moor_connection_t *moor_connection_alloc(void) {
+    /* Worker threads: allocate OUTSIDE the pool so the main thread's
+     * event loop, padding machine, reaper, and timeout handler can't
+     * find or interfere with the connection. */
+    if (moor_is_worker()) {
+        moor_connection_t *c = calloc(1, sizeof(moor_connection_t));
+        if (c) { c->fd = -1; moor_queue_init(&c->outq); }
+        return c;
+    }
+
     conn_pool_lock();
     if (!g_conn_pool_init) moor_connection_init_pool();
     for (int i = 0; i < MOOR_MAX_CONNECTIONS; i++) {
@@ -138,6 +163,30 @@ moor_connection_t *moor_connection_alloc(void) {
 
 void moor_connection_free(moor_connection_t *conn) {
     if (!conn) return;
+
+    /* Detect heap-allocated (calloc'd) connections — not in the pool.
+     * Worker threads allocate connections outside the pool to prevent
+     * main-thread interference.  These must be free()'d, not poisoned. */
+    int is_heap = (conn < &g_conn_pool[0] ||
+                   conn >= &g_conn_pool[MOOR_MAX_CONNECTIONS]);
+    if (is_heap) {
+        if (conn->transport && conn->transport_state) {
+            conn->transport->transport_free(conn->transport_state);
+            conn->transport_state = NULL;
+        }
+        if (conn->hs_state) {
+            moor_crypto_wipe(conn->hs_state, sizeof(moor_hs_state_t));
+            free(conn->hs_state);
+        }
+        moor_crypto_wipe(conn->send_key, 32);
+        moor_crypto_wipe(conn->recv_key, 32);
+        moor_crypto_wipe(conn->our_kx_sk, 32);
+        moor_crypto_wipe(conn->recv_buf, sizeof(conn->recv_buf));
+        moor_queue_clear(&conn->outq);
+        free(conn);
+        return;
+    }
+
     /* Idempotent: if already freed (poisoned), don't double-free.
      * After poison+restore, state=CONN_STATE_NONE and fd=-1.
      * A connection that was never used also has these values but
@@ -284,6 +333,16 @@ int moor_tcp_connect_simple(const char *address, uint16_t port) {
     }
 
     freeaddrinfo(res);
+
+#ifndef _WIN32
+    /* Worker threads: dup fd to >= 256 so main thread's stale libevent
+     * registrations on low fds can't fire old callbacks on our fd. */
+    if (moor_is_worker() && fd < 256) {
+        int high = fcntl(fd, F_DUPFD, 256);
+        if (high >= 0) { close(fd); fd = high; }
+    }
+#endif
+
     return fd;
 }
 

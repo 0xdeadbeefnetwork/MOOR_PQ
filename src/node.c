@@ -957,14 +957,11 @@ int moor_consensus_deserialize(moor_consensus_t *cons,
             b64dec(cons->relays[current_relay].signature, 64,
                    line + 2, strlen(line + 2));
         }
-        /* Contact info: "c <contact_info>" (truncate to field size) */
+        /* Contact info: "c <contact_info>" */
         else if (line[0] == 'c' && line[1] == ' ' && current_relay >= 0 && !in_footer) {
-            char *dst = cons->relays[current_relay].contact_info;
-            size_t cap = sizeof(cons->relays[current_relay].contact_info);
-            memset(dst, 0, cap);
-            size_t src_len = strlen(line + 2);
-            if (src_len >= cap) src_len = cap - 1;
-            memcpy(dst, line + 2, src_len);
+            snprintf(cons->relays[current_relay].contact_info,
+                     sizeof(cons->relays[current_relay].contact_info),
+                     "%s", line + 2);
         }
         /* Bandwidth weights: "bandwidth-weights Wgg=X Wgd=X Wee=X Wed=X Wmg=X Wme=X Wmm=X Wmd=X" */
         else if (strncmp(line, "bandwidth-weights ", 18) == 0) {

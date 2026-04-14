@@ -24,6 +24,10 @@
 #include <arpa/inet.h>
 #endif
 
+#include <pthread.h>
+#include <fcntl.h>
+#include <poll.h>
+
 #define MAX_SOCKS5_CLIENTS 128
 #define MAX_CIRCUIT_CACHE  32
 #define MAX_HS_PENDING     8
@@ -54,6 +58,181 @@ typedef struct {
 } hs_pending_connect_t;
 
 static hs_pending_connect_t g_hs_pending[MAX_HS_PENDING];
+
+/* ---- Async HS client connect (thread + pipe pattern) ----
+ * moor_hs_client_connect_start() blocks ~8-30s (descriptor fetch +
+ * circuit builds + RENDEZVOUS_ESTABLISHED wait + INTRODUCE1).
+ * We push it to a worker thread and signal completion via pipe. */
+
+typedef struct {
+    char     address[256];
+    char     isolation_key[256];
+    uint8_t  identity_pk[32];
+    uint8_t  identity_sk[64];
+    char     da_address[64];
+    uint16_t da_port;
+    moor_consensus_t cons;            /* deep copy */
+} hs_connect_work_t;
+
+typedef struct {
+    char     address[256];
+    char     isolation_key[256];
+    int      result;                  /* 0=success, -1=failure */
+    moor_circuit_t *rp_circ;
+    uint8_t  hs_kem_pk[1184];
+    int      hs_kem_available;
+} hs_connect_result_t;
+
+#define HS_CONNECT_QUEUE 8
+static int g_hs_connect_pipe[2] = {-1, -1};
+static hs_connect_result_t *g_hs_connect_results[HS_CONNECT_QUEUE];
+static int g_hs_conn_rhead = 0, g_hs_conn_rtail = 0, g_hs_conn_rcount = 0;
+static pthread_mutex_t g_hs_connect_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Forward declarations */
+static void hs_rp_read_cb(int fd, int events, void *arg);
+static void extend_dispatch_cell(moor_connection_t *conn, moor_cell_t *cell);
+
+static void hs_connect_push_result(hs_connect_result_t *r) {
+    pthread_mutex_lock(&g_hs_connect_mutex);
+    if (g_hs_conn_rcount < HS_CONNECT_QUEUE) {
+        g_hs_connect_results[g_hs_conn_rtail] = r;
+        g_hs_conn_rtail = (g_hs_conn_rtail + 1) % HS_CONNECT_QUEUE;
+        g_hs_conn_rcount++;
+    } else {
+        if (r->rp_circ) {
+            moor_circuit_destroy(r->rp_circ);
+        }
+        free(r);
+        r = NULL;
+    }
+    pthread_mutex_unlock(&g_hs_connect_mutex);
+    if (r) {
+        uint8_t sig = 1;
+        ssize_t wr = write(g_hs_connect_pipe[1], &sig, 1);
+        (void)wr;
+    }
+}
+
+static hs_connect_result_t *hs_connect_pop_result(void) {
+    hs_connect_result_t *r = NULL;
+    pthread_mutex_lock(&g_hs_connect_mutex);
+    if (g_hs_conn_rcount > 0) {
+        r = g_hs_connect_results[g_hs_conn_rhead];
+        g_hs_conn_rhead = (g_hs_conn_rhead + 1) % HS_CONNECT_QUEUE;
+        g_hs_conn_rcount--;
+    }
+    pthread_mutex_unlock(&g_hs_connect_mutex);
+    return r;
+}
+
+/* Worker thread: runs the blocking moor_hs_client_connect_start() */
+static void *hs_connect_worker(void *arg) {
+    extern void moor_worker_isolate(void);
+    moor_worker_isolate();
+    hs_connect_work_t *w = (hs_connect_work_t *)arg;
+    hs_connect_result_t *r = calloc(1, sizeof(*r));
+    if (!r) { moor_consensus_cleanup(&w->cons); free(w); return NULL; }
+
+    snprintf(r->address, sizeof(r->address), "%s", w->address);
+    snprintf(r->isolation_key, sizeof(r->isolation_key), "%s", w->isolation_key);
+    r->result = -1;
+
+    moor_circuit_t *rp_circ = NULL;
+    uint8_t hs_kem_pk[1184];
+    int hs_kem_avail = 0;
+
+    if (moor_hs_client_connect_start(w->address, &rp_circ,
+                                      &w->cons,
+                                      w->da_address, w->da_port,
+                                      w->identity_pk, w->identity_sk,
+                                      hs_kem_pk, &hs_kem_avail) == 0) {
+        r->result = 0;
+        r->rp_circ = rp_circ;
+        r->hs_kem_available = hs_kem_avail;
+        if (hs_kem_avail)
+            memcpy(r->hs_kem_pk, hs_kem_pk, 1184);
+        LOG_INFO("HS async connect: success for %s", w->address);
+    } else {
+        LOG_WARN("HS async connect: failed for %s", w->address);
+    }
+
+    hs_connect_push_result(r);
+    moor_consensus_cleanup(&w->cons);
+    free(w);
+    return NULL;
+}
+
+/* Event loop callback: HS connect worker(s) finished */
+static void hs_connect_complete_cb(int fd, int events, void *arg) {
+    (void)events; (void)arg;
+    uint8_t drain[32];
+    ssize_t rd = read(fd, drain, sizeof(drain));
+    (void)rd;
+
+    hs_connect_result_t *r;
+    while ((r = hs_connect_pop_result()) != NULL) {
+        if (r->result == 0 && r->rp_circ) {
+            /* Install as pending HS connection — same as the old sync path */
+            int slot = -1;
+            for (int i = 0; i < MAX_HS_PENDING; i++) {
+                if (!g_hs_pending[i].active) { slot = i; break; }
+            }
+            if (slot < 0) {
+                LOG_ERROR("HS async: all pending slots full");
+                moor_circuit_destroy(r->rp_circ);
+                free(r);
+                continue;
+            }
+
+            g_hs_pending[slot].active = 1;
+            snprintf(g_hs_pending[slot].address,
+                     sizeof(g_hs_pending[slot].address), "%s", r->address);
+            snprintf(g_hs_pending[slot].isolation_key,
+                     sizeof(g_hs_pending[slot].isolation_key), "%s", r->isolation_key);
+            g_hs_pending[slot].rp_circ = r->rp_circ;
+            g_hs_pending[slot].rp_conn = r->rp_circ->conn;
+            g_hs_pending[slot].started = time(NULL);
+            g_hs_pending[slot].hs_kem_available = r->hs_kem_available;
+            if (r->hs_kem_available)
+                memcpy(g_hs_pending[slot].hs_kem_pk, r->hs_kem_pk, 1184);
+
+            /* Register RP connection for async RENDEZVOUS2 wait */
+            if (r->rp_circ->conn) {
+                r->rp_circ->conn->on_other_cell = extend_dispatch_cell;
+                moor_event_add(r->rp_circ->conn->fd, MOOR_EVENT_READ,
+                               hs_rp_read_cb, r->rp_circ->conn);
+            }
+            LOG_INFO("HS async: pending slot %d installed (waiting RV2)", slot);
+        } else {
+            /* Failed — notify any BUILDING clients for this address */
+            for (int i = 0; i < MAX_SOCKS5_CLIENTS; i++) {
+                moor_socks5_client_t *c = &g_socks5_clients[i];
+                if (c->client_fd >= 0 &&
+                    c->state == SOCKS5_STATE_BUILDING &&
+                    moor_is_moor_address(c->target_addr) &&
+                    strcmp(c->target_addr, r->address) == 0) {
+                    uint8_t fail[] = { 0x05, 0x04, 0x00, 0x01, 0,0,0,0, 0,0 };
+                    send(c->client_fd, (char *)fail, sizeof(fail), MSG_NOSIGNAL);
+                    moor_event_remove(c->client_fd);
+                    close(c->client_fd);
+                    c->client_fd = -1;
+                    c->state = SOCKS5_STATE_GREETING;
+                }
+            }
+        }
+        free(r);
+    }
+}
+
+static int hs_connect_pipe_init(void) {
+    if (pipe(g_hs_connect_pipe) != 0) return -1;
+    int flags = fcntl(g_hs_connect_pipe[0], F_GETFL, 0);
+    if (flags >= 0) fcntl(g_hs_connect_pipe[0], F_SETFL, flags | O_NONBLOCK);
+    moor_event_add(g_hs_connect_pipe[0], MOOR_EVENT_READ,
+                   hs_connect_complete_cb, NULL);
+    return 0;
+}
 
 moor_consensus_t *moor_socks5_get_consensus(void) {
     return &g_client_consensus;
@@ -1680,76 +1859,49 @@ int moor_socks5_handle_request(moor_socks5_client_t *client,
                 return 0;
             }
 
-            /* Start HS connect: build circuits + send INTRODUCE1.
-             *
-             * This is synchronous and blocks the event loop for ~8s.
-             * To prevent Firefox's concurrent connections from starving
-             * (which kills the shared guard connection with EPIPE), we
-             * use skip_guard_reuse=1 so the RP circuit gets its OWN
-             * connection to the guard, independent of the channel used
-             * by clearnet circuits.  The event loop is still blocked
-             * during the HS connect, but the clearnet guard connection
-             * isn't multiplexed with the HS traffic, so Firefox's
-             * connections survive. */
-            moor_circuit_t *rp_circ = NULL;
-            uint8_t hs_kem_pk_tmp[1184];
-            int hs_kem_avail = 0;
-            if (moor_hs_client_connect_start(client->target_addr, &rp_circ,
-                                              &g_client_consensus,
-                                              g_socks5_config.da_address,
-                                              g_socks5_config.da_port,
-                                              g_socks5_config.identity_pk,
-                                              g_socks5_config.identity_sk,
-                                              hs_kem_pk_tmp,
-                                              &hs_kem_avail) != 0) {
-                uint8_t fail[] = { 0x05, 0x04, 0x00, 0x01, 0,0,0,0, 0,0 };
-                send(client->client_fd, (char *)fail, sizeof(fail), MSG_NOSIGNAL);
-                return -1;
-            }
+            /* Async HS connect: worker thread runs moor_hs_client_connect_start
+             * with full isolation (moor_worker_isolate makes circuit_alloc and
+             * connection_alloc return heap-only objects invisible to the main
+             * thread's padding/timeout/reaper). Completion signals via pipe. */
+            {
+                /* Init pipe on first use */
+                if (g_hs_connect_pipe[0] < 0)
+                    hs_connect_pipe_init();
 
-            /* Store pending entry */
-            int slot = -1;
-            for (int i = 0; i < MAX_HS_PENDING; i++) {
-                if (!g_hs_pending[i].active) { slot = i; break; }
+                hs_connect_work_t *w = calloc(1, sizeof(*w));
+                if (!w) {
+                    uint8_t fail[] = { 0x05, 0x04, 0x00, 0x01, 0,0,0,0, 0,0 };
+                    send(client->client_fd, (char *)fail, sizeof(fail), MSG_NOSIGNAL);
+                    return -1;
+                }
+                snprintf(w->address, sizeof(w->address), "%s", client->target_addr);
+                snprintf(w->isolation_key, sizeof(w->isolation_key), "%s", client->isolation_key);
+                memcpy(w->identity_pk, g_socks5_config.identity_pk, 32);
+                memcpy(w->identity_sk, g_socks5_config.identity_sk, 64);
+                snprintf(w->da_address, sizeof(w->da_address), "%s", g_socks5_config.da_address);
+                w->da_port = g_socks5_config.da_port;
+                memset(&w->cons, 0, sizeof(w->cons));
+                if (moor_consensus_copy(&w->cons, &g_client_consensus) != 0) {
+                    moor_consensus_cleanup(&w->cons);
+                    free(w);
+                    uint8_t fail[] = { 0x05, 0x04, 0x00, 0x01, 0,0,0,0, 0,0 };
+                    send(client->client_fd, (char *)fail, sizeof(fail), MSG_NOSIGNAL);
+                    return -1;
+                }
+                pthread_t t;
+                if (pthread_create(&t, NULL, hs_connect_worker, w) == 0) {
+                    pthread_detach(t);
+                    LOG_INFO("HS: async connect launched for %s", client->target_addr);
+                } else {
+                    moor_consensus_cleanup(&w->cons);
+                    free(w);
+                    uint8_t fail[] = { 0x05, 0x04, 0x00, 0x01, 0,0,0,0, 0,0 };
+                    send(client->client_fd, (char *)fail, sizeof(fail), MSG_NOSIGNAL);
+                    return -1;
+                }
             }
-            if (slot < 0) {
-                /* All slots full -- fail */
-                LOG_ERROR("HS: too many pending connects");
-                moor_circuit_destroy(rp_circ);
-                uint8_t fail[] = { 0x05, 0x04, 0x00, 0x01, 0,0,0,0, 0,0 };
-                send(client->client_fd, (char *)fail, sizeof(fail), MSG_NOSIGNAL);
-                return -1;
-            }
-
-            g_hs_pending[slot].active = 1;
-            snprintf(g_hs_pending[slot].address,
-                     sizeof(g_hs_pending[slot].address),
-                     "%s", client->target_addr);
-            snprintf(g_hs_pending[slot].isolation_key,
-                     sizeof(g_hs_pending[slot].isolation_key),
-                     "%s", client->isolation_key);
-            g_hs_pending[slot].rp_circ = rp_circ;
-            g_hs_pending[slot].rp_conn = rp_circ->conn;
-            g_hs_pending[slot].started = time(NULL);
-            g_hs_pending[slot].hs_kem_available = hs_kem_avail;
-            if (hs_kem_avail)
-                memcpy(g_hs_pending[slot].hs_kem_pk, hs_kem_pk_tmp, 1184);
-
-            /* Register RP connection for async RENDEZVOUS2 wait */
-            if (!rp_circ->conn) {
-                LOG_ERROR("HS: RP circuit has no connection");
-                moor_circuit_destroy(rp_circ);
-                g_hs_pending[slot].active = 0;
-                uint8_t fail[] = { 0x05, 0x04, 0x00, 0x01, 0,0,0,0, 0,0 };
-                send(client->client_fd, (char *)fail, sizeof(fail), MSG_NOSIGNAL);
-                return -1;
-            }
-            rp_circ->conn->on_other_cell = extend_dispatch_cell;
-            moor_event_add(rp_circ->conn->fd, MOOR_EVENT_READ,
-                           hs_rp_read_cb, rp_circ->conn);
 
             client->state = SOCKS5_STATE_BUILDING;
-            LOG_INFO("HS: async connect started (waiting for RV2)");
             return 0;
         }
     } else {
