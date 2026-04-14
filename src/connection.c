@@ -1602,94 +1602,521 @@ int moor_tcp_connect_nonblocking(const char *address, uint16_t port) {
     return fd;
 }
 
-/* Async connect callback: handles TCP connect completion + handshake */
-static void async_connect_write_cb(int fd, int events, void *arg) {
-    moor_connection_t *conn = (moor_connection_t *)arg;
-    (void)events;
+/* ---- Async handshake state machine ---- */
 
-    if (conn->state == CONN_STATE_TCP_CONNECTING) {
-        /* Check if TCP connect completed */
-        int err = 0;
-        socklen_t len = sizeof(err);
-        getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&err, &len);
-        if (err != 0) {
-            LOG_ERROR("async connect failed: error %d", err);
-            moor_event_remove(fd);
-            close(fd);
-            conn->fd = -1;
-            conn->state = CONN_STATE_NONE;
-            /* -2 = instant reject (ECONNREFUSED, ENETUNREACH, EHOSTUNREACH)
-             * -1 = timeout or other failure
-             * Callers use this to decide whether to back off or retry immediately. */
-            int status = (err == ECONNREFUSED || err == ENETUNREACH ||
-                          err == EHOSTUNREACH) ? -2 : -1;
-            /* Save + detach hs_state before callback (same UAF guard as success path) */
-            moor_hs_state_t *saved_hs = conn->hs_state;
-            conn->hs_state = NULL;
-            if (saved_hs && saved_hs->on_complete)
-                saved_hs->on_complete(conn, status, saved_hs->on_complete_arg);
-            moor_crypto_wipe(saved_hs, sizeof(*saved_hs));
-            free(saved_hs);
+/* Forward declarations */
+static void hs_async_cb(int fd, int events, void *arg);
+static void handle_tcp_connect(moor_connection_t *conn);
+static void handle_hs_sending(moor_connection_t *conn);
+static void handle_hs_receiving(moor_connection_t *conn);
+static void handle_pq_sending(moor_connection_t *conn);
+static void handle_pq_receiving(moor_connection_t *conn);
+
+/* Handshake timeout callback */
+static void hs_timeout_cb(void *arg) {
+    moor_connection_t *conn = (moor_connection_t *)arg;
+    if (!conn->hs_state) return;
+    if (conn->state == CONN_STATE_OPEN) return;
+    LOG_ERROR("async handshake timeout fd=%d state=%d", conn->fd, conn->state);
+    /* Fall through to hs_async_fail */
+    moor_hs_state_t *hs = conn->hs_state;
+    conn->hs_state = NULL;
+    moor_event_remove(conn->fd);
+    close(conn->fd);
+    conn->fd = -1;
+    conn->state = CONN_STATE_NONE;
+    if (hs->hs_timer_id >= 0) moor_event_remove_timer(hs->hs_timer_id);
+    void (*cb)(moor_connection_t *, int, void *) = hs->on_complete;
+    void *cb_arg = hs->on_complete_arg;
+    moor_crypto_wipe(hs, sizeof(*hs));
+    free(hs);
+    if (cb) cb(conn, -1, cb_arg);
+}
+
+/* Handshake failed: wipe + close + on_complete(-1) */
+static void hs_async_fail(moor_connection_t *conn) {
+    moor_hs_state_t *hs = conn->hs_state;
+    conn->hs_state = NULL;
+    moor_event_remove(conn->fd);
+    close(conn->fd);
+    conn->fd = -1;
+    conn->state = CONN_STATE_NONE;
+    if (hs) {
+        if (hs->hs_timer_id >= 0) moor_event_remove_timer(hs->hs_timer_id);
+        void (*cb)(moor_connection_t *, int, void *) = hs->on_complete;
+        void *cb_arg = hs->on_complete_arg;
+        moor_crypto_wipe(hs, sizeof(*hs));
+        free(hs);
+        if (cb) cb(conn, -1, cb_arg);
+    }
+}
+
+/* Handshake complete: finalize connection + on_complete(0) */
+static void hs_async_complete(moor_connection_t *conn) {
+    moor_hs_state_t *hs = conn->hs_state;
+    conn->hs_state = NULL;
+
+    if (hs->hs_timer_id >= 0) moor_event_remove_timer(hs->hs_timer_id);
+
+    /* Remove handshake event registration — caller will re-register */
+    moor_event_remove(conn->fd);
+
+    /* Insert into connection hash table */
+    conn_pool_lock();
+    conn_ht_insert(conn);
+    conn_pool_unlock();
+
+    /* TCP keepalive */
+    int keepalive = 1;
+    setsockopt(conn->fd, SOL_SOCKET, SO_KEEPALIVE,
+               (const char *)&keepalive, sizeof(keepalive));
+
+    /* Save callback, wipe hs_state, then call (UAF guard) */
+    void (*cb)(moor_connection_t *, int, void *) = hs->on_complete;
+    void *cb_arg = hs->on_complete_arg;
+    moor_crypto_wipe(hs, sizeof(*hs));
+    free(hs);
+    if (cb) cb(conn, 0, cb_arg);
+}
+
+/* Encrypt a cell into wire frame without CONN_STATE_OPEN check.
+ * Used during PQ handshake phase where state is PQ_SENDING. */
+static int hs_encrypt_cell_raw(moor_connection_t *conn,
+                                const moor_cell_t *cell,
+                                uint8_t *wire, size_t *wire_len) {
+    if (conn->send_nonce == UINT64_MAX) return -1;
+    uint8_t plain[MOOR_CELL_SIZE];
+    moor_cell_pack(plain, cell);
+    size_t ct_len;
+    if (moor_crypto_aead_encrypt(wire + 2, &ct_len, plain, MOOR_CELL_SIZE,
+                                  NULL, 0, conn->send_key, conn->send_nonce) != 0) {
+        moor_crypto_wipe(plain, sizeof(plain));
+        return -1;
+    }
+    moor_crypto_wipe(plain, sizeof(plain));
+    conn->send_nonce++;
+    wire[0] = (uint8_t)(ct_len >> 8);
+    wire[1] = (uint8_t)(ct_len);
+    *wire_len = 2 + ct_len;
+    return 0;
+}
+
+/* Try to decrypt one cell from conn->recv_buf without state check.
+ * Returns 1 if cell extracted, 0 if not enough data, -1 on error. */
+static int hs_decrypt_cell_raw(moor_connection_t *conn, moor_cell_t *cell) {
+    if (conn->recv_len < 2) return 0;
+    uint16_t ct_len = ((uint16_t)conn->recv_buf[0] << 8) | conn->recv_buf[1];
+    if (ct_len < MOOR_MAC_LEN || ct_len > MOOR_CELL_SIZE + MOOR_MAC_LEN)
+        return -1;
+    if (conn->recv_len < (size_t)(2 + ct_len)) return 0;
+
+    uint8_t plain[MOOR_CELL_SIZE];
+    size_t pt_len;
+    if (moor_crypto_aead_decrypt(plain, &pt_len, conn->recv_buf + 2, ct_len,
+                                  NULL, 0, conn->recv_key, conn->recv_nonce) != 0) {
+        moor_crypto_wipe(plain, sizeof(plain));
+        return -1;
+    }
+    conn->recv_nonce++;
+    moor_cell_unpack(cell, plain);
+    moor_crypto_wipe(plain, sizeof(plain));
+
+    /* Shift recv_buf */
+    size_t consumed = 2 + ct_len;
+    if (consumed < conn->recv_len)
+        memmove(conn->recv_buf, conn->recv_buf + consumed, conn->recv_len - consumed);
+    conn->recv_len -= consumed;
+    return 1;
+}
+
+/* ---- Async handshake state handlers ---- */
+
+/* HS_SENDING: partial non-blocking send of Noise msg1 (80 raw bytes) */
+static void handle_hs_sending(moor_connection_t *conn) {
+    moor_hs_state_t *hs = conn->hs_state;
+    ssize_t n = conn_send(conn, hs->msg_buf + hs->msg_offset,
+                          hs->msg_expected - hs->msg_offset);
+    if (n > 0) {
+        hs->msg_offset += (size_t)n;
+        if (hs->msg_offset == hs->msg_expected) {
+            /* msg1 fully sent — switch to receiving msg2 */
+            hs->msg_offset = 0;
+            hs->msg_expected = 48; /* Noise msg2: e_pk(32) + encrypted_empty(16) */
+            conn->state = CONN_STATE_HS_RECEIVING;
+            moor_event_modify(conn->fd, MOOR_EVENT_READ);
+        }
+        return;
+    }
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        return; /* wait for next WRITE event */
+    hs_async_fail(conn);
+}
+
+/* HS_RECEIVING: partial non-blocking recv of Noise msg2 (48 raw bytes),
+ * then process msg2, split keys, and start PQ phase */
+static void handle_hs_receiving(moor_connection_t *conn) {
+    moor_hs_state_t *hs = conn->hs_state;
+
+    ssize_t n = conn_recv(conn, hs->msg_buf + hs->msg_offset,
+                          hs->msg_expected - hs->msg_offset);
+    if (n > 0) {
+        hs->msg_offset += (size_t)n;
+    } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        return;
+    } else {
+        hs_async_fail(conn);
+        return;
+    }
+
+    if (hs->msg_offset < hs->msg_expected)
+        return; /* need more data */
+
+    /* --- Process msg2: e_pk(32) + encrypted_empty(16) --- */
+    uint8_t re_pk[32];
+    memcpy(re_pk, hs->msg_buf, 32);
+    noise_mix_hash(hs->h, re_pk, 32);
+
+    /* ee: DH(e_i, e_r) */
+    uint8_t dh_ee[32];
+    if (moor_crypto_dh(dh_ee, hs->e_sk, re_pk) != 0) {
+        moor_crypto_wipe(dh_ee, 32);
+        hs_async_fail(conn);
+        return;
+    }
+    noise_mix_key(hs->ck, hs->k, dh_ee, 32);
+    moor_crypto_wipe(dh_ee, 32);
+
+    /* se: DH(is_sk, re_pk) */
+    uint8_t dh_se[32];
+    if (moor_crypto_dh(dh_se, hs->our_curve_sk, re_pk) != 0) {
+        moor_crypto_wipe(dh_se, 32);
+        hs_async_fail(conn);
+        return;
+    }
+    noise_mix_key(hs->ck, hs->k, dh_se, 32);
+    moor_crypto_wipe(dh_se, 32);
+
+    /* Decrypt empty payload (MAC verification) */
+    uint8_t empty_pt[1];
+    size_t empty_len;
+    if (noise_decrypt_and_hash(empty_pt, &empty_len,
+                                hs->msg_buf + 32, 16, hs->h, hs->k) != 0) {
+        LOG_ERROR("async Noise_IK: msg2 auth failed");
+        hs_async_fail(conn);
+        return;
+    }
+
+    /* Split: derive send/recv keys */
+    uint8_t k1[32], k2[32];
+    moor_crypto_hkdf(k1, k2, hs->ck, (const uint8_t *)"", 0);
+    memcpy(conn->send_key, k1, 32);
+    memcpy(conn->recv_key, k2, 32);
+    conn->send_nonce = 0;
+    conn->recv_nonce = 0;
+    conn->is_initiator = 1;
+    memcpy(conn->our_kx_pk, hs->our_curve_pk, 32);
+    memcpy(conn->our_kx_sk, hs->our_curve_sk, 32);
+    moor_crypto_wipe(k1, 32);
+    moor_crypto_wipe(k2, 32);
+
+    /* Wipe Noise intermediates (keep hs_state for PQ phase) */
+    moor_crypto_wipe(hs->e_sk, 32);
+    moor_crypto_wipe(hs->our_curve_sk, 32);
+    moor_crypto_wipe(hs->h, 32);
+    moor_crypto_wipe(hs->ck, 32);
+    moor_crypto_wipe(hs->k, 32);
+
+    LOG_DEBUG("async Noise_IK complete fd=%d, starting PQ KEM", conn->fd);
+
+    /* --- Begin PQ phase: generate Kyber keypair --- */
+    conn->pq_handshake_done = 0;
+
+    /* Store PK in msg_buf, SK in kem_sk */
+    if (moor_kem_keygen(hs->msg_buf, hs->kem_sk) != 0) {
+        hs_async_fail(conn);
+        return;
+    }
+
+    /* Build and encrypt first PQ cell */
+    hs->phase = 0;
+    {
+        moor_cell_t kcell;
+        memset(&kcell, 0, sizeof(kcell));
+        kcell.command = CELL_KEM_CT;
+        size_t chunk = MOOR_KEM_PK_LEN - (size_t)hs->phase * MOOR_CELL_PAYLOAD;
+        if (chunk > MOOR_CELL_PAYLOAD) chunk = MOOR_CELL_PAYLOAD;
+        memcpy(kcell.payload, hs->msg_buf + (size_t)hs->phase * MOOR_CELL_PAYLOAD, chunk);
+        size_t wire_len;
+        if (hs_encrypt_cell_raw(conn, &kcell, hs->wire_frame, &wire_len) != 0) {
+            hs_async_fail(conn);
+            return;
+        }
+        hs->msg_offset = 0;
+        hs->msg_expected = wire_len;
+    }
+    conn->state = CONN_STATE_PQ_SENDING;
+    moor_event_modify(conn->fd, MOOR_EVENT_WRITE);
+}
+
+/* PQ_SENDING: send Kyber PK as 3 encrypted cells (phase 0-2) */
+static void handle_pq_sending(moor_connection_t *conn) {
+    moor_hs_state_t *hs = conn->hs_state;
+
+    /* Try to send current wire frame */
+    ssize_t n = conn_send(conn, hs->wire_frame + hs->msg_offset,
+                          hs->msg_expected - hs->msg_offset);
+    if (n > 0) {
+        hs->msg_offset += (size_t)n;
+    } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        return;
+    } else {
+        hs_async_fail(conn);
+        return;
+    }
+
+    if (hs->msg_offset < hs->msg_expected)
+        return; /* partial send, wait for next WRITE */
+
+    /* Current cell fully sent */
+    hs->phase++;
+
+    /* How many cells for Kyber PK? ceil(1184/509) = 3 */
+    int total_cells = ((int)MOOR_KEM_PK_LEN + MOOR_CELL_PAYLOAD - 1) / MOOR_CELL_PAYLOAD;
+
+    if (hs->phase < total_cells) {
+        /* Build next cell */
+        moor_cell_t kcell;
+        memset(&kcell, 0, sizeof(kcell));
+        kcell.command = CELL_KEM_CT;
+        size_t pk_off = (size_t)hs->phase * MOOR_CELL_PAYLOAD;
+        size_t chunk = MOOR_KEM_PK_LEN - pk_off;
+        if (chunk > MOOR_CELL_PAYLOAD) chunk = MOOR_CELL_PAYLOAD;
+        memcpy(kcell.payload, hs->msg_buf + pk_off, chunk);
+        size_t wire_len;
+        if (hs_encrypt_cell_raw(conn, &kcell, hs->wire_frame, &wire_len) != 0) {
+            hs_async_fail(conn);
+            return;
+        }
+        hs->msg_offset = 0;
+        hs->msg_expected = wire_len;
+        return; /* try sending immediately on next WRITE event */
+    }
+
+    /* All PQ cells sent — switch to receiving CT */
+    hs->phase = 0;
+    hs->msg_offset = 0; /* now tracks reassembled KEM CT bytes in msg_buf */
+    conn->state = CONN_STATE_PQ_RECEIVING;
+    moor_event_modify(conn->fd, MOOR_EVENT_READ);
+}
+
+/* PQ_RECEIVING: receive Kyber CT as encrypted cells, decap, mix keys */
+static void handle_pq_receiving(moor_connection_t *conn) {
+    moor_hs_state_t *hs = conn->hs_state;
+
+    /* Read data from socket into conn->recv_buf */
+    if (conn->recv_len < sizeof(conn->recv_buf)) {
+        ssize_t n = conn_recv(conn, conn->recv_buf + conn->recv_len,
+                              sizeof(conn->recv_buf) - conn->recv_len);
+        if (n > 0) {
+            conn->recv_len += (size_t)n;
+        } else if (n == 0) {
+            hs_async_fail(conn);
+            return;
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            hs_async_fail(conn);
+            return;
+        }
+    }
+
+    /* Try to extract cells */
+    while (hs->msg_offset < MOOR_KEM_CT_LEN) {
+        moor_cell_t kcell;
+        int rc = hs_decrypt_cell_raw(conn, &kcell);
+        if (rc < 0) {
+            LOG_ERROR("async PQ: cell decrypt failed fd=%d", conn->fd);
+            hs_async_fail(conn);
+            return;
+        }
+        if (rc == 0)
+            return; /* need more data, wait for next READ */
+
+        if (kcell.command != CELL_KEM_CT) {
+            LOG_ERROR("async PQ: unexpected cell command %d", kcell.command);
+            hs_async_fail(conn);
             return;
         }
 
-        /* TCP connected -- start sync handshake on this fd */
-        moor_event_remove(fd);
+        /* Copy payload into msg_buf for CT reassembly */
+        size_t space = MOOR_KEM_CT_LEN - hs->msg_offset;
+        size_t chunk = MOOR_CELL_PAYLOAD;
+        if (chunk > space) chunk = space;
+        memcpy(hs->msg_buf + hs->msg_offset, kcell.payload, chunk);
+        hs->msg_offset += chunk;
+    }
 
-        /* Set socket timeout for the handshake */
-        moor_set_socket_timeout(fd, MOOR_HANDSHAKE_TIMEOUT);
+    /* All KEM CT received — decapsulate */
+    uint8_t kem_shared[MOOR_KEM_SS_LEN];
+    if (moor_kem_decapsulate(kem_shared, hs->msg_buf, hs->kem_sk) != 0) {
+        LOG_ERROR("async PQ: KEM decapsulate failed");
+        moor_crypto_wipe(kem_shared, sizeof(kem_shared));
+        hs_async_fail(conn);
+        return;
+    }
 
-        /* Clear non-blocking for the sync handshake phase */
-#ifdef _WIN32
-        u_long mode = 0;
-        ioctlsocket(fd, FIONBIO, &mode);
-#else
-        int flags = fcntl(fd, F_GETFL, 0);
-        fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
-#endif
+    /* Mix KEM shared secret into existing keys */
+    uint8_t new_send[32], new_recv[32];
+    moor_crypto_hkdf(new_send, new_recv, conn->send_key, kem_shared, MOOR_KEM_SS_LEN);
+    uint8_t new_recv2[32], dummy[32];
+    moor_crypto_hkdf(new_recv2, dummy, conn->recv_key, kem_shared, MOOR_KEM_SS_LEN);
 
-        conn->state = CONN_STATE_HANDSHAKING;
+    memcpy(conn->send_key, new_send, 32);
+    memcpy(conn->recv_key, new_recv2, 32);
 
-        int ret = link_handshake_client_pq(conn,
-                        conn->hs_state->our_id_pk,
-                        conn->hs_state->our_id_sk);
+    moor_crypto_wipe(hs->kem_sk, sizeof(hs->kem_sk));
+    moor_crypto_wipe(kem_shared, sizeof(kem_shared));
+    moor_crypto_wipe(new_send, 32);
+    moor_crypto_wipe(new_recv, 32);
+    moor_crypto_wipe(new_recv2, 32);
+    moor_crypto_wipe(dummy, 32);
 
-        if (ret != 0) {
-            close(fd);
-            conn->fd = -1;
-            conn->state = CONN_STATE_NONE;
-            if (conn->hs_state && conn->hs_state->on_complete)
-                conn->hs_state->on_complete(conn, -1, conn->hs_state->on_complete_arg);
-        } else {
-            conn->state = CONN_STATE_OPEN;
-            conn_pool_lock();
-            conn_ht_insert(conn);
-            conn_pool_unlock();
+    conn->pq_handshake_done = 1;
+    conn->state = CONN_STATE_OPEN;
+    LOG_DEBUG("async PQ hybrid Noise_IK complete fd=%d", conn->fd);
 
-            /* Clear handshake timeout + restore non-blocking for event loop */
-            moor_set_socket_timeout(fd, 0);
-            moor_set_nonblocking(fd);
+    hs_async_complete(conn);
+}
 
-            /* Enable TCP keepalive */
-            int keepalive = 1;
-            setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE,
-                       (const char *)&keepalive, sizeof(keepalive));
+/* TCP connect completed: build Noise msg1 (all crypto), start sending */
+static void handle_tcp_connect(moor_connection_t *conn) {
+    moor_hs_state_t *hs = conn->hs_state;
 
-            /* Save + detach hs_state BEFORE calling on_complete.
-             * The callback may free the connection (poison with 0xDE),
-             * making conn->hs_state a garbage pointer that passes
-             * NULL checks. By clearing it first, we own the cleanup. */
-            moor_hs_state_t *saved_hs = conn->hs_state;
-            conn->hs_state = NULL;
+    /* Check TCP connect result */
+    int err = 0;
+    socklen_t len = sizeof(err);
+    getsockopt(conn->fd, SOL_SOCKET, SO_ERROR, (char *)&err, &len);
+    if (err != 0) {
+        LOG_ERROR("async connect failed: error %d", err);
+        int status = (err == ECONNREFUSED || err == ENETUNREACH ||
+                      err == EHOSTUNREACH) ? -2 : -1;
+        moor_hs_state_t *saved = conn->hs_state;
+        conn->hs_state = NULL;
+        moor_event_remove(conn->fd);
+        close(conn->fd);
+        conn->fd = -1;
+        conn->state = CONN_STATE_NONE;
+        if (saved->hs_timer_id >= 0) moor_event_remove_timer(saved->hs_timer_id);
+        void (*cb)(moor_connection_t *, int, void *) = saved->on_complete;
+        void *cb_arg = saved->on_complete_arg;
+        moor_crypto_wipe(saved, sizeof(*saved));
+        free(saved);
+        if (cb) cb(conn, status, cb_arg);
+        return;
+    }
 
-            if (saved_hs && saved_hs->on_complete)
-                saved_hs->on_complete(conn, 0, saved_hs->on_complete_arg);
+    /* TCP connected — start handshake timer */
+    hs->hs_timer_id = moor_event_add_timer(MOOR_HANDSHAKE_TIMEOUT * 1000,
+                                             hs_timeout_cb, conn);
 
-            moor_crypto_wipe(saved_hs, sizeof(*saved_hs));
-            free(saved_hs);
-        }
+    /* Convert Ed25519 identities to Curve25519 */
+    if (moor_crypto_ed25519_to_curve25519_pk(hs->our_curve_pk, hs->our_id_pk) != 0 ||
+        moor_crypto_ed25519_to_curve25519_sk(hs->our_curve_sk, hs->our_id_sk) != 0) {
+        LOG_ERROR("async Noise_IK: failed to convert identity keys");
+        hs_async_fail(conn);
+        return;
+    }
+
+    /* Peer identity → Curve25519 */
+    uint8_t zero_id[32] = {0};
+    if (sodium_memcmp(conn->peer_identity, zero_id, 32) == 0) {
+        LOG_ERROR("async Noise_IK: peer identity unknown");
+        hs_async_fail(conn);
+        return;
+    }
+    if (moor_crypto_ed25519_to_curve25519_pk(hs->peer_curve_pk, conn->peer_identity) != 0) {
+        LOG_ERROR("async Noise_IK: failed to convert peer identity");
+        hs_async_fail(conn);
+        return;
+    }
+
+    /* Initialize Noise state */
+    noise_init(hs->h, hs->ck);
+    noise_mix_hash(hs->h, hs->peer_curve_pk, 32);
+
+    /* Generate ephemeral keypair */
+    moor_crypto_box_keygen(hs->e_pk, hs->e_sk);
+
+    /* Build msg1: -> e, es, s, ss */
+    noise_mix_hash(hs->h, hs->e_pk, 32);
+
+    /* es: DH(e_i, rs) */
+    uint8_t dh_es[32];
+    if (moor_crypto_dh(dh_es, hs->e_sk, hs->peer_curve_pk) != 0) {
+        moor_crypto_wipe(dh_es, 32);
+        hs_async_fail(conn);
+        return;
+    }
+    noise_mix_key(hs->ck, hs->k, dh_es, 32);
+    moor_crypto_wipe(dh_es, 32);
+
+    /* s: encrypt our static pk */
+    uint8_t encrypted_s[48];
+    size_t enc_s_len;
+    if (noise_encrypt_and_hash(encrypted_s, &enc_s_len,
+                                hs->our_curve_pk, 32, hs->h, hs->k) != 0) {
+        hs_async_fail(conn);
+        return;
+    }
+
+    /* ss: DH(is, rs) */
+    uint8_t dh_ss[32];
+    if (moor_crypto_dh(dh_ss, hs->our_curve_sk, hs->peer_curve_pk) != 0) {
+        moor_crypto_wipe(dh_ss, 32);
+        hs_async_fail(conn);
+        return;
+    }
+    noise_mix_key(hs->ck, hs->k, dh_ss, 32);
+    moor_crypto_wipe(dh_ss, 32);
+
+    /* Pack msg1: e_pk(32) + encrypted_s(48) = 80 bytes */
+    memcpy(hs->msg_buf, hs->e_pk, 32);
+    memcpy(hs->msg_buf + 32, encrypted_s, 48);
+    hs->msg_expected = 80;
+    hs->msg_offset = 0;
+
+    conn->state = CONN_STATE_HS_SENDING;
+    /* Socket is already registered for WRITE — try sending immediately */
+    handle_hs_sending(conn);
+}
+
+/* Master dispatch for async handshake state machine */
+static void hs_async_cb(int fd, int events, void *arg) {
+    moor_connection_t *conn = (moor_connection_t *)arg;
+    (void)fd;
+    (void)events;
+
+    switch (conn->state) {
+    case CONN_STATE_TCP_CONNECTING:
+        handle_tcp_connect(conn);
+        break;
+    case CONN_STATE_HS_SENDING:
+        handle_hs_sending(conn);
+        break;
+    case CONN_STATE_HS_RECEIVING:
+        handle_hs_receiving(conn);
+        break;
+    case CONN_STATE_PQ_SENDING:
+        handle_pq_sending(conn);
+        break;
+    case CONN_STATE_PQ_RECEIVING:
+        handle_pq_receiving(conn);
+        break;
+    default:
+        LOG_ERROR("hs_async_cb: unexpected state %d fd=%d", conn->state, conn->fd);
+        break;
     }
 }
+
+/* (async_connect_write_cb removed — replaced by hs_async_cb state machine above) */
 
 int moor_connection_connect_async(moor_connection_t *conn,
                                    const char *address, uint16_t port,
@@ -1726,10 +2153,11 @@ int moor_connection_connect_async(moor_connection_t *conn,
     hs->is_initiator = 1;
     hs->on_complete = on_complete;
     hs->on_complete_arg = arg;
+    hs->hs_timer_id = -1;
     conn->hs_state = hs;
 
-    /* Register for write-readiness (connect completion) */
-    moor_event_add(fd, MOOR_EVENT_WRITE, async_connect_write_cb, conn);
+    /* Register for write-readiness (connect completion) — async state machine */
+    moor_event_add(fd, MOOR_EVENT_WRITE, hs_async_cb, conn);
 
     return 0;
 }

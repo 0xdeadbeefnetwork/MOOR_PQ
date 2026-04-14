@@ -24,14 +24,18 @@ typedef struct {
     uint8_t  e_pk[32], e_sk[32];            /* our ephemeral keypair */
     uint8_t  peer_curve_pk[32];             /* peer's Curve25519 static */
     uint8_t  our_curve_pk[32], our_curve_sk[32]; /* our Curve25519 */
-    uint8_t  msg_buf[1184];                 /* send/recv buffer */
-    size_t   msg_expected, msg_offset;      /* progress tracking */
+    uint8_t  msg_buf[1184];                 /* send/recv buffer (Kyber PK, then CT reassembly) */
+    size_t   msg_expected, msg_offset;      /* progress tracking for partial I/O */
     uint8_t  our_id_pk[32], our_id_sk[64];  /* our identity keys */
     int      peer_known;                    /* 1 if peer identity pre-known */
     int      is_initiator;
-    int      phase;                         /* sub-phase within state */
+    int      phase;                         /* sub-phase within state (PQ cell index 0-2) */
     void     (*on_complete)(moor_connection_t *, int, void *);
     void     *on_complete_arg;
+    /* Async PQ handshake state */
+    uint8_t  kem_sk[2400];                  /* MOOR_KEM_SK_LEN: persists between PQ send/recv */
+    uint8_t  wire_frame[532];               /* MOOR_CELL_WIRE_SIZE: current PQ cell being sent */
+    int      hs_timer_id;                   /* handshake timeout timer, or -1 */
 } moor_hs_state_t;
 
 struct moor_connection {
