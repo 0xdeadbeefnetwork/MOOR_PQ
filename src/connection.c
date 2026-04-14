@@ -170,6 +170,15 @@ void moor_connection_free(moor_connection_t *conn) {
     int is_heap = (conn < &g_conn_pool[0] ||
                    conn >= &g_conn_pool[MOOR_MAX_CONNECTIONS]);
     if (is_heap) {
+        /* NULL out all circuit/channel/socks references BEFORE free().
+         * Pool connections survive after free (poisoned but valid memory).
+         * Heap connections become genuinely dangling after free(), so any
+         * circuit still referencing this conn would SIGSEGV on access. */
+        moor_circuit_nullify_conn(conn);
+        moor_channel_nullify_conn(conn);
+        moor_socks5_nullify_conn(conn);
+        moor_hs_nullify_conn(conn);
+        moor_hs_event_nullify_conn(conn);
         if (conn->transport && conn->transport_state) {
             conn->transport->transport_free(conn->transport_state);
             conn->transport_state = NULL;
