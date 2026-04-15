@@ -370,28 +370,8 @@ if [[ -f "$AWS_KEY" ]]; then
             for attempt in 1 2 3; do
                 if scp -i "$AWS_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -q \
                     "$AWS_TARBALL" ubuntu@${ip}:/tmp/moor-src.tar.gz 2>/dev/null && \
-                   $AWS_SSH ubuntu@${ip} bash -s <<'AWSEOF' 2>/dev/null; then
-set -e
-cd /opt/moor
-sudo tar xzf /tmp/moor-src.tar.gz
-sudo make clean >/dev/null 2>&1 || true
-sudo make -j$(nproc) 2>&1 | tail -1
-sudo install -m 755 moor /usr/local/bin/moor
-sudo mkdir -p /var/lib/moor/keys
-sudo chmod 755 /var/lib/moor && sudo chmod 700 /var/lib/moor/keys
-# Hard kill + restart — systemctl restart alone sometimes leaves old process
-sudo systemctl stop moor 2>/dev/null || true
-sudo pkill -9 -x moor 2>/dev/null || true
-sleep 1
-sudo systemctl start moor
-sleep 3
-# Verify: service active AND process started recently (not stale)
-systemctl is-active moor >/dev/null 2>&1
-MOOR_PID=$(pgrep -x moor | head -1)
-if [ -z "$MOOR_PID" ]; then exit 1; fi
-PROC_AGE=$(( $(date +%s) - $(stat -c %Y /proc/$MOOR_PID 2>/dev/null || echo 0) ))
-if [ "$PROC_AGE" -gt 30 ]; then exit 1; fi
-AWSEOF
+                   $AWS_SSH ubuntu@${ip} \
+                    'set -e; cd /opt/moor && sudo tar xzf /tmp/moor-src.tar.gz && sudo make clean >/dev/null 2>&1; sudo make -j$(nproc) 2>&1 | tail -1 && sudo install -m 755 moor /usr/local/bin/moor && sudo mkdir -p /var/lib/moor/keys && sudo chmod 755 /var/lib/moor && sudo chmod 700 /var/lib/moor/keys && sudo systemctl stop moor 2>/dev/null; sudo pkill -9 -x moor 2>/dev/null; sleep 1; sudo systemctl start moor && sleep 3 && systemctl is-active moor >/dev/null 2>&1 && PID=$(pgrep -x moor | head -1) && [ -n "$PID" ] && AGE=$(( $(date +%s) - $(stat -c %Y /proc/$PID 2>/dev/null || echo 0) )) && [ "$AGE" -lt 30 ]' 2>/dev/null; then
                     echo "$ip"
                     return 0
                 fi
@@ -436,7 +416,8 @@ AWSEOF
             echo -e "${YELLOW}==> Retrying failed AWS nodes sequentially...${NC}"
             for ip in $AWS_FAIL_LIST; do
                 info "retrying $ip..."
-                if aws_deploy_node "$ip" | grep -qv FAIL; then
+                retry_out=$(aws_deploy_node "$ip")
+                if echo "$retry_out" | grep -qv FAIL; then
                     ok "$ip (retry succeeded)"
                     AWS_OK=$((AWS_OK + 1))
                 else
