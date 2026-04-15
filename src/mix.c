@@ -31,6 +31,8 @@ void moor_mix_init(uint64_t lambda_ms) {
     mix_lock_init();
     memset(&g_mix_pool, 0, sizeof(g_mix_pool));
     g_mix_pool.lambda_ms = lambda_ms;
+    if (lambda_ms > 0)
+        LOG_WARN("Poisson mixing enabled (lambda=%llu ms)", (unsigned long long)lambda_ms);
 }
 
 void moor_mix_cleanup(void) {
@@ -105,6 +107,15 @@ int moor_mix_enqueue(struct moor_connection *conn,
 
             e->active = 1;
             g_mix_pool.count++;
+            static uint64_t s_enq_total = 0;
+            static uint64_t s_enq_log_ms = 0;
+            s_enq_total++;
+            if (moor_time_ms() - s_enq_log_ms >= 10000) {
+                LOG_DEBUG("mix pool: enqueued cell (delay=%llums, pool=%d, total=%llu)",
+                         (unsigned long long)(e->fire_time_ms - moor_time_ms()),
+                         g_mix_pool.count, (unsigned long long)s_enq_total);
+                s_enq_log_ms = moor_time_ms();
+            }
             mix_unlock();
             return 0;
         }
@@ -163,6 +174,8 @@ int moor_mix_enqueue(struct moor_connection *conn,
 int moor_mix_drain(void) {
     mix_lock();
     if (g_mix_pool.count == 0) { mix_unlock(); return 0; }
+    static uint64_t s_total_mixed = 0;
+    static uint64_t s_last_log_ms = 0;
     uint64_t now = moor_time_ms();
     int sent = 0;
 
@@ -204,6 +217,15 @@ int moor_mix_drain(void) {
         if (g_mix_pool.count > 0) g_mix_pool.count--;
     }
 
+    if (sent > 0) {
+        s_total_mixed += (uint64_t)sent;
+        if (now - s_last_log_ms >= 10000) { /* Log every 10s */
+            LOG_DEBUG("mix pool: drained %d cells (%llu total, %d queued, lambda=%llums)",
+                     sent, (unsigned long long)s_total_mixed, g_mix_pool.count,
+                     (unsigned long long)g_mix_pool.lambda_ms);
+            s_last_log_ms = now;
+        }
+    }
     mix_unlock();
     return sent;
 }

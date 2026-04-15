@@ -1907,11 +1907,8 @@ static int run_relay(void) {
 
     /* Initialize Poisson mixing pool (relay only) */
     moor_mix_init(g_config.mix_delay);
-    if (g_config.mix_delay > 0) {
+    if (g_config.mix_delay > 0)
         moor_event_add_timer(1, mix_drain_timer_cb, NULL);
-        LOG_INFO("Poisson mixing enabled (lambda=%llu ms)",
-                 (unsigned long long)g_config.mix_delay);
-    }
 
     /* WTF-PAD: resolve padding machine (default: "generic" — mandatory baseline).
      * Per-circuit randomized machines are applied at lazy-init in wfpad_tick_all(). */
