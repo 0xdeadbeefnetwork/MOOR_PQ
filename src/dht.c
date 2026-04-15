@@ -1146,6 +1146,15 @@ static int dht_recv_cell(moor_connection_t *conn, moor_cell_t *cell,
  * happens at the HS/client layer, these are convenience wrappers)
  * ================================================================ */
 
+/* Forward declaration — defined below after helpers */
+static int dht_connect_relay(const moor_node_descriptor_t *relay,
+                               moor_connection_t **out_conn,
+                               moor_circuit_t **out_circ,
+                               uint8_t tmp_sk[64],
+                               const moor_consensus_t *consensus);
+static void dht_cleanup_relay(moor_connection_t *conn, moor_circuit_t *circ,
+                                uint8_t tmp_sk[64]);
+
 int moor_dht_publish(const uint8_t address_hash[32],
                       const uint8_t *data, uint16_t data_len,
                       const moor_consensus_t *consensus,
@@ -1177,41 +1186,12 @@ int moor_dht_publish(const uint8_t address_hash[32],
         LOG_INFO("DHT publish: sending to relay %u (%s:%u)",
                  idx, relay->address, relay->or_port);
 
-        /* Build a 1-hop circuit to the target relay and send RELAY_DHT_STORE.
-         * In a full implementation this would be a 3-hop circuit via
-         * moor_hs_build_circuit_to_rp. For now, we do a simple direct
-         * connection + CKE handshake. */
-        moor_connection_t *conn = moor_connection_alloc();
-        if (!conn) continue;
-
-        /* We need our own identity for the connection -- use a temporary keypair */
-        uint8_t tmp_pk[32], tmp_sk[64];
-        moor_crypto_sign_keygen(tmp_pk, tmp_sk);
-
-        memcpy(conn->peer_identity, relay->identity_pk, 32);
-        if (moor_connection_connect(conn, relay->address, relay->or_port,
-                                     tmp_pk, tmp_sk, NULL, NULL) != 0) {
-            moor_connection_free(conn);
-            moor_crypto_wipe(tmp_sk, 64);
-            continue;
-        }
-
-        /* Build CKE circuit */
-        moor_circuit_t *circ = moor_circuit_alloc();
-        if (!circ) {
-            moor_connection_close(conn);
-            moor_crypto_wipe(tmp_sk, 64);
-            continue;
-        }
-
-        circ->circuit_id = moor_circuit_gen_id();
-        circ->is_client = 1;
-        circ->conn = conn;
-        memcpy(circ->hops[0].node_id, relay->identity_pk, 32);
-
-        if (moor_circuit_create(circ, relay->identity_pk, relay->onion_pk) != 0) {
-            moor_circuit_free(circ);
-            moor_connection_close(conn);
+        /* Build 3-hop circuit to the target relay for DHT STORE.
+         * Hides the HS's IP from the DHT relay. */
+        moor_connection_t *conn = NULL;
+        moor_circuit_t *circ = NULL;
+        uint8_t tmp_sk[64];
+        if (dht_connect_relay(relay, &conn, &circ, tmp_sk, consensus) != 0) {
             moor_crypto_wipe(tmp_sk, 64);
             continue;
         }
@@ -1363,39 +1343,92 @@ static int dht_recv_pir_response(moor_connection_t *conn, moor_circuit_t *circ,
 
 /* Helper: connect to a relay, build 1-hop circuit.
  * Returns 0 on success; conn and circ are set. Caller must clean up. */
+/* Build a 3-hop circuit (guard → middle → target DHT relay) for PIR queries.
+ * The target relay only sees traffic from the middle relay, not the client's IP.
+ * Uses skip_guard_reuse=1 to avoid sharing the main thread's guard connection. */
 static int dht_connect_relay(const moor_node_descriptor_t *relay,
                                moor_connection_t **out_conn,
                                moor_circuit_t **out_circ,
-                               uint8_t tmp_sk[64]) {
+                               uint8_t tmp_sk[64],
+                               const moor_consensus_t *consensus) {
     uint8_t tmp_pk[32];
     moor_crypto_sign_keygen(tmp_pk, tmp_sk);
 
     moor_connection_t *conn = moor_connection_alloc();
     if (!conn) return -1;
 
-    memcpy(conn->peer_identity, relay->identity_pk, 32);
-    if (moor_connection_connect(conn, relay->address, relay->or_port,
-                                 tmp_pk, tmp_sk, NULL, NULL) != 0) {
-        moor_connection_free(conn);
-        return -1;
-    }
-
     moor_circuit_t *circ = moor_circuit_alloc();
-    if (!circ) {
-        moor_connection_close(conn);
-        return -1;
-    }
+    if (!circ) { moor_connection_free(conn); return -1; }
 
     circ->circuit_id = moor_circuit_gen_id();
     circ->is_client = 1;
     circ->conn = conn;
-    memcpy(circ->hops[0].node_id, relay->identity_pk, 32);
 
-    if (moor_circuit_create(circ, relay->identity_pk, relay->onion_pk) != 0) {
+    /* Select guard (exclude ourselves + the target DHT relay) */
+    uint8_t exclude[96];
+    memcpy(exclude, tmp_pk, 32);
+    memcpy(exclude + 32, relay->identity_pk, 32);
+
+    const moor_node_descriptor_t *guard =
+        moor_node_select_relay(consensus, NODE_FLAG_GUARD | NODE_FLAG_RUNNING,
+                               exclude, 2);
+    if (!guard)
+        guard = moor_node_select_relay(consensus, NODE_FLAG_RUNNING, exclude, 2);
+    if (!guard) {
+        LOG_WARN("DHT circuit: no guard relay available");
+        moor_circuit_free(circ);
+        moor_connection_free(conn);
+        return -1;
+    }
+
+    /* Connect to guard */
+    memcpy(conn->peer_identity, guard->identity_pk, 32);
+    if (moor_connection_connect(conn, guard->address, guard->or_port,
+                                 tmp_pk, tmp_sk, NULL, NULL) != 0) {
+        moor_circuit_free(circ);
+        moor_connection_free(conn);
+        return -1;
+    }
+    /* Clear peer_identity to prevent main thread's channel mux from
+     * discovering this connection (skip_guard_reuse isolation). */
+    memset(conn->peer_identity, 0, 32);
+    conn->circuit_refcount++;
+
+    /* CREATE to guard */
+    memcpy(circ->hops[0].node_id, guard->identity_pk, 32);
+    if (moor_circuit_create(circ, guard->identity_pk, guard->onion_pk) != 0) {
         moor_circuit_free(circ);
         moor_connection_close(conn);
         return -1;
     }
+
+    /* Select middle (exclude guard + target) */
+    memcpy(exclude + 64, guard->identity_pk, 32);
+    const moor_node_descriptor_t *middle =
+        moor_node_select_relay(consensus, NODE_FLAG_RUNNING, exclude, 3);
+    if (!middle) {
+        LOG_WARN("DHT circuit: no middle relay available");
+        moor_circuit_free(circ);
+        moor_connection_close(conn);
+        return -1;
+    }
+
+    /* EXTEND to middle */
+    if (moor_circuit_extend(circ, middle) != 0) {
+        moor_circuit_free(circ);
+        moor_connection_close(conn);
+        return -1;
+    }
+
+    /* EXTEND to target DHT relay */
+    if (moor_circuit_extend(circ, relay) != 0) {
+        moor_circuit_free(circ);
+        moor_connection_close(conn);
+        return -1;
+    }
+
+    LOG_INFO("DHT circuit: 3-hop path to %s:%u built (circ %u)",
+             relay->address, relay->or_port, circ->circuit_id);
 
     *out_conn = conn;
     *out_circ = circ;
@@ -1449,7 +1482,7 @@ static int dht_fetch_pir(const uint8_t address_hash[32],
         moor_circuit_t *circ = NULL;
         uint8_t tmp_sk[64];
 
-        if (dht_connect_relay(relay0, &conn, &circ, tmp_sk) != 0) {
+        if (dht_connect_relay(relay0, &conn, &circ, tmp_sk, consensus) != 0) {
             LOG_WARN("DHT PIR: failed to connect to replica 0");
             moor_crypto_wipe(tmp_sk, 64);
             return -1;
@@ -1513,7 +1546,7 @@ static int dht_fetch_pir(const uint8_t address_hash[32],
         moor_circuit_t *circ = NULL;
         uint8_t tmp_sk[64];
 
-        if (dht_connect_relay(relay1, &conn, &circ, tmp_sk) != 0) {
+        if (dht_connect_relay(relay1, &conn, &circ, tmp_sk, consensus) != 0) {
             LOG_WARN("DHT PIR: failed to connect to replica 1");
             moor_crypto_wipe(tmp_sk, 64);
             return -1;
@@ -1600,7 +1633,7 @@ static int dht_fetch_dpf(const uint8_t address_hash[32],
         moor_circuit_t *circ = NULL;
         uint8_t tmp_sk[64];
 
-        if (dht_connect_relay(relay0, &conn, &circ, tmp_sk) != 0) {
+        if (dht_connect_relay(relay0, &conn, &circ, tmp_sk, consensus) != 0) {
             LOG_WARN("DHT DPF-PIR: failed to connect to replica 0");
             moor_crypto_wipe(tmp_sk, 64);
             return -1;
@@ -1658,7 +1691,7 @@ static int dht_fetch_dpf(const uint8_t address_hash[32],
         moor_circuit_t *circ = NULL;
         uint8_t tmp_sk[64];
 
-        if (dht_connect_relay(relay1, &conn, &circ, tmp_sk) != 0) {
+        if (dht_connect_relay(relay1, &conn, &circ, tmp_sk, consensus) != 0) {
             LOG_WARN("DHT DPF-PIR: failed to connect to replica 1");
             moor_crypto_wipe(tmp_sk, 64);
             return -1;
@@ -1731,126 +1764,45 @@ int moor_dht_fetch(const uint8_t address_hash[32],
 
     LOG_INFO("DHT fetch: trying %u responsible relays", resp.num_relays);
 
-    /* Try DPF-PIR first (preferred), then XOR-bitmask PIR, then plaintext */
+    /* PIR with replica pair rotation.  With k=3 replicas there are 3 pairs:
+     * (0,1), (0,2), (1,2).  Try each pair before giving up.
+     * No plaintext fallback — falling back to plaintext would leak the
+     * address_hash to the relay, defeating the privacy goal of PIR. */
     {
         extern moor_config_t g_config;
-        if (g_config.pir && resp.num_relays >= 2) {
-            if (g_config.pir_dpf) {
-                LOG_INFO("DHT fetch: attempting DPF-PIR fetch");
-                if (dht_fetch_dpf(address_hash, out_data, out_len,
-                                  &resp, consensus) == 0)
-                    return 0;
-                LOG_INFO("DHT fetch: DPF-PIR failed, trying XOR-bitmask PIR");
-            }
-            LOG_INFO("DHT fetch: attempting XOR-bitmask PIR fetch");
-            if (dht_fetch_pir(address_hash, out_data, out_len,
-                              &resp, consensus) == 0)
-                return 0;
-            LOG_INFO("DHT fetch: PIR failed, falling back to plaintext");
-        }
-    }
+        if (resp.num_relays >= 2) {
+            /* Build list of replica pairs to try */
+            struct { uint32_t a, b; } pairs[3];
+            int num_pairs = 0;
+            for (uint32_t i = 0; i < resp.num_relays && num_pairs < 3; i++)
+                for (uint32_t j = i + 1; j < resp.num_relays && num_pairs < 3; j++)
+                    { pairs[num_pairs].a = i; pairs[num_pairs].b = j; num_pairs++; }
 
-    /* Legacy plaintext fetch — try each replica sequentially */
-    for (uint32_t r = 0; r < resp.num_relays; r++) {
-        uint32_t idx = resp.relay_indices[r];
-        const moor_node_descriptor_t *relay = &consensus->relays[idx];
+            for (int p = 0; p < num_pairs; p++) {
+                /* Temporarily override which replicas the PIR functions use */
+                moor_dht_responsible_t try_resp = resp;
+                try_resp.relay_indices[0] = resp.relay_indices[pairs[p].a];
+                try_resp.relay_indices[1] = resp.relay_indices[pairs[p].b];
+                try_resp.num_relays = 2;
 
-        LOG_INFO("DHT fetch: trying relay %u (%s:%u)",
-                 idx, relay->address, relay->or_port);
-
-        uint8_t tmp_sk[64];
-        moor_connection_t *conn = NULL;
-        moor_circuit_t *circ = NULL;
-
-        if (dht_connect_relay(relay, &conn, &circ, tmp_sk) != 0) {
-            moor_crypto_wipe(tmp_sk, 64);
-            continue;
-        }
-
-        /* Send RELAY_DHT_FETCH */
-        moor_cell_t cell;
-        moor_cell_relay(&cell, circ->circuit_id, RELAY_DHT_FETCH, 0,
-                        address_hash, 32);
-        if (moor_circuit_encrypt_forward(circ, &cell) != 0 ||
-            moor_connection_send_cell(conn, &cell) != 0) {
-            dht_cleanup_relay(conn, circ, tmp_sk);
-            continue;
-        }
-
-        /* Wait for response */
-        moor_cell_t resp_cell;
-        int ret = dht_recv_cell(conn, &resp_cell, 10000);
-
-        if (ret < 0) {
-            LOG_WARN("DHT fetch: recv error from relay %u (%s:%u)",
-                     idx, relay->address, relay->or_port);
-        } else if (ret == 0) {
-            LOG_WARN("DHT fetch: timeout from relay %u (%s:%u)",
-                     idx, relay->address, relay->or_port);
-        } else if (resp_cell.command != CELL_RELAY) {
-            LOG_WARN("DHT fetch: got non-relay cell (cmd=%d) from relay %u",
-                     resp_cell.command, idx);
-            ret = 0;
-        } else {
-            if (moor_circuit_decrypt_backward(circ, &resp_cell) != 0) {
-                LOG_WARN("DHT fetch: decrypt failed from relay %u", idx);
-                ret = 0;
-            }
-        }
-
-        if (ret > 0) {
-            moor_relay_payload_t rp;
-            moor_relay_unpack(&rp, resp_cell.payload);
-
-            LOG_INFO("DHT fetch: relay %u responded cmd=%d len=%u",
-                     idx, rp.relay_command, rp.data_length);
-
-            if (rp.relay_command == RELAY_DHT_FOUND && rp.data_length >= 36) {
-                uint16_t total = ((uint16_t)rp.data[32] << 8) | rp.data[33];
-                /* Validate server-declared total against both protocol max
-                 * and the caller's buffer capacity (CWE-787) */
-                uint16_t buf_cap = *out_len ? *out_len : MOOR_DHT_MAX_DESC_DATA;
-                if (total <= MOOR_DHT_MAX_DESC_DATA && total <= buf_cap) {
-                    uint16_t chunk = rp.data_length - 36;
-                    if (chunk > total) chunk = total;
-                    memcpy(out_data, rp.data + 36, chunk);
-                    uint16_t received = chunk;
-
-                    /* Multi-cell: receive remaining chunks */
-                    while (received < total) {
-                        moor_cell_t mc;
-                        int mc_ret = dht_recv_cell(conn, &mc, 5000);
-                        if (mc_ret <= 0) {
-                            LOG_WARN("DHT fetch: multi-cell recv failed at %u/%u",
-                                     received, total);
-                            break;
-                        }
-                        if (mc.command != CELL_RELAY) break;
-                        moor_circuit_decrypt_backward(circ, &mc);
-                        moor_relay_payload_t mrp;
-                        moor_relay_unpack(&mrp, mc.payload);
-                        if (mrp.relay_command != RELAY_DHT_FOUND) break;
-                        if (mrp.data_length < 36) break;
-                        uint16_t mc_off = ((uint16_t)mrp.data[34] << 8) | mrp.data[35];
-                        uint16_t mc_chunk = mrp.data_length - 36;
-                        if (mc_off + mc_chunk > total) break;
-                        memcpy(out_data + mc_off, mrp.data + 36, mc_chunk);
-                        received = mc_off + mc_chunk;
-                    }
-
-                    *out_len = total;
-                    dht_cleanup_relay(conn, circ, tmp_sk);
-                    LOG_INFO("DHT fetch: got descriptor (%u bytes)", total);
-                    return 0;
+                if (g_config.pir && g_config.pir_dpf) {
+                    LOG_INFO("DHT fetch: DPF-PIR pair (%u,%u) attempt %d/%d",
+                             pairs[p].a, pairs[p].b, p + 1, num_pairs);
+                    if (dht_fetch_dpf(address_hash, out_data, out_len,
+                                      &try_resp, consensus) == 0)
+                        return 0;
                 }
-            } else if (rp.relay_command == RELAY_DHT_NOT_FOUND) {
-                LOG_INFO("DHT fetch: relay %u does not have descriptor", idx);
+                if (g_config.pir) {
+                    LOG_INFO("DHT fetch: XOR-PIR pair (%u,%u) attempt %d/%d",
+                             pairs[p].a, pairs[p].b, p + 1, num_pairs);
+                    if (dht_fetch_pir(address_hash, out_data, out_len,
+                                      &try_resp, consensus) == 0)
+                        return 0;
+                }
             }
         }
-
-        dht_cleanup_relay(conn, circ, tmp_sk);
     }
 
-    LOG_WARN("DHT fetch: all relays failed");
+    LOG_WARN("DHT fetch: all PIR replica pairs failed");
     return -1;
 }

@@ -370,8 +370,28 @@ if [[ -f "$AWS_KEY" ]]; then
             for attempt in 1 2 3; do
                 if scp -i "$AWS_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -q \
                     "$AWS_TARBALL" ubuntu@${ip}:/tmp/moor-src.tar.gz 2>/dev/null && \
-                   $AWS_SSH ubuntu@${ip} \
-                    'cd /opt/moor && sudo tar xzf /tmp/moor-src.tar.gz && sudo make clean >/dev/null 2>&1 && sudo make -j$(nproc) 2>&1 | tail -1 && sudo install -m 755 moor /usr/local/bin/moor && sudo mkdir -p /var/lib/moor/keys && sudo chmod 755 /var/lib/moor && sudo chmod 700 /var/lib/moor/keys && sudo systemctl restart moor && sleep 2 && systemctl is-active moor >/dev/null 2>&1' 2>/dev/null; then
+                   $AWS_SSH ubuntu@${ip} bash -s <<'AWSEOF' 2>/dev/null; then
+set -e
+cd /opt/moor
+sudo tar xzf /tmp/moor-src.tar.gz
+sudo make clean >/dev/null 2>&1 || true
+sudo make -j$(nproc) 2>&1 | tail -1
+sudo install -m 755 moor /usr/local/bin/moor
+sudo mkdir -p /var/lib/moor/keys
+sudo chmod 755 /var/lib/moor && sudo chmod 700 /var/lib/moor/keys
+# Hard kill + restart — systemctl restart alone sometimes leaves old process
+sudo systemctl stop moor 2>/dev/null || true
+sudo pkill -9 -x moor 2>/dev/null || true
+sleep 1
+sudo systemctl start moor
+sleep 3
+# Verify: service active AND process started recently (not stale)
+systemctl is-active moor >/dev/null 2>&1
+MOOR_PID=$(pgrep -x moor | head -1)
+if [ -z "$MOOR_PID" ]; then exit 1; fi
+PROC_AGE=$(( $(date +%s) - $(stat -c %Y /proc/$MOOR_PID 2>/dev/null || echo 0) ))
+if [ "$PROC_AGE" -gt 30 ]; then exit 1; fi
+AWSEOF
                     echo "$ip"
                     return 0
                 fi
@@ -389,25 +409,23 @@ if [[ -f "$AWS_KEY" ]]; then
         done
         wait
 
-        # Verify every AWS node: check binary is fresh AND service is active.
-        # The deploy function already verifies inside its SSH session, so
-        # this is a second pass to catch any that slipped through.
+        # Verify every AWS node: service active AND process is fresh (not stale).
         echo -e "${YELLOW}==> Verifying AWS nodes (15s settle)...${NC}"
         sleep 15
-        DEPLOY_TIME=$(date +%s)
         AWS_OK=0
         AWS_FAIL_LIST=""
         for ip in "${AWS_IPS[@]}"; do
             result=$(ssh -i "$AWS_KEY" -o ConnectTimeout=15 -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
-                ubuntu@${ip} "systemctl is-active moor 2>/dev/null && stat -c '%Y' /usr/local/bin/moor 2>/dev/null" 2>/dev/null)
+                ubuntu@${ip} 'systemctl is-active moor 2>/dev/null; PID=$(pgrep -x moor | head -1); if [ -n "$PID" ]; then echo $(( $(date +%s) - $(stat -c %Y /proc/$PID 2>/dev/null || echo 0) )); else echo 9999; fi' 2>/dev/null || echo -e "dead\n9999")
             status=$(echo "$result" | head -1)
-            bin_ts=$(echo "$result" | tail -1)
-            bin_age=$(( DEPLOY_TIME - ${bin_ts:-0} ))
-            if [[ "$status" == "active" && $bin_age -lt 600 ]]; then
-                ok "$ip"
+            proc_age=$(echo "$result" | tail -1)
+            # Ensure proc_age is numeric
+            [[ "$proc_age" =~ ^[0-9]+$ ]] || proc_age=9999
+            if [[ "$status" == "active" && $proc_age -lt 120 ]]; then
+                ok "$ip (process ${proc_age}s old)"
                 AWS_OK=$((AWS_OK + 1))
             else
-                fail "$ip (status=$status, binary ${bin_age}s old)"
+                fail "$ip (status=$status, process ${proc_age}s old)"
                 AWS_FAIL_LIST="$AWS_FAIL_LIST $ip"
                 ALL_OK=0
             fi
@@ -456,8 +474,12 @@ if command -v sshpass >/dev/null 2>&1; then
         make clean 2>/dev/null || true
         make -j$(nproc) 2>&1 | tail -1
         sudo systemctl stop moor 2>/dev/null || true
+        sudo pkill -9 -x moor 2>/dev/null || true
+        sleep 1
         sudo cp ./moor /usr/local/bin/moor
         sudo systemctl start moor
+        sleep 3
+        systemctl is-active moor >/dev/null 2>&1
 PI_EOF
 
     if [[ $? -eq 0 ]]; then
