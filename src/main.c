@@ -102,12 +102,13 @@ static int maybe_drop_privileges(void);
 static void print_usage(const char *prog) {
     fprintf(stderr,
         "\033[36m"
-        "                 ███╗   ███╗ ██████╗  ██████╗ ██████╗ \n"
-        "                 ████╗ ████║██╔═══██╗██╔═══██╗██╔══██╗\n"
-        "                 ██╔████╔██║██║   ██║██║   ██║██████╔╝\n"
-        "                 ██║╚██╔╝██║██║   ██║██║   ██║██╔══██╗\n"
-        "                 ██║ ╚═╝ ██║╚██████╔╝╚██████╔╝██║  ██║\n"
-        "                 ╚═╝     ╚═╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝\n"
+        "        .-------.                          \n"
+        "       / .-----. \\                         \n"
+        "      / / .---. \\ \\    \033[0m\033[1mM O O R\033[0m\033[36m             \n"
+        "     | | |\033[33m .:. \033[36m| | |                        \n"
+        "      \\ \\ '---' / /    \033[0m\033[1mMy Own Onion Router\033[0m\033[36m  \n"
+        "       \\ '-----' /                         \n"
+        "        '-------'                          \n"
         "\033[0m\n"
         "  MOOR v%s -- My Own Onion Router -- PQ Secure Overlay Network\n"
         "\n"
@@ -1969,6 +1970,10 @@ static int run_relay(void) {
      * without RST -- common with NAT, mobile, WSL). */
     moor_event_add_timer(30000, conn_reap_timer_cb, NULL);
 
+    LOG_WARN("defenses: WTF-PAD=%s mixing=%s (lambda=%llums) PQ-hybrid=on",
+             g_wfpad_machine ? g_wfpad_machine->name : "off",
+             g_config.mix_delay > 0 ? "on" : "off",
+             (unsigned long long)g_config.mix_delay);
     LOG_INFO("relay running on %s:%u", g_bind_addr, g_or_port);
 #ifndef _WIN32
     if (maybe_drop_privileges() != 0) return -1;
@@ -2291,6 +2296,16 @@ static int run_client(void) {
                  g_config.bridges[0].address,
                  g_config.bridges[0].port,
                  g_config.bridges[0].transport);
+    }
+    /* Traffic analysis defense summary — always visible so operator knows
+     * what's active.  Relays do the actual mixing; clients benefit from
+     * WTF-PAD (per-circuit padding) and PIR (private HS lookups). */
+    {
+        extern moor_config_t g_config;
+        LOG_WARN("defenses: WTF-PAD=%s PIR=%s DPF-PIR=%s PQ-hybrid=on",
+                 g_wfpad_machine ? g_wfpad_machine->name : "off",
+                 g_config.pir ? "on" : "off",
+                 (g_config.pir && g_config.pir_dpf) ? "on" : "off");
     }
     LOG_INFO("SOCKS5 client running on %s:%u", g_bind_addr, g_socks_port);
 #ifndef _WIN32
@@ -4222,20 +4237,19 @@ int main(int argc, char **argv) {
         fprintf(stderr,
             "\n"
             "\033[36m====================================================================\033[0m\n"
-            "\033[36m                 ███╗   ███╗ ██████╗  ██████╗ ██████╗ \033[0m\n"
-            "\033[36m                 ████╗ ████║██╔═══██╗██╔═══██╗██╔══██╗\033[0m\n"
-            "\033[36m                 ██╔████╔██║██║   ██║██║   ██║██████╔╝\033[0m\n"
-            "\033[36m                 ██║╚██╔╝██║██║   ██║██║   ██║██╔══██╗\033[0m\n"
-            "\033[36m                 ██║ ╚═╝ ██║╚██████╔╝╚██████╔╝██║  ██║\033[0m\n"
-            "\033[36m                 ╚═╝     ╚═╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝\033[0m \033[1mv%s\033[0m\n"
             "\n"
-            "                \033[1mM Y   O W N   O N I O N   R O U T E R\033[0m\n"
-            "                       \033[90mPQ SECURE OVERLAY NETWORK\033[0m\n"
+            "\033[36m        .-------.\033[0m\n"
+            "\033[36m       / .-----. \\\033[0m\n"
+            "\033[36m      / / .---. \\ \\\033[0m    \033[1mM O O R\033[0m  v%s\n"
+            "\033[36m     | | |\033[33m .:. \033[36m| | |\033[0m\n"
+            "\033[36m      \\ \\ '---' / /\033[0m    \033[1mMy Own Onion Router\033[0m\n"
+            "\033[36m       \\ '-----' /\033[0m     \033[90mPQ Secure Overlay Network\033[0m\n"
+            "\033[36m        '-------'\033[0m\n"
             "\n"
             "\033[36m--------------------------------------------------------------------\033[0m\n"
             "\n"
             "        \033[33m>>>   PRIVACY IS A RIGHT, NOT A FEATURE   <<<\033[0m\n"
-            "        \033[33m>>>     TRUSTLESS • STATELESS • SILENT     <<<\033[0m\n"
+            "        \033[33m>>>     TRUSTLESS  *  STATELESS  *  SILENT     <<<\033[0m\n"
             "\n"
             "\033[36m--------------------------------------------------------------------\033[0m\n"
             "\033[36m====================================================================\033[0m\n"
