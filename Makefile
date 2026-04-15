@@ -57,7 +57,6 @@ SOURCES = $(SRCDIR)/log.c \
           $(SRCDIR)/fragment.c \
           $(SRCDIR)/pow.c \
           $(SRCDIR)/geoip.c \
-          $(SRCDIR)/padding_adv.c \
           $(SRCDIR)/bw_auth.c \
           $(SRCDIR)/conflux.c \
           $(SRCDIR)/ratelimit.c \
@@ -115,7 +114,6 @@ TEST_FRAGMENT_SRC = tests/test_fragment.c
 TEST_PQ_CIRCUIT_SRC = tests/test_pq_circuit.c
 TEST_POW_SRC = tests/test_pow.c
 TEST_GEOIP_SRC = tests/test_geoip.c
-TEST_PADDING_ADV_SRC = tests/test_padding_adv.c
 TEST_BW_AUTH_SRC = tests/test_bw_auth.c
 TEST_CONFLUX_SRC = tests/test_conflux.c
 TEST_RATELIMIT_SRC = tests/test_ratelimit.c
@@ -149,7 +147,6 @@ TEST_FRAGMENT_TARGET = $(BUILDDIR)/test_fragment
 TEST_PQ_CIRCUIT_TARGET = $(BUILDDIR)/test_pq_circuit
 TEST_POW_TARGET = $(BUILDDIR)/test_pow
 TEST_GEOIP_TARGET = $(BUILDDIR)/test_geoip
-TEST_PADDING_ADV_TARGET = $(BUILDDIR)/test_padding_adv
 TEST_BW_AUTH_TARGET = $(BUILDDIR)/test_bw_auth
 TEST_CONFLUX_TARGET = $(BUILDDIR)/test_conflux
 TEST_RATELIMIT_TARGET = $(BUILDDIR)/test_ratelimit

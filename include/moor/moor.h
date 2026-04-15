@@ -51,12 +51,6 @@
 #define MOOR_TA_FRONT_MAX         1000  /* Max FRONT padding cells per circuit */
 #define MOOR_TA_FRONT_WINDOW_MS   5000  /* Spread FRONT cells over 5 seconds */
 
-/* Advanced padding modes (bitmask) */
-#define MOOR_PADDING_CONSTANT   (1 << 0)  /* Constant-rate padding */
-#define MOOR_PADDING_ADAPTIVE   (1 << 1)  /* Adaptive burst cover */
-#define MOOR_PADDING_JITTER     (1 << 2)  /* Jitter delay */
-#define MOOR_PADDING_ALL        (MOOR_PADDING_CONSTANT | MOOR_PADDING_ADAPTIVE | MOOR_PADDING_JITTER)
-
 /* Bandwidth verification */
 #define MOOR_BW_TEST_SIZE       (256 * 1024) /* 256KB test */
 #define MOOR_BW_TOLERANCE       1.2          /* 20% tolerance */
@@ -178,7 +172,6 @@ typedef enum {
 #include "config.h"
 #include "pow.h"
 #include "geoip.h"
-#include "padding_adv.h"
 #include "bw_auth.h"
 #include "conflux.h"
 #include "ratelimit.h"

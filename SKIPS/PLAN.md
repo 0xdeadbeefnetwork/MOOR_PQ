@@ -1,177 +1,80 @@
-# SKIPS — Sick Kernel Informed Packet Scheduler
+# MOOR Implementation Status
 
-## Implementation Plan for MOOR
+Last updated: 2026-04-14
 
-### Prerequisites (sloppy code fixes needed first)
+## Overview
 
-#### Phase 1 — Crash Prevention (30 min)
-- `src/relay.c:163` — `g_extend_pq_inflight` bare `++/--` from threads → use `__sync_fetch_and_add/sub`
-- `src/circuit.c:266` — `realloc(g_circuits, ...)` doesn't check NULL return → add check, keep old pointer on failure
-- `src/relay.c:2588` — hardcoded `4` for PQ inflight cap → `#define MOOR_MAX_PQ_EXTEND_INFLIGHT 4` in limits.h
+~47K lines of C across 64 source files. All features implemented. Fleet operational:
+2 DAs, 3 core relays, 20 AWS relays (11 countries), 1 Pi hidden service.
 
-#### Phase 2 — Unify RELAY_DATA handling (1-2 hours)
-Three files implement the same protocol operation differently:
-- `src/relay.c:2013` — exit relay handler (has short-write, XOFF/XON, SENDME)
-- `src/main.c:2021` — HS handler (has short-write, SENDME, but different)
-- `src/socks5.c:987` — client handler (different again)
+## Completed Features
 
-Extract into shared `moor_stream_forward_to_target()` called by all three.
+### Cryptography & Handshakes
+- **Noise_IK link handshake** — mutual auth, full forward secrecy
+- **PQ Kyber768 hybrid** — post-quantum KEM mixed into Noise_IK session keys
+- **DA-to-DA Noise_IK** — replaced hand-rolled DH (2026-04-14)
+- **ML-DSA-65 consensus signatures** — hybrid Ed25519 + post-quantum DA sigs
+- **Async handshake state machine** — non-blocking Noise_IK + PQ for circuit builds
 
-#### Phase 2.5 — SKIPS Prerequisites (the big one)
-These changes are required before SKIPS can work:
+### Cell Scheduling (SKIPS)
+- **EWMA circuitmux** — min-heap priority, tick-based decay, quietest-circuit-first (`channel.c:340-567`)
+- **SKIPS scheduler** — TCP_INFO-aware write budgets, RTT-adaptive interval, burst mode (`scheduler.c`)
+- **Per-circuit queues** — relay-forward cells deferred to SKIPS, client/HS cells flush directly
+- **Backpressure** — checks `outq + circuitmux_total_queued()`, pauses client reads at threshold
+- **XOFF/XON flow control** — Prop 344, exit-to-client and client-to-exit
 
-**a) Refactor send_cell to always queue (not inline send)**
-- Current: `moor_connection_send_cell()` at `src/connection.c:1185` tries `send()` inline, only queues on EAGAIN
-- Needed: ALL cells go to per-circuit queues. The scheduler decides when to flush to kernel.
-- The per-circuit queue structs already exist at `src/scheduler.c:157-176` (`moor_circ_queue_init/clear`) but are never populated
+### Traffic Analysis Defenses
+- **WTFPad** — adaptive padding state machine on every circuit (`wfpad.c`, 466 lines)
+- **Pluggable transports** — 6 implementations:
+  - Scramble (635 loc), Shade (653), Speakeasy (707), Nether/Minecraft (612), Mirage (1165), Shitstorm (3116)
+- **Poisson mixing** — configurable per-relay mix delay
+- **Elligator2** — indistinguishable-from-random key encodings
 
-**b) Wire up circuitmux as single EWMA authority**
-- Current: `src/channel.c:514` has `moor_circuitmux_pick()` (full min-heap, decay, priority) but it's NEVER CALLED
-- Current: `src/circuit.c:1761` has a SEPARATE `circ->ewma_cell_count` that diverges from the mux's count
-- Fix: remove `circ->ewma_cell_count`, use only `mux->entries[].ewma_cell_count`
-- Call `moor_circuitmux_notify_xmit()` after each cell send to update EWMA
+### Hidden Services
+- **v3 HS protocol** — blinded keys, time periods, encrypted descriptors
+- **Vanguards** — restricted middle hops (L2/L3) to prevent guard discovery
+- **HS PoW DoS protection** — configurable proof-of-work for INTRODUCE2
+- **Intro re-establishment** — deferred rebuild with stale ctx purge (fixed 2026-04-14)
+- **PQ e2e** — Kyber768 KEM for end-to-end HS circuit key exchange
+- **DHT descriptor storage** — PIR and DPF-PIR for private descriptor fetch
 
-**c) Fix backpressure to check circuit queues**
-- Current: `src/socks5.c:1790` pauses clients when `conn->outq > 384`
-- Current: `src/relay.c:1168` resumes when `conn->outq < 256`
-- If cells move to per-circuit queues, `conn->outq` is always near-empty
-- Fix: check total queued cells across all circuits on this connection, OR check global queue pressure
+### Directory Authority
+- **2-DA consensus** — epoch-aligned timestamps with 3s grace window
+- **PQ vote exchange** — Ed25519 + ML-DSA-65 dual-signed votes
+- **Descriptor propagation** — PROPAGATE with signature verification
+- **DA-to-DA sync** — Noise_IK encrypted SYNC_RELAYS (5-min cycle)
+- **Relay liveness probing** — PROBE/ALIVE + bandwidth measurement (15-min cycle)
+- **Stale relay eviction** — 3-hour threshold, 3-strike probe failure
+- **SRV commit-reveal** — shared random values for DHT epoch computation
 
-**d) Remove dead fields**
-- `circuit.h:123` — `last_real_cell_time` (written, never read)
-- `circuit.h:110` — `ewma_cell_count` (duplicate of mux's EWMA, remove after wiring mux)
+### Network
+- **Conflux multi-path** — circuit leg linking, switching, acknowledgment
+- **SENDME flow control** — window-based, per-circuit
+- **Connection reaper** — idle connection culling
+- **Circuit-level DoS** — CREATE rate limiting, cell token bucket (Prop 305)
+- **EXTEND_PQ** — post-quantum circuit extension with concurrency cap
+- **GeoIP** — IPv4/IPv6 country + AS lookup, relay flag computation
 
-#### Phase 3 — Magic Numbers (20 min)
-- `src/socks5.c:525` — hardcoded `498` → use `MOOR_RELAY_DATA`
-- `src/relay.c:2588` — hardcoded `4` → constant
-- `src/relay.c:30` — hardcoded `30` timeout → constant
-- Various IPv4 mask constants in `relay.c:37+` → named defines
+## Known Issues (Non-Blocking)
 
----
+- **PQ KEM spin-loops removed** — replaced with poll-based blocking (2026-04-14)
+- **Vote divergence at epoch boundary** — 3s grace window added, may still fire once/hour at the boundary; self-heals on next cycle
+- **SKIPS only schedules relay-forward path** — client/HS cells flush directly; this is intentional (latency-sensitive paths need immediate send)
 
-### SKIPS Implementation (~400 lines in scheduler.c)
+## What an Auditor Should Focus On
 
-#### What Tor's KIST does (baseline)
-1. Every 2ms, wake up
-2. For each connection with pending cells: `getsockopt(SOL_TCP, TCP_INFO)` to get cwnd, unacked, mss
-3. Compute write budget: `limit = (cwnd - unacked) * mss + extra_space - notsent`
-4. Pop channels from EWMA priority queue, flush 1 cell at a time, re-insert
-5. Stop writing when `written >= limit`
-6. Batch flush outbufs to kernel at end
+1. **Noise_IK implementation** — `connection.c:490-900` (handshake), `connection.c:904-1091` (PQ KEM exchange)
+2. **Cell encryption** — `connection.c:1274-1460` (send_cell/recv_cell AEAD)
+3. **HS descriptor crypto** — `hidden_service.c` (blinded keys, sealed box, descriptor encryption)
+4. **DA consensus signing** — `directory.c:619-990` (body hash, Ed25519 + ML-DSA-65 signing, vote verification)
+5. **PIR/DPF-PIR** — `dht.c:645-1100` (query/response, privacy guarantees)
+6. **Transport obfuscation** — each `transport_*.c` (DPI resistance claims)
+7. **EWMA fairness** — `channel.c:340-567` (does the min-heap actually prevent starvation?)
+8. **Key management** — identity key generation, storage, rotation; SCP03 integration (Pi/SE050)
 
-#### What SKIPS improves
+## Removed Dead Code (2026-04-14)
 
-| Aspect | Tor KIST | SKIPS |
-|--------|----------|-------|
-| Interval | Fixed 2ms | RTT-adaptive: `min(2ms, tcpi_rtt/4)` |
-| Buffer factor | Static 1.0 | RTT-scaled: `min(interval_ms / tcpi_rtt, 1.0)` (fixes Tor ticket #24694) |
-| Cells per pop | 1 (expensive for high circuit counts) | Burst 4 when > 16 active circuits |
-| Platform | Linux-only | Graceful KISTLite fallback on non-Linux |
-| CC interaction | None | CC-aware: boost EWMA priority for high-RTT circuits |
-| Channel states | 5 states with known bugs | 3 states: IDLE, HAS_CELLS, WRITING |
-
-#### Data flow after SKIPS
-
-```
-Application data
-  → moor_socks5_forward_to_circuit()
-    → e2e encrypt (if HS)
-    → moor_circuit_send_data()
-      → moor_circuit_encrypt_forward()
-      → ENQUEUE to circ->cell_queue (NOT conn->outq)
-      → moor_circuitmux_notify_cells(chan, circ, 1)
-      → moor_skips_channel_has_cells(chan)  // mark channel pending
-
-SKIPS timer fires (every 2ms or RTT/4):
-  → for each pending channel:
-      getsockopt(fd, SOL_TCP, TCP_INFO) → fill kist_cwnd/unacked/mss/notsent
-      compute limit = (cwnd - unacked) * mss + extra - notsent
-  → while pending channels exist:
-      chan = pop min-EWMA channel
-      circ = moor_circuitmux_pick(chan)  // EWMA selects circuit
-      cell = circ->cell_queue.pop()
-      append to chan->outbuf
-      chan->kist_written += cell_wire_size
-      moor_circuitmux_notify_xmit(chan, circ, 1)  // update EWMA
-      if kist_written >= kist_limit: remove from pending
-      else: re-insert channel
-  → flush all outbufs to kernel via write()
-  → re-add channels that still have cells but hit limit
-```
-
-#### Files to modify
-
-| File | Change |
-|------|--------|
-| `src/scheduler.c` | Replace stubs with full SKIPS: init, timer, scheduling loop, TCP_INFO query |
-| `src/connection.c` | `send_cell` queues to circuit instead of inline send |
-| `src/channel.c` | Wire `circuitmux_pick` into scheduling, remove orphaned code paths |
-| `src/circuit.c` | Remove duplicate `ewma_cell_count`, use mux's exclusively |
-| `src/socks5.c` | Backpressure checks circuit queue depth instead of conn->outq |
-| `src/relay.c` | Same backpressure fix, flush path uses scheduler |
-| `src/main.c` | Same backpressure fix |
-| `include/moor/scheduler.h` | Replace KIST stubs with SKIPS API: `moor_skips_init`, `moor_skips_channel_has_cells`, `moor_skips_run` |
-| `include/moor/limits.h` | Add SKIPS constants: interval, burst size, buffer factor |
-| `include/moor/circuit.h` | Remove `ewma_cell_count`, `last_real_cell_time` |
-
-#### Existing infrastructure that slots in
-
-| Component | File:Line | Status |
-|-----------|-----------|--------|
-| EWMA circuitmux (min-heap, decay, pick) | `channel.c:340-567` | Complete, never called |
-| Channel KIST fields (cwnd, unacked, mss, notsent, limit, written) | `channel.h:104-110` | Allocated, zeroed |
-| Per-circuit queue structs | `scheduler.c:157-176` | Exist, never populated |
-| KIST stub call sites | `relay.c:1142`, `socks5.c:1164`, `main.c:557`, `channel.c:284` | Wired, no-op |
-| Backpressure pause/resume | `socks5.c:1790`, `relay.c:1168` | Works, needs threshold change |
-| Event timer system | `event.c:156-176` | Works, used for other timers |
-
-#### TCP_INFO syscall (Linux)
-
-```c
-#include <linux/tcp.h>
-#include <sys/ioctl.h>
-
-struct tcp_info ti;
-socklen_t ti_len = sizeof(ti);
-getsockopt(fd, IPPROTO_TCP, TCP_INFO, &ti, &ti_len);
-
-uint32_t cwnd    = ti.tcpi_snd_cwnd;
-uint32_t unacked = ti.tcpi_unacked;
-uint32_t mss     = ti.tcpi_snd_mss;
-
-// Not-sent bytes in kernel buffer
-int notsent = 0;
-ioctl(fd, SIOCOUTQNSD, &notsent);  // requires Linux >= 2.6.39
-```
-
-#### Constants to add to limits.h
-
-```c
-#define MOOR_SKIPS_INTERVAL_DEFAULT  2      /* ms between scheduler runs */
-#define MOOR_SKIPS_INTERVAL_MIN      1
-#define MOOR_SKIPS_INTERVAL_MAX      100
-#define MOOR_SKIPS_BURST_THRESHOLD   16     /* circuits before burst mode */
-#define MOOR_SKIPS_BURST_SIZE        4      /* cells per pop in burst mode */
-#define MOOR_SKIPS_OUTBUF_FLUSH      8      /* cells before kernel flush */
-#define MOOR_SKIPS_BUF_FACTOR        1.0    /* sock buffer factor (RTT-adjusted) */
-```
-
-#### Order of implementation
-
-1. Phase 1 — crash fixes (atomics, NULL check)
-2. Phase 2 — unify RELAY_DATA
-3. Phase 2.5a — refactor send_cell to queue-only (biggest change)
-4. Phase 2.5b — wire circuitmux, remove duplicate EWMA
-5. Phase 2.5c — fix backpressure for circuit queues
-6. Phase 2.5d — remove dead fields
-7. Phase 3 — magic numbers
-8. Phase 4 — implement SKIPS scheduling loop in scheduler.c
-9. Phase 5 — RTT-adaptive interval + CC-aware EWMA boost
-10. Test on 3-relay fleet, measure latency improvement
-
-### References
-
-- Tor KIST paper: https://www.robgjansen.com/publications/kist-tops2018.pdf
-- Tor source: https://gitlab.torproject.org/tpo/core/tor/-/blob/main/src/core/or/scheduler_kist.c
-- Tor ticket #24694 (RTT-aware factor): https://gitlab.torproject.org/tpo/core/tor/-/issues/24694
-- Tor Prop 324 (Vegas CC): https://spec.torproject.org/proposals/324-rtt-congestion-control.html
+- `padding_adv.c` / `padding_adv.h` — legacy padding module, replaced by WTFPad
+- `moor_transport_shade_register()` — unused wrapper, Shade registered directly
+- `MOOR_PADDING_CONSTANT/ADAPTIVE/JITTER` defines — config parsed but never read
+- `padding_mode` field from config.h, relay.h, circuit.h

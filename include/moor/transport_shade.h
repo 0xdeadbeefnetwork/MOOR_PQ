@@ -27,7 +27,6 @@ typedef struct {
 
 extern const moor_transport_t moor_shade_transport;
 
-int moor_transport_shade_register(void);
 void moor_shade_compute_mark(uint8_t mark[16],
                               const uint8_t node_id[32],
                               const uint8_t representative[32]);

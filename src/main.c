@@ -76,7 +76,6 @@ static char g_bridge_transport[32] = "scramble";
 static int g_pow_difficulty = 0;
 static char g_geoip_file[256] = "";
 static char g_geoip6_file[256] = "";
-static int g_padding_mode = 0;
 static int g_conflux = 0;
 static int g_conflux_legs = 2;
 static moor_geoip_db_t g_geoip_db;
@@ -200,7 +199,6 @@ static void apply_config_to_globals(const moor_config_t *cfg) {
     g_pow_difficulty = cfg->pow_difficulty;
     snprintf(g_geoip_file, sizeof(g_geoip_file), "%s", cfg->geoip_file);
     snprintf(g_geoip6_file, sizeof(g_geoip6_file), "%s", cfg->geoip6_file);
-    g_padding_mode = cfg->padding_mode;
     g_conflux = cfg->conflux;
     g_conflux_legs = cfg->conflux_legs > 0 ? cfg->conflux_legs : 2;
     g_control_port = cfg->control_port;
@@ -337,9 +335,6 @@ static void parse_args_into_config(moor_config_t *cfg, int argc, char **argv) {
         }
         else if (strcmp(argv[i], "--geoip6") == 0 && i + 1 < argc) {
             moor_config_set(cfg, "GeoIPv6File", argv[++i]);
-        }
-        else if (strcmp(argv[i], "--padding-mode") == 0 && i + 1 < argc) {
-            moor_config_set(cfg, "PaddingMode", argv[++i]);
         }
         else if (strcmp(argv[i], "--conflux") == 0) {
             moor_config_set(cfg, "Conflux", "1");
@@ -1389,7 +1384,7 @@ static void mix_drain_timer_cb(void *arg) {
     moor_mix_drain();
 }
 
-/* WTF-PAD: active padding machine (NULL = use legacy padding_adv) */
+/* WTF-PAD: active padding machine */
 static const wfpad_machine_t *g_wfpad_machine = NULL;
 
 /* WTF-PAD tick: iterate all circuits, send CELL_PADDING where due */
@@ -1739,7 +1734,6 @@ static int run_relay(void) {
     g_relay_cfg.pow_difficulty = g_pow_difficulty;
     g_relay_cfg.pow_memlimit = g_config.pow_memlimit;
     g_relay_cfg.mix_delay = g_config.mix_delay;
-    g_relay_cfg.padding_mode = g_padding_mode;
     memcpy(g_relay_cfg.nickname, g_config.nickname, sizeof(g_relay_cfg.nickname));
     memcpy(g_relay_cfg.contact_info, g_config.contact_info, sizeof(g_relay_cfg.contact_info));
     g_relay_cfg.is_bridge = g_is_bridge;
@@ -3081,13 +3075,19 @@ static void hs_intro_rotation_cb(void *arg) {
         if (g_hs_configs[h].intros_need_reestablish) {
             g_hs_configs[h].intros_need_reestablish = 0;
             LOG_INFO("HS %d: deferred intro re-establishment triggered", h);
-            /* moor_hs_establish_intro builds circuits synchronously (blocking
-             * TCP to relays). moor_hs_publish_descriptor does TCP to DAs.
-             * Both block the event loop. Accept the block here because intro
-             * re-establishment is rare (only when intro circuits die) and
-             * must complete before we register the new circuits with the
-             * event loop below. Moving to a thread would require complex
-             * synchronization with the event registration code. */
+            /* Purge stale intro ctx entries for this HS before rebuilding.
+             * Connection pool reuse means establish_intro can get the same
+             * moor_connection_t* back, and the 'already registered' check
+             * below would match the stale entry, skipping event registration.
+             * Without this, rebuilt intros never receive INTRODUCE2. */
+            for (int j = 0; j < g_num_hs_intro_ctxs; j++) {
+                if (g_hs_intro_ctxs[j].config == &g_hs_configs[h]) {
+                    if (g_hs_intro_ctxs[j].conn && g_hs_intro_ctxs[j].conn->fd >= 0)
+                        moor_event_remove(g_hs_intro_ctxs[j].conn->fd);
+                    g_hs_intro_ctxs[j].conn = NULL;
+                    g_hs_intro_ctxs[j].config = NULL;
+                }
+            }
             moor_hs_establish_intro(&g_hs_configs[h], g_hs_consensus);
             moor_hs_publish_descriptor(&g_hs_configs[h]);
             /* Fall through to register new intro circuits with event loop */

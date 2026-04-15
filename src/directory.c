@@ -793,9 +793,15 @@ static int da_build_consensus_unlocked(moor_da_config_t *config) {
     moor_da_srv_compute(config);
 
     /* Epoch-aligned timestamps: all DAs in the same epoch produce
-     * identical valid_after/fresh_until/valid_until values. */
+     * identical valid_after/fresh_until/valid_until values.
+     * Grace window: if we're within 3 seconds of the NEXT epoch, round up.
+     * Prevents body-hash divergence when two DAs' timers straddle the
+     * hour boundary (e.g. 23:59:59 vs 00:00:01). */
     uint64_t now = (uint64_t)time(NULL);
     uint64_t epoch = (now / MOOR_CONSENSUS_INTERVAL) * MOOR_CONSENSUS_INTERVAL;
+    uint64_t next_epoch = epoch + MOOR_CONSENSUS_INTERVAL;
+    if (next_epoch - now <= 3)
+        epoch = next_epoch;
     config->consensus.valid_after = epoch;
     config->consensus.fresh_until = epoch + MOOR_CONSENSUS_INTERVAL;
     config->consensus.valid_until = epoch + MOOR_CONSENSUS_INTERVAL * 3;

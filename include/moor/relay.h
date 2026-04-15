@@ -30,7 +30,6 @@ typedef struct {
     moor_exit_policy_t exit_policy;
     int      pow_difficulty;        /* PoW difficulty for DA registration */
     uint32_t pow_memlimit;         /* Argon2id memory in bytes */
-    int      padding_mode;          /* Advanced padding bitmask */
     uint64_t mix_delay;            /* Poisson mixing mean delay (ms, 0=disabled) */
     char     nickname[32];          /* Human-readable relay name */
     uint8_t  prev_onion_pk[32];     /* Previous onion key (for rotation overlap) */

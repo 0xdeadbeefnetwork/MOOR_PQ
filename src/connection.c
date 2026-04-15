@@ -967,11 +967,12 @@ int link_handshake_client_pq(moor_connection_t *conn,
     while (ct_total < MOOR_KEM_CT_LEN) {
         moor_cell_t kcell;
         int rr = 0;
-        /* TODO: replace spin-loop with async I/O (temporary fix) */
-        for (int attempt = 0; attempt < 1000; attempt++) {
+        for (;;) {
             rr = moor_connection_recv_cell(conn, &kcell);
             if (rr != 0) break;
-            usleep(1000);
+            struct pollfd pfd = { conn->fd, POLLIN, 0 };
+            int pr = poll(&pfd, 1, MOOR_HANDSHAKE_TIMEOUT * 1000);
+            if (pr <= 0) { rr = -1; break; }
         }
         if (rr <= 0 || kcell.command != CELL_KEM_CT) {
             LOG_ERROR("PQ hybrid: recv kyber_ct cell failed");
@@ -1034,19 +1035,18 @@ int link_handshake_server_pq(moor_connection_t *conn,
     conn->state = CONN_STATE_OPEN;
     conn->pq_handshake_done = 0;
 
-    /* Step 2: Receive kyber_pk from client via AEAD cell channel.
-     * recv_cell uses poll(0) which returns immediately if no data.
-     * In this sync handshake context, we need to wait for data. */
+    /* Step 2: Receive kyber_pk from client via AEAD cell channel */
     uint8_t kem_pk[MOOR_KEM_PK_LEN];
     size_t total = 0;
     while (total < MOOR_KEM_PK_LEN) {
         moor_cell_t kcell;
         int rr = 0;
-        /* TODO: replace spin-loop with async I/O (temporary fix) */
-        for (int attempt = 0; attempt < 1000; attempt++) {
+        for (;;) {
             rr = moor_connection_recv_cell(conn, &kcell);
-            if (rr != 0) break; /* got data or error */
-            usleep(1000); /* wait 1ms before retry */
+            if (rr != 0) break;
+            struct pollfd pfd = { conn->fd, POLLIN, 0 };
+            int pr = poll(&pfd, 1, MOOR_HANDSHAKE_TIMEOUT * 1000);
+            if (pr <= 0) { rr = -1; break; }
         }
         if (rr <= 0 || kcell.command != CELL_KEM_CT) {
             LOG_ERROR("PQ hybrid server: recv kyber_pk cell failed");

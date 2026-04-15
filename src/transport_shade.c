@@ -651,7 +651,3 @@ const moor_transport_t moor_shade_transport = {
     .transport_has_pending = NULL,
     .transport_free       = shade_free,
 };
-
-int moor_transport_shade_register(void) {
-    return moor_transport_register(&moor_shade_transport);
-}

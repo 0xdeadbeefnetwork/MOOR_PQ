@@ -545,14 +545,6 @@ int moor_config_set(moor_config_t *cfg, const char *key, const char *value) {
     else if (strcmp(key, "GeoIPv6File") == 0) {
         snprintf(cfg->geoip6_file, sizeof(cfg->geoip6_file), "%s", value);
     }
-    else if (strcmp(key, "PaddingMode") == 0) {
-        cfg->padding_mode = 0;
-        if (strstr(value, "constant")) cfg->padding_mode |= MOOR_PADDING_CONSTANT;
-        if (strstr(value, "adaptive")) cfg->padding_mode |= MOOR_PADDING_ADAPTIVE;
-        if (strstr(value, "jitter"))   cfg->padding_mode |= MOOR_PADDING_JITTER;
-        if (strstr(value, "all"))      cfg->padding_mode = MOOR_PADDING_ALL;
-        if (strcmp(value, "none") == 0) cfg->padding_mode = 0;
-    }
     else if (strcmp(key, "Conflux") == 0) {
         cfg->conflux = atoi(value);
     }
@@ -738,7 +730,6 @@ int moor_config_reload(moor_config_t *cfg, const char *path) {
     /* Only update safe fields -- NOT mode, bind_addr, ports, identity keys */
     cfg->bandwidth = temp.bandwidth;
     cfg->exit_policy = temp.exit_policy;
-    cfg->padding_mode = temp.padding_mode;
     cfg->verbose = temp.verbose;
     cfg->hs_pow_difficulty = temp.hs_pow_difficulty;
     cfg->padding = temp.padding;

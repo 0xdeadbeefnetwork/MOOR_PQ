@@ -116,8 +116,6 @@ typedef struct moor_circuit {
     uint8_t  pq_key_seed[32];           /* DH key_seed preserved while awaiting KEM CT */
     int      pq_kem_pending;            /* 1 = waiting for CELL_KEM_CT to complete CREATE_PQ */
     struct moor_conflux_set *conflux;   /* Multi-path set (NULL if unused) */
-    /* Advanced padding state */
-    int      padding_mode;              /* Bitmask: constant|adaptive|jitter */
     /* WTF-PAD adaptive padding state machine */
     wfpad_circuit_state_t wfpad_state;
     uint64_t last_cell_time;            /* Timestamp of last cell processed (OOM) */

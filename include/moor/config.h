@@ -106,9 +106,6 @@ typedef struct {
     char            geoip_file[256];
     char            geoip6_file[256];
 
-    /* Advanced padding mode (bitmask: constant=1, adaptive=2, jitter=4) */
-    int             padding_mode;
-
     /* Conflux multi-path */
     int             conflux;
     int             conflux_legs;
