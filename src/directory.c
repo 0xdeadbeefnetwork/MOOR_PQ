@@ -3139,7 +3139,22 @@ int moor_client_fetch_consensus(moor_consensus_t *cons,
     }
     close(fd);
 
-    int ret = moor_consensus_deserialize(cons, buf, len);
+    /* Transparent decompression: mirrors may send MZLB-compressed data */
+    uint8_t *parse_buf = buf;
+    size_t parse_len = len;
+    uint8_t *decompressed = NULL;
+    if (moor_consensus_is_compressed(buf, len)) {
+        size_t dec_len = 0;
+        if (moor_consensus_decompress(buf, len, &decompressed, &dec_len) != 0) {
+            free(buf);
+            return -1;
+        }
+        parse_buf = decompressed;
+        parse_len = dec_len;
+    }
+
+    int ret = moor_consensus_deserialize(cons, parse_buf, parse_len);
+    free(decompressed);
     free(buf);
 
     if (ret > 0) {
@@ -4370,14 +4385,57 @@ void moor_da_compute_flags_statistical(moor_da_config_t *config) {
 /* ---- Directory Mirror (Relay-side consensus caching) ---- */
 
 static moor_consensus_t g_dir_cache = {0};
-static int g_dir_cache_valid = 0;
+static int              g_dir_cache_valid = 0;
+static pthread_mutex_t  g_dir_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Pre-serialized consensus snapshot (same text format the DA serves).
+ * Swap atomically under g_dir_cache_lock so readers always see a
+ * consistent pointer+length pair. */
+static uint8_t         *g_dir_published_buf = NULL;
+static int              g_dir_published_len = 0;
+/* Compressed snapshot for bandwidth savings (~2.5x with zlib) */
+static uint8_t         *g_dir_compressed_buf = NULL;
+static size_t           g_dir_compressed_len = 0;
 
 int moor_relay_dir_has_cache(void) {
-    return g_dir_cache_valid;
+    pthread_mutex_lock(&g_dir_cache_lock);
+    int valid = g_dir_cache_valid;
+    pthread_mutex_unlock(&g_dir_cache_lock);
+    return valid;
+}
+
+/* Install a pre-fetched consensus into the dir cache.
+ * Serializes, compresses, and atomically swaps the published snapshot. */
+int moor_relay_dir_cache_update(const moor_consensus_t *fresh) {
+    size_t buf_sz = moor_consensus_wire_size(fresh);
+    if (buf_sz < 1024) buf_sz = 1024;
+    uint8_t *buf = malloc(buf_sz);
+    if (!buf) return -1;
+    int len = moor_consensus_serialize(buf, buf_sz, fresh);
+    if (len <= 0) { free(buf); return -1; }
+
+    uint8_t *comp = NULL;
+    size_t comp_len = 0;
+    moor_consensus_compress(buf, (size_t)len, &comp, &comp_len);
+
+    pthread_mutex_lock(&g_dir_cache_lock);
+    uint8_t *old_buf = g_dir_published_buf;
+    uint8_t *old_comp = g_dir_compressed_buf;
+    moor_consensus_copy(&g_dir_cache, fresh);
+    g_dir_published_buf = buf;
+    g_dir_published_len = len;
+    g_dir_compressed_buf = comp;
+    g_dir_compressed_len = comp_len;
+    g_dir_cache_valid = 1;
+    pthread_mutex_unlock(&g_dir_cache_lock);
+
+    free(old_buf);
+    free(old_comp);
+    LOG_INFO("dir mirror: cached consensus with %u relays (%d bytes, %zu compressed)",
+             fresh->num_relays, len, comp_len);
+    return 0;
 }
 
 int moor_relay_dir_cache_refresh(const char *da_address, uint16_t da_port) {
-    /* Heap-alloc to avoid ~3.5MB on stack */
     moor_consensus_t *fresh = calloc(1, sizeof(moor_consensus_t));
     if (!fresh) return -1;
     if (moor_client_fetch_consensus(fresh, da_address, da_port) != 0) {
@@ -4385,17 +4443,13 @@ int moor_relay_dir_cache_refresh(const char *da_address, uint16_t da_port) {
         free(fresh);
         return -1;
     }
-    moor_consensus_copy(&g_dir_cache, fresh);
+    int rc = moor_relay_dir_cache_update(fresh);
     moor_consensus_cleanup(fresh);
     free(fresh);
-    g_dir_cache_valid = 1;
-    LOG_INFO("dir mirror: cached consensus with %u relays",
-             g_dir_cache.num_relays);
-    return 0;
+    return rc;
 }
 
 int moor_relay_dir_handle_request(int client_fd) {
-    /* Simple plaintext protocol: read "CONSENSUS\n", respond with serialized consensus */
     char req[512];
     ssize_t n = recv(client_fd, req, sizeof(req) - 1, 0);
     if (n <= 0) return -1;
@@ -4422,54 +4476,43 @@ int moor_relay_dir_handle_request(int client_fd) {
         return -1;
     }
 
-    if (!g_dir_cache_valid) {
-        const char *err = "ERROR no cached consensus\n";
-        send(client_fd, err, strlen(err), 0);
+    /* Serve pre-serialized consensus using the same wire format as the DA:
+     *   len(4 bytes big-endian) + serialized text consensus (possibly compressed)
+     * Clients call moor_client_fetch_consensus() which handles decompression
+     * and verifies DA signatures — mirrors cannot forge consensus.
+     * Hold g_dir_cache_lock during send to prevent free-during-send.
+     * Bounded by the 5s socket send timeout set in relay_dir_accept_cb. */
+    pthread_mutex_lock(&g_dir_cache_lock);
+    if (!g_dir_cache_valid || !g_dir_published_buf || g_dir_published_len <= 0) {
+        pthread_mutex_unlock(&g_dir_cache_lock);
+        send(client_fd, "ERR\n", 4, 0);
         return -1;
     }
 
-    /* Serialize consensus and send (same format as DA) */
-    /* Header: "CONSENSUS\n" + num_relays(4) + valid_after(8) + valid_until(8) + sig(64) */
-    uint8_t hdr[10 + 4 + 8 + 8 + 64];
-    memcpy(hdr, "CONSENSUS\n", 10);
-    uint32_t nr = g_dir_cache.num_relays;
-    hdr[10] = (uint8_t)(nr >> 24);
-    hdr[11] = (uint8_t)(nr >> 16);
-    hdr[12] = (uint8_t)(nr >> 8);
-    hdr[13] = (uint8_t)(nr);
-    for (int i = 0; i < 8; i++) {
-        hdr[14 + i] = (uint8_t)(g_dir_cache.valid_after >> ((7 - i) * 8));
-        hdr[22 + i] = (uint8_t)(g_dir_cache.valid_until >> ((7 - i) * 8));
-    }
-    memcpy(hdr + 30, g_dir_cache.da_sigs[0].signature, 64);
-
-    if (send(client_fd, (const char *)hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr))
-        return -1;
-
-    /* Send each relay descriptor */
-    for (uint32_t i = 0; i < nr && i < MOOR_MAX_RELAYS; i++) {
-        const moor_node_descriptor_t *r = &g_dir_cache.relays[i];
-        /* Pack: identity_pk(32) + onion_pk(32) + addr(64) + or_port(2) + dir_port(2) + flags(4) + bw(8) */
-        uint8_t desc[144];
-        memcpy(desc, r->identity_pk, 32);
-        memcpy(desc + 32, r->onion_pk, 32);
-        memcpy(desc + 64, r->address, 64);
-        desc[128] = (uint8_t)(r->or_port >> 8);
-        desc[129] = (uint8_t)(r->or_port);
-        desc[130] = (uint8_t)(r->dir_port >> 8);
-        desc[131] = (uint8_t)(r->dir_port);
-        desc[132] = (uint8_t)(r->flags >> 24);
-        desc[133] = (uint8_t)(r->flags >> 16);
-        desc[134] = (uint8_t)(r->flags >> 8);
-        desc[135] = (uint8_t)(r->flags);
-        for (int j = 0; j < 8; j++)
-            desc[136 + j] = (uint8_t)(r->bandwidth >> ((7 - j) * 8));
-        if (send(client_fd, (const char *)desc, 144, 0) != 144)
-            return -1;
+    const uint8_t *send_buf;
+    size_t send_len;
+    if (g_dir_compressed_buf && g_dir_compressed_len > 0) {
+        send_buf = g_dir_compressed_buf;
+        send_len = g_dir_compressed_len;
+    } else {
+        send_buf = g_dir_published_buf;
+        send_len = (size_t)g_dir_published_len;
     }
 
-    LOG_DEBUG("dir mirror: served consensus to client");
-    return 0;
+    uint8_t len_buf[4];
+    uint32_t sl = (uint32_t)send_len;
+    len_buf[0] = (uint8_t)(sl >> 24);
+    len_buf[1] = (uint8_t)(sl >> 16);
+    len_buf[2] = (uint8_t)(sl >> 8);
+    len_buf[3] = (uint8_t)(sl);
+
+    int ok = (send(client_fd, (char *)len_buf, 4, 0) == 4 &&
+              send(client_fd, (char *)send_buf, send_len, 0) == (ssize_t)send_len);
+    pthread_mutex_unlock(&g_dir_cache_lock);
+
+    if (ok)
+        LOG_DEBUG("dir mirror: served consensus to client (%zu bytes)", send_len);
+    return ok ? 0 : -1;
 }
 
 int moor_client_fetch_consensus_with_mirrors(moor_consensus_t *cons,

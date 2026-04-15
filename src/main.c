@@ -263,6 +263,9 @@ static void parse_args_into_config(moor_config_t *cfg, int argc, char **argv) {
         else if (strcmp(argv[i], "--dir-port") == 0 && i + 1 < argc) {
             moor_config_set(cfg, "DirPort", argv[++i]);
         }
+        else if (strcmp(argv[i], "--dir-cache") == 0) {
+            moor_config_set(cfg, "DirCache", "1");
+        }
         else if (strcmp(argv[i], "--socks-port") == 0 && i + 1 < argc) {
             moor_config_set(cfg, "SocksPort", argv[++i]);
         }
@@ -1257,6 +1260,10 @@ static void *relay_consensus_retry_thread(void *arg) {
         moor_relay_set_consensus(&fresh);
         LOG_INFO("relay: refreshed consensus (%u relays)", fresh.num_relays);
 
+        /* Piggyback dir cache update on consensus refresh */
+        if (g_config.dir_cache && g_dir_port > 0)
+            moor_relay_dir_cache_update(&fresh);
+
         if (!g_is_bridge) {
             if (moor_relay_register(&g_relay_cfg) == 0)
                 g_reg_registered = 1;
@@ -1292,6 +1299,35 @@ static void relay_consensus_retry_cb(void *arg) {
         } else {
             __sync_lock_release(&g_relay_cons_retry_running);
         }
+    }
+}
+
+/* Dir cache refresh: dedicated fallback timer.
+ * The primary refresh path piggybacks on relay_consensus_retry_thread,
+ * but this timer ensures the dir cache stays fresh even if that path
+ * is delayed or the relay hasn't registered yet. */
+static volatile int g_dir_cache_refresh_running = 0;
+
+static void *relay_dir_cache_refresh_thread(void *arg) {
+    (void)arg;
+    moor_consensus_t fresh = {0};
+    if (moor_client_fetch_consensus_multi(&fresh, g_da_list, g_num_das) == 0)
+        moor_relay_dir_cache_update(&fresh);
+    moor_consensus_cleanup(&fresh);
+    __sync_lock_release(&g_dir_cache_refresh_running);
+    return NULL;
+}
+
+static void relay_dir_cache_timer_cb(void *arg) {
+    (void)arg;
+    if (g_dir_cache_refresh_running)
+        return;
+    if (__sync_lock_test_and_set(&g_dir_cache_refresh_running, 1) == 0) {
+        pthread_t t;
+        if (pthread_create(&t, NULL, relay_dir_cache_refresh_thread, NULL) == 0)
+            pthread_detach(t);
+        else
+            __sync_lock_release(&g_dir_cache_refresh_running);
     }
 }
 
@@ -1919,6 +1955,16 @@ static int run_relay(void) {
             moor_event_add(dir_listen, MOOR_EVENT_READ, relay_dir_accept_cb, NULL);
             LOG_INFO("directory mirror on %s:%u", g_bind_addr, g_dir_port);
         }
+        /* Dedicated refresh timer: CONSENSUS_INTERVAL/2 ± 5 min jitter.
+         * Safety net in case relay_consensus_retry_thread is delayed. */
+        uint32_t jitter_raw;
+        moor_crypto_random((uint8_t *)&jitter_raw, sizeof(jitter_raw));
+        int jitter_ms = (int)(jitter_raw % (10 * 60 * 1000)) - 5 * 60 * 1000;
+        int interval_ms = (int)(MOOR_CONSENSUS_INTERVAL * 1000 / 2) + jitter_ms;
+        if (interval_ms < 60 * 1000) interval_ms = 60 * 1000;
+        moor_event_add_timer((uint64_t)interval_ms, relay_dir_cache_timer_cb, NULL);
+        LOG_INFO("dir mirror: refresh timer every %d s (±5 min jitter)",
+                 interval_ms / 1000);
     }
 
     /* Connection reaper: close idle connections every 30s to prevent
@@ -1937,13 +1983,62 @@ static int run_relay(void) {
 /* Consensus refresh timer callback */
 static moor_consensus_t *g_live_consensus = NULL;
 
-/* Try fetching consensus through a guard relay's dir_port (directory guard).
- * Falls back to direct DA fetch on failure. */
+/* Find a relay's dir_port by identity_pk in the consensus.
+ * Returns 0 if not found or relay has no dir_port. */
+static uint16_t find_relay_dir_port(const moor_consensus_t *cons,
+                                     const uint8_t identity_pk[32],
+                                     char *addr_out, size_t addr_sz) {
+    for (uint32_t i = 0; i < cons->num_relays; i++) {
+        if (sodium_memcmp(cons->relays[i].identity_pk, identity_pk, 32) == 0) {
+            if (addr_out && addr_sz > 0)
+                snprintf(addr_out, addr_sz, "%s", cons->relays[i].address);
+            return cons->relays[i].dir_port;
+        }
+    }
+    return 0;
+}
+
+/* Try fetching consensus through a directory guard (Tor Prop 207).
+ * Prefers the client's own primary/confirmed guards to avoid leaking
+ * our IP to arbitrary relays.  Falls back to any running guard with
+ * dir_port if the client has no established guards yet. */
 static int fetch_consensus_via_dir_guard(moor_consensus_t *fresh) {
     moor_consensus_t *current = moor_socks5_get_consensus();
     if (!current || current->num_relays == 0) return -1;
 
-    /* Pick a guard relay that has a dir_port */
+    /* Try the client's own guards first — these already know our IP */
+    moor_guard_state_t *gs = moor_pathbias_get_state();
+    if (gs) {
+        /* Primary guards (highest priority) */
+        for (int p = 0; p < gs->num_primary; p++) {
+            int idx = gs->primary_indices[p];
+            const moor_guard_entry_t *g = &gs->sampled[idx];
+            if (!g->is_reachable) continue;
+            char addr[64];
+            uint16_t dp = find_relay_dir_port(current, g->identity_pk, addr, sizeof(addr));
+            if (dp == 0) continue;
+            if (moor_client_fetch_consensus(fresh, addr, dp) == 0) {
+                LOG_INFO("consensus fetched via primary guard %s:%u", addr, dp);
+                return 0;
+            }
+        }
+        /* Confirmed guards (already connected at least once) */
+        for (int c = 0; c < gs->num_confirmed; c++) {
+            int idx = gs->confirmed_indices[c];
+            const moor_guard_entry_t *g = &gs->sampled[idx];
+            if (!g->is_reachable) continue;
+            char addr[64];
+            uint16_t dp = find_relay_dir_port(current, g->identity_pk, addr, sizeof(addr));
+            if (dp == 0) continue;
+            if (moor_client_fetch_consensus(fresh, addr, dp) == 0) {
+                LOG_INFO("consensus fetched via confirmed guard %s:%u", addr, dp);
+                return 0;
+            }
+        }
+    }
+
+    /* Fallback: any running guard with dir_port (e.g. during bootstrap
+     * before we've established guard state) */
     for (uint32_t i = 0; i < current->num_relays; i++) {
         const moor_node_descriptor_t *r = &current->relays[i];
         if (!(r->flags & NODE_FLAG_GUARD)) continue;
@@ -3272,13 +3367,11 @@ static int run_hs(void) {
         printf("Hidden service %d address: %s\n", h, hs_config.moor_address);
     }
 
-    /* After init (which does DHT publish synchronously before the event
-     * loop starts), set skip_dht_publish so periodic republish only does
-     * the fast DA publish.  DHT publish builds synchronous circuits to
-     * 6 relays, blocking the event loop for 20-30s and killing all intro
-     * and RP circuits via connection timeout. */
-    for (int h = 0; h < hs_count; h++)
-        g_hs_configs[h].skip_dht_publish = 1;
+    /* DHT republish runs in hs_desc_republish_thread (background pthread),
+     * so it won't block the event loop.  Keep skip_dht_publish=0 so the
+     * periodic republish pushes descriptors to DHT with the current SRV.
+     * Without this, DHT entries go stale after hourly SRV rotation and
+     * clients can't find the service via DHT. */
 
     /* R10-CC3: Register periodic timers for HS maintenance */
     if (moor_event_add_timer(10 * 60 * 1000, hs_consensus_refresh_cb, NULL) < 0 ||

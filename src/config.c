@@ -1091,62 +1091,8 @@ void moor_exit_policy_set_defaults(moor_exit_policy_t *policy) {
     for (int i = 0; i < count && policy->num_rules < MOOR_MAX_EXIT_RULES; i++) {
         moor_exit_policy_rule_t rule;
         memset(&rule, 0, sizeof(rule));
-        /* parse_exit_policy_rule is static, so we use moor_config_set
-         * indirectly via a temporary config. Instead, inline the parse. */
-        char buf[128];
-        strncpy(buf, defaults[i], sizeof(buf) - 1);
-        buf[sizeof(buf) - 1] = '\0';
-
-        /* Split action */
-        char *space = strchr(buf, ' ');
-        if (!space) continue;
-        *space = '\0';
-        char *pattern = space + 1;
-
-        if (strcmp(buf, "reject") == 0)
-            rule.action = 0;
-        else
-            rule.action = 1;
-
-        /* Split addr:port */
-        char *colon = strrchr(pattern, ':');
-        if (!colon) continue;
-        *colon = '\0';
-        char *addr_part = pattern;
-        char *port_part = colon + 1;
-
-        if (strcmp(addr_part, "*") == 0) {
-            rule.addr_wildcard = 1;
-        } else {
-            rule.addr_wildcard = 0;
-            char *slash = strchr(addr_part, '/');
-            int prefix = 32;
-            if (slash) {
-                *slash = '\0';
-                if (!slash[1] || !isdigit((unsigned char)slash[1])) continue;
-                prefix = atoi(slash + 1);
-            }
-            struct in_addr ia;
-            if (inet_pton(AF_INET, addr_part, &ia) != 1) continue;
-            rule.addr = ntohl(ia.s_addr);
-            if (prefix == 0)
-                rule.mask = 0;
-            else
-                rule.mask = (0xFFFFFFFFU << (32 - prefix));
-            rule.addr &= rule.mask;
-        }
-
-        if (strcmp(port_part, "*") == 0) {
-            rule.port_wildcard = 1;
-            rule.port_lo = 0;
-            rule.port_hi = 65535;
-        } else {
-            rule.port_wildcard = 0;
-            int p = atoi(port_part);
-            rule.port_lo = (uint16_t)p;
-            rule.port_hi = (uint16_t)p;
-        }
-
+        if (parse_exit_policy_rule(&rule, defaults[i]) != 0)
+            continue;
         policy->rules[policy->num_rules++] = rule;
     }
 }

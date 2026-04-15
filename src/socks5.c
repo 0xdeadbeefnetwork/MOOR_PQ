@@ -149,19 +149,42 @@ static void *hs_connect_worker(void *arg) {
     uint8_t hs_kem_pk[1184];
     int hs_kem_avail = 0;
 
-    if (moor_hs_client_connect_start(w->address, &rp_circ,
-                                      &w->cons,
-                                      w->da_address, w->da_port,
-                                      w->identity_pk, w->identity_sk,
-                                      hs_kem_pk, &hs_kem_avail) == 0) {
-        r->result = 0;
-        r->rp_circ = rp_circ;
-        r->hs_kem_available = hs_kem_avail;
-        if (hs_kem_avail)
-            memcpy(r->hs_kem_pk, hs_kem_pk, 1184);
-        LOG_INFO("HS async connect: success for %s", w->address);
-    } else {
-        LOG_WARN("HS async connect: failed for %s", w->address);
+    /* Try up to 2 attempts: first with the copied consensus, then with
+     * a freshly fetched one.  Handles the case where the worker's consensus
+     * has a stale SRV (hourly rotation), causing DHT lookups to miss. */
+    for (int attempt = 0; attempt < 2; attempt++) {
+        rp_circ = NULL;
+        hs_kem_avail = 0;
+
+        if (moor_hs_client_connect_start(w->address, &rp_circ,
+                                          &w->cons,
+                                          w->da_address, w->da_port,
+                                          w->identity_pk, w->identity_sk,
+                                          hs_kem_pk, &hs_kem_avail) == 0) {
+            r->result = 0;
+            r->rp_circ = rp_circ;
+            r->hs_kem_available = hs_kem_avail;
+            if (hs_kem_avail)
+                memcpy(r->hs_kem_pk, hs_kem_pk, 1184);
+            LOG_INFO("HS async connect: success for %s (attempt %d)",
+                     w->address, attempt + 1);
+            break;
+        }
+
+        if (attempt == 0) {
+            /* First attempt failed — re-fetch consensus in case SRV changed */
+            LOG_WARN("HS async connect: attempt 1 failed for %s, refreshing consensus",
+                     w->address);
+            moor_consensus_t fresh = {0};
+            if (moor_client_fetch_consensus(&fresh, w->da_address, w->da_port) == 0) {
+                moor_consensus_cleanup(&w->cons);
+                w->cons = fresh;  /* transfer ownership */
+            } else {
+                moor_consensus_cleanup(&fresh);
+            }
+        } else {
+            LOG_WARN("HS async connect: failed for %s after retry", w->address);
+        }
     }
 
     hs_connect_push_result(r);

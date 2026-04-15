@@ -255,6 +255,7 @@ void moor_da_compute_flags_statistical(moor_da_config_t *config);
 
 /* Directory mirror on relays */
 int moor_relay_dir_cache_refresh(const char *da_address, uint16_t da_port);
+int moor_relay_dir_cache_update(const moor_consensus_t *fresh);
 int moor_relay_dir_handle_request(int client_fd);
 int moor_relay_dir_has_cache(void);
 

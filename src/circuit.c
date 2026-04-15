@@ -2225,8 +2225,13 @@ void moor_circuit_check_timeouts(void) {
         }
 
         /* Circuit rotation: tear down old established circuits.
+         * HS rendezvous circuits get a longer lifetime (1h vs 10m) so idle
+         * .moor connections survive consensus refreshes without reconnecting.
          * Skip circuits with active streams to avoid killing live connections. */
-        if (circ->is_client && age > MOOR_CIRCUIT_ROTATE_SECS) {
+        uint64_t rotate_age = (circ->cc_path_type == MOOR_CC_PATH_ONION)
+                              ? MOOR_HS_CIRCUIT_MAX_AGE
+                              : MOOR_CIRCUIT_ROTATE_SECS;
+        if (circ->is_client && age > rotate_age) {
             int has_streams = 0;
             for (int j = 0; j < MOOR_MAX_STREAMS; j++) {
                 if (circ->streams[j].stream_id != 0) {
@@ -2237,7 +2242,7 @@ void moor_circuit_check_timeouts(void) {
             if (has_streams) {
                 /* Don't rotate -- still has active streams.
                  * Force-kill after 2x rotation interval to prevent leaks. */
-                if (age > MOOR_CIRCUIT_ROTATE_SECS * 2) {
+                if (age > rotate_age * 2) {
                     LOG_WARN("circuit %u: force-recycled (still had streams, age %llus)",
                              circ->circuit_id, (unsigned long long)age);
                     if (circ->conn && circ->conn->state == CONN_STATE_OPEN) {
