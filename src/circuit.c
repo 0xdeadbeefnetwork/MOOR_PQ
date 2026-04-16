@@ -4343,7 +4343,12 @@ static void cbuild_on_connect(moor_connection_t *conn, int status, void *arg) {
     /* Finish channel setup if this was a new async connection */
     if (circ->chan && circ->chan->state == CHAN_STATE_OPENING) {
         moor_channel_open(circ->chan, conn);
-        moor_circuitmux_attach(circ->chan, circ, circ->circuit_id);
+        if (moor_circuitmux_attach(circ->chan, circ, circ->circuit_id) != 0) {
+            LOG_ERROR("circuit %u: mux full, cannot schedule — aborting build",
+                      circ->circuit_id);
+            moor_circuit_mark_for_close(circ, DESTROY_REASON_RESOURCELIMIT);
+            return;
+        }
     }
 
     circ->conn = conn;
@@ -4446,7 +4451,16 @@ int moor_circuit_build_async(moor_circuit_t *circ,
         /* Reuse existing OPEN channel — milliseconds instead of seconds */
         circ->chan = chan;
         circ->conn = chan->conn;
-        moor_circuitmux_attach(chan, circ, circ->circuit_id);
+        if (moor_circuitmux_attach(chan, circ, circ->circuit_id) != 0) {
+            LOG_ERROR("circuit %u: mux full on channel reuse, aborting build",
+                      circ->circuit_id);
+            if (conn != chan->conn)
+                moor_connection_free(conn);
+            moor_crypto_wipe(ctx, sizeof(*ctx));
+            free(ctx);
+            circ->build_ctx = NULL;
+            return -1;
+        }
         if (conn != chan->conn)
             moor_connection_free(conn);
         cbuild_on_connect(chan->conn, 0, circ);

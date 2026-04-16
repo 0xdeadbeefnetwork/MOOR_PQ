@@ -605,7 +605,7 @@ int moor_hs_establish_intro(moor_hs_config_t *config,
         if (moor_circuit_encrypt_forward(circ, &cell) != 0 ||
             moor_connection_send_cell(circ->conn, &cell) != 0) {
             LOG_WARN("HS: failed to send ESTABLISH_INTRO");
-            moor_circuit_free(circ);
+            moor_circuit_destroy(circ);
             if (conn->fd >= 0)
                 moor_connection_close(conn);
             else
@@ -656,7 +656,7 @@ int moor_hs_establish_intro(moor_hs_config_t *config,
             }
             if (!got_ack) {
                 LOG_WARN("HS: INTRO_ESTABLISHED timeout for slot %d, dropping", i);
-                moor_circuit_free(circ);
+                moor_circuit_destroy(circ);
                 if (conn->fd >= 0)
                     moor_connection_close(conn);
                 else

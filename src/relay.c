@@ -2996,12 +2996,14 @@ int moor_relay_handle_relay(moor_connection_t *conn,
         }
 
         /* Tor-aligned: per-circuit cell queue limit (DoS defense).
-         * Kill circuits that accumulate too many queued cells —
-         * prevents a single circuit from exhausting relay memory. */
-        circ->relay_cells_queued++;
-        if (circ->relay_cells_queued > MOOR_CIRC_CELL_QUEUE_MAX) {
-            LOG_WARN("circuit %u: cell queue limit exceeded (%u > %u), destroying",
-                     circ->circuit_id, circ->relay_cells_queued,
+         * Kill circuits that accumulate too many *currently queued*
+         * cells — prevents a single circuit from exhausting relay
+         * memory.  Uses live queue depth so the circuit is not killed
+         * simply for being long-lived. */
+        uint32_t depth = circ->cell_queue_n.count + circ->cell_queue_p.count;
+        if (depth > MOOR_CIRC_CELL_QUEUE_MAX) {
+            LOG_WARN("circuit %u: cell queue depth exceeded (%u > %u), destroying",
+                     circ->circuit_id, depth,
                      MOOR_CIRC_CELL_QUEUE_MAX);
             moor_relay_handle_destroy(conn, cell);
             return -1;

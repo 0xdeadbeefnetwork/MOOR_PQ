@@ -28,7 +28,7 @@
 /* ===== INTERNAL -- Pools & Capacity ===== */
 #define MOOR_MAX_RELAYS         8192    /* Max relays in consensus */
 /* Circuits: dynamically allocated, no hard cap (see circuit.c) */
-#define MOOR_MAX_CONNECTIONS    1024    /* Max TCP connections */
+#define MOOR_MAX_CONNECTIONS    4096    /* Max TCP connections */
 #define MOOR_MAX_STREAMS        64      /* Max streams per circuit */
 #define MOOR_MAX_INTRO_POINTS   10      /* Max intro points per HS (Tor: 3-10) */
 #define MOOR_DEFAULT_INTRO_POINTS 6    /* Default intro points per HS (Tor default: 6) */

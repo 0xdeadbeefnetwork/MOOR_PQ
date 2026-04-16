@@ -44,7 +44,7 @@ typedef struct {
 } moor_mux_entry_t;
 
 /* ---- Circuit multiplexer (per-channel) ---- */
-#define MOOR_MUX_MAX  256  /* max circuits per channel */
+#define MOOR_MUX_MAX  1024 /* max circuits per channel */
 
 typedef struct {
     moor_mux_entry_t entries[MOOR_MUX_MAX];

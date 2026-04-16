@@ -29,7 +29,7 @@
 #include <poll.h>
 
 #define MAX_SOCKS5_CLIENTS 128
-#define MAX_CIRCUIT_CACHE  32
+#define MAX_CIRCUIT_CACHE  256
 #define MAX_HS_PENDING     8
 #define HS_CONNECT_TIMEOUT 60  /* seconds to wait for RENDEZVOUS2 */
 
@@ -412,7 +412,12 @@ static void assign_circuits_to_waiting_clients(void) {
             moor_event_remove(client->client_fd);
             close(client->client_fd);
             client->client_fd = -1;
+            moor_circuit_t *bad = client->circuit;
             client->circuit = NULL;
+            if (bad) {
+                moor_circuit_mark_for_close(bad, DESTROY_REASON_INTERNAL);
+                moor_socks5_invalidate_circuit(bad);
+            }
         }
     }
 }
@@ -549,17 +554,22 @@ static void prebuilt_timer_cb(void *arg) {
  * try the next one.  Callers MUST use pb->circuit->conn (authoritative)
  * instead of pb->conn (may be stale after connection death). */
 static prebuilt_entry_t *prebuilt_pop(void) {
+    uint64_t now = (uint64_t)time(NULL);
     while (g_prebuilt_pool_count > 0) {
         prebuilt_entry_t *e = &g_prebuilt_pool[--g_prebuilt_pool_count];
-        if (e->circuit && e->circuit->circuit_id != 0 &&
-            e->circuit->conn && e->circuit->conn->state == CONN_STATE_OPEN) {
+        int alive = e->circuit && e->circuit->circuit_id != 0 &&
+                    e->circuit->conn &&
+                    e->circuit->conn->state == CONN_STATE_OPEN;
+        int fresh = alive && (now - e->circuit->created_at) <
+                    MOOR_CIRCUIT_ROTATE_SECS;
+        if (alive && fresh) {
             e->conn = e->circuit->conn; /* refresh stale pointer */
             return e;
         }
-        /* Dead circuit -- destroy if not already freed */
+        /* Dead or aged-out -- destroy if not already freed */
         if (e->circuit && e->circuit->circuit_id != 0)
             moor_circuit_destroy(e->circuit);
-        LOG_DEBUG("prebuilt pool: discarded dead circuit");
+        LOG_DEBUG("prebuilt pool: discarded dead/aged circuit");
     }
     return NULL;
 }
