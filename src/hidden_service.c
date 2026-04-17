@@ -711,7 +711,8 @@ int moor_hs_publish_descriptor(moor_hs_config_t *config) {
      * included dead/NULL slots, publishing zero node_ids that clients
      * can't look up in their consensus — making the HS unreachable. */
     desc.num_intro_points = 0;
-    for (int i = 0; i < config->num_intro_circuits && desc.num_intro_points < 3; i++) {
+    for (int i = 0; i < config->num_intro_circuits &&
+         desc.num_intro_points < MOOR_MAX_INTRO_POINTS; i++) {
         moor_circuit_t *circ = config->intro_circuits[i];
         if (circ && circ->num_hops > 0 &&
             circ->conn && circ->conn->state == CONN_STATE_OPEN) {
@@ -744,12 +745,13 @@ int moor_hs_publish_descriptor(moor_hs_config_t *config) {
      * modify intro points / PoW params, re-encrypt, and re-publish with valid sig.
      * Now covers blinded_pk, intro_points, pow_seed, pow_difficulty.
      * Excludes onion_pk so signature verifies with client-auth (zeroed onion_pk). */
-    uint8_t extra_buf[256];
+    /* 32 blinded + 4 nip + MOOR_MAX_INTRO_POINTS*32 + 32 pow_seed + 1 pow_diff + 8 revision */
+    uint8_t extra_buf[32 + 4 + MOOR_MAX_INTRO_POINTS * 32 + 32 + 1 + 8];
     size_t epos = 0;
     memcpy(extra_buf + epos, desc.blinded_pk, 32); epos += 32;
     uint32_t nip = desc.num_intro_points;
     memcpy(extra_buf + epos, &nip, 4); epos += 4;
-    for (uint32_t ip = 0; ip < nip && ip < 3; ip++) {
+    for (uint32_t ip = 0; ip < nip && ip < MOOR_MAX_INTRO_POINTS; ip++) {
         memcpy(extra_buf + epos, desc.intro_points[ip].node_id, 32); epos += 32;
     }
     memcpy(extra_buf + epos, desc.pow_seed, 32); epos += 32;
@@ -1166,7 +1168,12 @@ int moor_hs_rendezvous(moor_hs_config_t *config,
     if (moor_circuit_encrypt_forward(rp_circ, &cell) != 0 ||
         moor_connection_send_cell(rp_circ->conn, &cell) != 0) {
         LOG_ERROR("HS rendezvous: failed to send RENDEZVOUS1");
-        moor_circuit_free(rp_circ);
+        /* Tear down the RP circuit properly: send DESTROY cells through
+         * the guard and free the conn.  moor_circuit_free alone would
+         * leak rp_conn and leave phantom circuits on the network. */
+        moor_circuit_destroy(rp_circ);
+        if (rp_conn->fd >= 0) close(rp_conn->fd);
+        moor_connection_free(rp_conn);
         free(heap_cons);
         moor_crypto_wipe(shared, 32);
         moor_crypto_wipe(eph_sk, 32);
@@ -1430,12 +1437,12 @@ verify_descriptor:
     /* Verify descriptor signature over address_hash + service_pk + content_hash.
      * Content hash covers blinded_pk, intro_points, pow_seed, pow_difficulty. */
     {
-        uint8_t extra_buf[256];
+        uint8_t extra_buf[32 + 4 + MOOR_MAX_INTRO_POINTS * 32 + 32 + 1 + 8];
         size_t epos = 0;
         memcpy(extra_buf + epos, hs_desc.blinded_pk, 32); epos += 32;
         uint32_t nip = hs_desc.num_intro_points;
         memcpy(extra_buf + epos, &nip, 4); epos += 4;
-        for (uint32_t ip = 0; ip < nip && ip < 3; ip++) {
+        for (uint32_t ip = 0; ip < nip && ip < MOOR_MAX_INTRO_POINTS; ip++) {
             memcpy(extra_buf + epos, hs_desc.intro_points[ip].node_id, 32);
             epos += 32;
         }

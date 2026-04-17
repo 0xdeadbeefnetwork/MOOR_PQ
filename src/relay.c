@@ -3722,6 +3722,10 @@ int moor_relay_register(const moor_relay_config_t *config) {
     desc.features |= NODE_FEATURE_PQ;
     /* CELL_KEM_CT wire format (v0.8+) -- required by DAs to join network */
     desc.features |= NODE_FEATURE_CELL_KEM;
+    /* V7: stamp this binary's git commit hash into the descriptor.
+     * DAs enforce strict equality — mixed-commit fleets cannot form. */
+    memcpy(desc.build_id, moor_build_id, sizeof(desc.build_id));
+    desc.features |= NODE_FEATURE_BUILD_ID;
     /* Protocol version: DAs reject descriptors below MOOR_MIN_PROTOCOL_VERSION */
     desc.protocol_version = MOOR_PROTOCOL_VERSION;
     memcpy(desc.kem_pk, config->kem_pk, MOOR_KEM_PK_LEN);

@@ -124,13 +124,15 @@ int moor_node_create_descriptor(moor_node_descriptor_t *desc,
     return ret;
 }
 
-/* Compute wire features: auto-set FAMILY/NICKNAME bits to match serialization */
+/* Compute wire features: auto-set FAMILY/NICKNAME/BUILD_ID bits to match serialization */
 static uint32_t desc_wire_features(const moor_node_descriptor_t *desc) {
     uint32_t f = desc->features;
     int is_v3 = (desc->num_family_members > 0);
     int has_v4 = (desc->nickname[0] != '\0' || desc->onion_key_version > 0);
+    int has_v7 = (desc->build_id[0] != '\0');
     if (is_v3 || has_v4) f |= NODE_FEATURE_FAMILY;
     if (has_v4)           f |= NODE_FEATURE_NICKNAME;
+    if (has_v7)           f |= NODE_FEATURE_BUILD_ID;
     return f;
 }
 
@@ -171,6 +173,8 @@ static size_t desc_sign_serialize(uint8_t *buf, const moor_node_descriptor_t *de
     memcpy(buf + off, desc->prev_onion_pk, 32); off += 32;
     for (int i = 3; i >= 0; i--) buf[off++] = (uint8_t)(desc->onion_key_version >> (i * 8));
     for (int i = 7; i >= 0; i--) buf[off++] = (uint8_t)(desc->onion_key_published >> (i * 8));
+    /* V7: build_id must be signed so a MITM can't strip it and bypass DA gating */
+    memcpy(buf + off, desc->build_id, 16); off += 16;
     return off;
 }
 
@@ -236,6 +240,7 @@ size_t moor_node_descriptor_signable_serialize(uint8_t *buf,
 #define DESC_V3_MAX_WIRE_SIZE 1707
 #define DESC_V4_EXTRA     140
 #define DESC_V5_EXTRA     128   /* contact_info(128) */
+#define DESC_V7_EXTRA     16    /* build_id(16) */
 
 int moor_node_descriptor_serialize(uint8_t *out, size_t out_len,
                                    const moor_node_descriptor_t *desc) {
@@ -243,21 +248,24 @@ int moor_node_descriptor_serialize(uint8_t *out, size_t out_len,
     int is_v2 = (desc->features != 0) || is_v3;
     int has_v4 = (desc->nickname[0] != '\0' || desc->onion_key_version > 0);
     int has_v5 = (desc->contact_info[0] != '\0');
+    int has_v7 = (desc->build_id[0] != '\0');
     size_t needed = is_v2 ? DESC_V2_WIRE_SIZE : DESC_WIRE_SIZE;
     if (is_v3)
         needed += 1 + (size_t)desc->num_family_members * 32 + 32;
-    if (has_v4 || has_v5) {
-        /* V4 requires V2+ base */
+    if (has_v4 || has_v5 || has_v7) {
+        /* V4+ requires V2+ base */
         if (!is_v2) { is_v2 = 1; needed = DESC_V2_WIRE_SIZE; }
-        /* V4 also requires V3 header (family count + family_id) */
+        /* V4+ also requires V3 header (family count + family_id) */
         if (!is_v3) needed += 1 + 32; /* num_family(1) + family_id(32) */
         needed += DESC_V4_EXTRA;
-        has_v4 = 1; /* V5 implies V4 present */
+        has_v4 = 1; /* V5/V7 imply V4 present */
     }
     if (has_v5)
         needed += DESC_V5_EXTRA;
     if (is_v2)
         needed += 2; /* V6: protocol_version */
+    if (has_v7)
+        needed += DESC_V7_EXTRA;
     if (out_len < needed) return -1;
 
     size_t off = 0;
@@ -277,11 +285,12 @@ int moor_node_descriptor_serialize(uint8_t *out, size_t out_len,
     memcpy(out + off, desc->signature, 64); off += 64;
 
     if (is_v2) {
-        /* Auto-set feature flags so deserializer can detect V3/V4/V5 */
+        /* Auto-set feature flags so deserializer can detect V3/V4/V5/V7 */
         uint32_t wire_features = desc->features;
         if (is_v3 || has_v4) wire_features |= NODE_FEATURE_FAMILY;
         if (has_v4)          wire_features |= NODE_FEATURE_NICKNAME;
         if (has_v5)          wire_features |= NODE_FEATURE_CONTACT;
+        if (has_v7)          wire_features |= NODE_FEATURE_BUILD_ID;
         out[off++] = (uint8_t)(wire_features >> 24);
         out[off++] = (uint8_t)(wire_features >> 16);
         out[off++] = (uint8_t)(wire_features >> 8);
@@ -330,6 +339,11 @@ int moor_node_descriptor_serialize(uint8_t *out, size_t out_len,
     if (is_v2) {
         out[off++] = (uint8_t)(desc->protocol_version >> 8);
         out[off++] = (uint8_t)(desc->protocol_version);
+    }
+
+    /* V7: build_id (16 bytes, fixed) — only written if non-empty */
+    if (has_v7) {
+        memcpy(out + off, desc->build_id, 16); off += 16;
     }
 
     return (int)off;
@@ -437,6 +451,19 @@ int moor_node_descriptor_deserialize(moor_node_descriptor_t *desc,
         if (off + 2 <= data_len) {
             desc->protocol_version = ((uint16_t)data[off] << 8) | data[off + 1];
             off += 2;
+        }
+
+        /* V7 extension: 16-byte build_id (gated by NODE_FEATURE_BUILD_ID) */
+        if ((desc->features & NODE_FEATURE_BUILD_ID) &&
+            off + 16 <= data_len) {
+            memcpy(desc->build_id, data + off, 16);
+            off += 16;
+            /* Sanitize for log safety: strip non-hex/printable (CWE-93) */
+            for (int c = 0; c < 16; c++) {
+                unsigned char ch = (unsigned char)desc->build_id[c];
+                if (ch == 0) break;
+                if (ch < 0x20 || ch >= 0x7F) desc->build_id[c] = '_';
+            }
         }
     }
 

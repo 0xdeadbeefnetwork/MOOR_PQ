@@ -176,7 +176,23 @@ static uint32_t parse_event_mask(const char *args) {
     if (strstr(args, "CIRC"))   mask |= MOOR_CTRL_EVENT_CIRC;
     if (strstr(args, "STREAM")) mask |= MOOR_CTRL_EVENT_STREAM;
     if (strstr(args, "BW"))     mask |= MOOR_CTRL_EVENT_BW;
+    if (strstr(args, "ORCONN")) mask |= MOOR_CTRL_EVENT_ORCONN;
     return mask;
+}
+
+/* Bootstrap state tracked for GETINFO status/bootstrap-phase */
+static int  g_bootstrap_pct = 0;
+static char g_bootstrap_tag[32] = "starting";
+static char g_bootstrap_summary[128] = "Starting";
+
+void moor_monitor_set_bootstrap(int percent, const char *tag, const char *summary) {
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    g_bootstrap_pct = percent;
+    if (tag)
+        snprintf(g_bootstrap_tag, sizeof(g_bootstrap_tag), "%s", tag);
+    if (summary)
+        snprintf(g_bootstrap_summary, sizeof(g_bootstrap_summary), "%s", summary);
 }
 
 /* Send a response to a control client */
@@ -266,6 +282,42 @@ static void handle_ctrl_command(moor_ctrl_client_t *client, const char *cmd) {
                 "250 OK\r\n",
                 g_stats.connections_active);
         }
+        else if (strcmp(key, "status/bootstrap-phase") == 0) {
+            /* Tor-compatible bootstrap-phase format: severity + progress */
+            const char *severity = (g_bootstrap_pct < 100) ? "NOTICE" : "NOTICE";
+            resp_len = snprintf(resp, sizeof(resp),
+                "250-status/bootstrap-phase=%s BOOTSTRAP PROGRESS=%d TAG=%s SUMMARY=\"%s\"\r\n"
+                "250 OK\r\n",
+                severity, g_bootstrap_pct, g_bootstrap_tag, g_bootstrap_summary);
+        }
+        else if (strcmp(key, "orconn-status") == 0) {
+            /* Dump channel list: one line per channel */
+            char body[4096];
+            size_t pos = 0;
+            int n_chan = moor_channel_count();
+            for (int ci = 0; ci < n_chan && pos < sizeof(body) - 256; ci++) {
+                moor_channel_t *ch = moor_channel_get_by_index(ci);
+                if (!ch) continue;
+                const char *st;
+                switch (ch->state) {
+                    case CHAN_STATE_OPEN:    st = "CONNECTED"; break;
+                    case CHAN_STATE_OPENING: st = "LAUNCHED";  break;
+                    case CHAN_STATE_CLOSING: st = "CLOSED";    break;
+                    case CHAN_STATE_ERROR:   st = "FAILED";    break;
+                    default:                 st = "CLOSED";    break;
+                }
+                char hex[65];
+                for (int b = 0; b < 32; b++)
+                    snprintf(hex + b * 2, 3, "%02X", ch->peer_identity[b]);
+                hex[64] = '\0';
+                int w = snprintf(body + pos, sizeof(body) - pos,
+                                 "$%s~chan%llu %s\r\n",
+                                 hex, (unsigned long long)ch->id, st);
+                if (w > 0) pos += (size_t)w;
+            }
+            resp_len = snprintf(resp, sizeof(resp),
+                "250+orconn-status=\r\n%s.\r\n250 OK\r\n", body);
+        }
         else if (strcmp(key, "stats") == 0) {
             resp_len = snprintf(resp, sizeof(resp),
                 "250+stats=\r\n"
@@ -328,6 +380,23 @@ static void handle_ctrl_command(moor_ctrl_client_t *client, const char *cmd) {
             ctrl_send(client->fd, "250 OK\r\n", 8);
             LOG_INFO("monitor: SIGNAL SHUTDOWN -- stopping event loop");
             moor_event_stop();
+        }
+        else if (strcmp(sig, "RELOAD") == 0 || strcmp(sig, "HUP") == 0) {
+            /* RELOAD is a best-effort: drop the circuit cache so clients
+             * get fresh paths, and request a consensus refresh on the
+             * next timer tick. We don't re-read the config file — that
+             * would require a full restart. */
+            moor_socks5_clear_circuit_cache();
+            extern void moor_request_consensus_refresh(void);
+            moor_request_consensus_refresh();
+            ctrl_send(client->fd, "250 OK\r\n", 8);
+            LOG_INFO("monitor: SIGNAL RELOAD -- cache cleared, consensus refresh requested");
+        }
+        else if (strcmp(sig, "DORMANT") == 0 || strcmp(sig, "ACTIVE") == 0) {
+            /* No-op: accept for Tor compatibility. MOOR doesn't track
+             * dormant state yet. */
+            ctrl_send(client->fd, "250 OK\r\n", 8);
+            LOG_INFO("monitor: SIGNAL %s -- accepted (no-op)", sig);
         }
         else {
             resp_len = snprintf(resp, sizeof(resp), "552 Unrecognized signal \"%s\"\r\n", sig);
@@ -486,6 +555,25 @@ void moor_monitor_notify_stream(uint16_t stream_id, const char *status,
     if (len <= 0 || len >= (int)sizeof(msg)) return;
     for (int i = 0; i < g_ctrl_client_count; i++) {
         if (g_ctrl_clients[i].event_mask & MOOR_CTRL_EVENT_STREAM)
+            ctrl_send(g_ctrl_clients[i].fd, msg, (size_t)len);
+    }
+}
+
+void moor_monitor_notify_orconn(uint64_t channel_id, const char *status,
+                                 const char *peer_id_hex) {
+    if (!g_monitor_initialized) return;
+    char msg[256];
+    int len;
+    if (peer_id_hex && peer_id_hex[0]) {
+        len = snprintf(msg, sizeof(msg), "650 ORCONN $%s~chan%llu %s\r\n",
+                       peer_id_hex, (unsigned long long)channel_id, status);
+    } else {
+        len = snprintf(msg, sizeof(msg), "650 ORCONN chan%llu %s\r\n",
+                       (unsigned long long)channel_id, status);
+    }
+    if (len <= 0 || len >= (int)sizeof(msg)) return;
+    for (int i = 0; i < g_ctrl_client_count; i++) {
+        if (g_ctrl_clients[i].event_mask & MOOR_CTRL_EVENT_ORCONN)
             ctrl_send(g_ctrl_clients[i].fd, msg, (size_t)len);
     }
 }

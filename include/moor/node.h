@@ -33,6 +33,8 @@ typedef struct {
     char     contact_info[128];     /* Operator contact (email, URL, etc.) */
     /* V6 fields (protocol version) */
     uint16_t protocol_version;      /* MOOR_PROTOCOL_VERSION at build time */
+    /* V7 fields (build identifier) */
+    char     build_id[16];          /* Git commit short hash; DAs enforce strict equality */
     /* Local-only (not serialized on wire, not signed) */
     uint64_t first_seen;            /* DA-local: when relay first appeared */
     uint64_t last_registered;       /* DA-local: last PUBLISH from this relay (for stale reaper) */

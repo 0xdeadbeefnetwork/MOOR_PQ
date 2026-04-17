@@ -2080,6 +2080,15 @@ static void *client_consensus_refresh_thread(void *arg) {
     return NULL;
 }
 
+static void hs_consensus_refresh_cb(void *arg);
+
+/* Control port SIGNAL RELOAD: request immediate consensus refresh.
+ * Kicks the same refresh path the 10-min timer uses. */
+void moor_request_consensus_refresh(void) {
+    consensus_refresh_cb(NULL);
+    hs_consensus_refresh_cb(NULL);
+}
+
 static void consensus_refresh_cb(void *arg) {
     (void)arg;
     if (!g_live_consensus) return;
@@ -3140,6 +3149,29 @@ static void hs_blinded_key_rotation_cb(void *arg) {
     }
 }
 
+/* Rotate HS PoW seed every hour to prevent replay of solved challenges.
+ * Without rotation, an attacker who solves one PoW can spam INTRODUCE1
+ * forever. Bumps desc_revision so the next republish pushes the new seed. */
+static void hs_pow_seed_rotation_cb(void *arg) {
+    (void)arg;
+    static uint64_t last_rotate_at = 0;
+    uint64_t now = (uint64_t)time(NULL);
+    if (last_rotate_at == 0) { last_rotate_at = now; return; }
+    if (now - last_rotate_at < MOOR_VANGUARD_L3_ROTATE) return; /* 1h */
+    last_rotate_at = now;
+
+    int hs_count = g_config.num_hidden_services;
+    if (hs_count == 0) hs_count = 1;
+    for (int h = 0; h < hs_count; h++) {
+        if (!g_hs_configs[h].pow_enabled || g_hs_configs[h].pow_difficulty == 0)
+            continue;
+        moor_crypto_random(g_hs_configs[h].pow_seed, 32);
+        g_hs_configs[h].desc_revision++;
+        LOG_INFO("HS %d: PoW seed rotated (rev=%llu)",
+                 h, (unsigned long long)g_hs_configs[h].desc_revision);
+    }
+}
+
 /* Send PADDING cells on intro circuit connections to keep NAT mappings alive.
  * Without this, the Pi's NAT router drops the TCP mapping after ~4 minutes
  * and intro circuits silently die. TCP keepalive doesn't help because many
@@ -3390,6 +3422,7 @@ static int run_hs(void) {
         moor_event_add_timer(5 * 60 * 1000, hs_blinded_key_rotation_cb, NULL) < 0 ||
         moor_event_add_timer(30 * 1000, hs_intro_rotation_cb, NULL) < 0 ||
         moor_event_add_timer(45 * 1000, hs_intro_padding_cb, NULL) < 0 ||
+        moor_event_add_timer(5 * 60 * 1000, hs_pow_seed_rotation_cb, NULL) < 0 ||
         moor_event_add_timer(5 * 60 * 1000, hs_desc_republish_cb, NULL) < 0) {
         LOG_ERROR("FATAL: failed to register HS timers");
         return -1;
@@ -4268,8 +4301,14 @@ int main(int argc, char **argv) {
         const char *os = "unknown";
         if (uname(&uts) == 0) os = uts.sysname;
 
-        LOG_INFO("MOOR v%s running on %s with libsodium %s",
-                 MOOR_VERSION_STRING, os, sodium_version_string());
+        char build_id_str[17];
+        memcpy(build_id_str, moor_build_id, 16);
+        build_id_str[16] = '\0';
+        /* Print build_id via fprintf to bypass log-redaction (hex → [KEY]).
+         * DAs enforce strict equality on this string. */
+        fprintf(stderr, "        \033[90mbuild %s\033[0m\n\n", build_id_str);
+        LOG_INFO("MOOR v%s build %s running on %s with libsodium %s",
+                 MOOR_VERSION_STRING, build_id_str, os, sodium_version_string());
         LOG_INFO("Operating in %s mode (PID %d)", mode_str, (int)getpid());
 
         if (g_mode == MOOR_MODE_CLIENT)

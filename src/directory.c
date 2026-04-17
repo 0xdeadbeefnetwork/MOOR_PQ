@@ -428,6 +428,18 @@ static int da_add_relay_unlocked(moor_da_config_t *config,
         return -1;
     }
 
+    /* Strict fleet-equality gate: reject relays built from a different commit.
+     * Prevents mixed-binary fleets from causing wire/handshake incompatibilities.
+     * Compared as a 16-byte buffer (strncmp would stop at any embedded NUL). */
+    if (memcmp(desc->build_id, moor_build_id, MOOR_BUILD_ID_LEN) != 0) {
+        char their[17], ours[17];
+        memcpy(their, desc->build_id, 16); their[16] = '\0';
+        memcpy(ours, moor_build_id, 16);   ours[16]  = '\0';
+        LOG_WARN("DA: rejecting descriptor from %s -- build_id '%s' != ours '%s'",
+                 desc->address, their, ours);
+        return -1;
+    }
+
     /* Reject relays advertising private/reserved addresses */
     if (da_is_private_address(desc->address)) {
         LOG_WARN("DA: rejecting descriptor with private address %s", desc->address);
@@ -586,7 +598,11 @@ int moor_da_add_relay_trusted(moor_da_config_t *config,
      * da_add_relay_unlocked after the sig check). */
     int ret = -1;
 
-    /* Feature check (same as da_add_relay_unlocked) */
+    /* Feature check (same as da_add_relay_unlocked).
+     * We deliberately skip build_id equality here: text consensus is lossy
+     * and doesn't preserve build_id.  Relays re-register within 30 min with
+     * fresh PUBLISH descriptors that hit the full da_add_relay_unlocked path,
+     * which enforces strict build_id equality. */
     if ((desc->features & NODE_FEATURES_REQUIRED) != NODE_FEATURES_REQUIRED) {
         da_unlock(config);
         return -1;
@@ -2537,6 +2553,15 @@ static int da_dispatch_request(int client_fd, moor_da_config_t *config,
                 free(desc_buf);
                 return 0;
             }
+            /* Strict build_id gate (matches da_add_relay_unlocked check) */
+            if (memcmp(desc.build_id, moor_build_id, MOOR_BUILD_ID_LEN) != 0) {
+                char their[17];
+                memcpy(their, desc.build_id, 16); their[16] = '\0';
+                LOG_WARN("DA: PROPAGATE descriptor build_id '%s' mismatch", their);
+                send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
+                free(desc_buf);
+                return 0;
+            }
             da_lock(config);
             if (da_add_relay_unlocked(config, &desc) == 0) {
                 LOG_INFO("DA: accepted propagated descriptor from peer");
@@ -3475,7 +3500,7 @@ int moor_hs_descriptor_serialize(uint8_t *out, size_t out_len,
     out[off++] = (uint8_t)(desc->num_intro_points >> 8);
     out[off++] = (uint8_t)(desc->num_intro_points);
 
-    for (uint32_t i = 0; i < desc->num_intro_points && i < 3; i++) {
+    for (uint32_t i = 0; i < desc->num_intro_points && i < MOOR_MAX_INTRO_POINTS; i++) {
         memcpy(out + off, desc->intro_points[i].node_id, 32); off += 32;
         memcpy(out + off, desc->intro_points[i].address, 64); off += 64;
         out[off++] = (uint8_t)(desc->intro_points[i].or_port >> 8);
@@ -3541,7 +3566,7 @@ int moor_hs_descriptor_deserialize(moor_hs_descriptor_t *desc,
                               ((uint32_t)data[off+2] << 8) | data[off+3];
     off += 4;
 
-    if (desc->num_intro_points > 3) {
+    if (desc->num_intro_points > MOOR_MAX_INTRO_POINTS) {
         LOG_WARN("descriptor has invalid num_intro_points=%u, rejecting",
                  desc->num_intro_points);
         return -1;

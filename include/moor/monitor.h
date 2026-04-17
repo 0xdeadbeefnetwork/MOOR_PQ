@@ -36,6 +36,7 @@ typedef struct {
 #define MOOR_CTRL_EVENT_CIRC     (1u << 0)
 #define MOOR_CTRL_EVENT_STREAM   (1u << 1)
 #define MOOR_CTRL_EVENT_BW       (1u << 2)
+#define MOOR_CTRL_EVENT_ORCONN   (1u << 3)
 
 typedef struct {
     uint64_t cells_sent;
@@ -100,6 +101,15 @@ void moor_monitor_notify_circ(uint32_t circuit_id, const char *status);
 void moor_monitor_notify_stream(uint16_t stream_id, const char *status,
                                  uint32_t circuit_id, const char *target);
 void moor_monitor_notify_bw(void);
+
+/* ORCONN event: channel state change.
+ * status: "LAUNCHED" | "CONNECTED" | "FAILED" | "CLOSED"
+ * peer_id_hex: hex identity fingerprint (may be NULL for anonymous) */
+void moor_monitor_notify_orconn(uint64_t channel_id, const char *status,
+                                 const char *peer_id_hex);
+
+/* Bootstrap progress tracking (0..100) */
+void moor_monitor_set_bootstrap(int percent, const char *tag, const char *summary);
 
 /* Cleanup: wipe credentials from memory */
 void moor_monitor_cleanup(void);

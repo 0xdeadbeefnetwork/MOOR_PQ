@@ -71,8 +71,16 @@
  * changes.  DAs reject descriptors below MOOR_MIN_PROTOCOL_VERSION.
  * This prevents old binaries from joining the network and causing
  * signature verification failures during DA-to-DA sync. */
-#define MOOR_PROTOCOL_VERSION       3   /* current: v0.8.1 descriptor format */
-#define MOOR_MIN_PROTOCOL_VERSION   3   /* minimum accepted by DAs */
+#define MOOR_PROTOCOL_VERSION       4   /* v0.8.2: adds build_id (V7) to descriptor */
+#define MOOR_MIN_PROTOCOL_VERSION   4   /* minimum accepted by DAs */
+
+/* Length of the git-commit build identifier carried in every descriptor.
+ * 12 hex chars + space for NUL/padding.  Populated from moor_build_id
+ * (see src/build_id.c).  Strict equality is enforced at DAs. */
+#define MOOR_BUILD_ID_LEN           16
+
+/* Exported by src/build_id.c — always rebuilt so it reflects current HEAD. */
+extern const char moor_build_id[MOOR_BUILD_ID_LEN];
 
 /* Node descriptor features bitmask */
 #define NODE_FEATURE_PQ         (1u << 0)  /* Supports PQ circuit crypto */
@@ -80,10 +88,12 @@
 #define NODE_FEATURE_NICKNAME   (1u << 2)  /* Has nickname + key rotation (V4) */
 #define NODE_FEATURE_CONTACT    (1u << 3)  /* Has operator contact info (V5) */
 #define NODE_FEATURE_CELL_KEM   (1u << 4)  /* KEM CT via CELL_KEM_CT (v0.8+) */
+#define NODE_FEATURE_BUILD_ID   (1u << 5)  /* Descriptor carries 16-byte build_id (v0.8.2) */
 
 /* Minimum required feature set for DA to accept a relay descriptor.
- * Old nodes without CELL_KEM cause wire framing desync on the network. */
-#define NODE_FEATURES_REQUIRED  NODE_FEATURE_CELL_KEM
+ * Old nodes without CELL_KEM cause wire framing desync on the network.
+ * BUILD_ID is required so we can enforce strict fleet-wide commit equality. */
+#define NODE_FEATURES_REQUIRED  (NODE_FEATURE_CELL_KEM | NODE_FEATURE_BUILD_ID)
 
 /* Node flags */
 #define NODE_FLAG_GUARD         (1u << 0)

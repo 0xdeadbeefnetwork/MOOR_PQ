@@ -39,6 +39,7 @@ OBJDIR = obj
 BUILDDIR = .
 
 SOURCES = $(SRCDIR)/log.c \
+          $(SRCDIR)/build_id.c \
           $(SRCDIR)/crypto.c \
           $(SRCDIR)/cell.c \
           $(SRCDIR)/event.c \
@@ -186,6 +187,12 @@ $(OBJDIR)/dilithium:
 
 $(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
+
+# build_id.o is always rebuilt so the baked-in git hash matches current HEAD.
+# Uses shell command substitution ($$) so git runs at recipe-execution time.
+.PHONY: $(OBJDIR)/build_id.o
+$(OBJDIR)/build_id.o: $(SRCDIR)/build_id.c | $(OBJDIR)
+	$(CC) $(CFLAGS) -DMOOR_BUILD_ID="\"$$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)\"" -c $< -o $@
 
 $(OBJDIR)/kyber/%.o: $(SRCDIR)/kyber/%.c | $(OBJDIR)/kyber
 	$(CC) $(CFLAGS) -c $< -o $@
