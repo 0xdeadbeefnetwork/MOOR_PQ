@@ -142,6 +142,10 @@ void moor_config_defaults(moor_config_t *cfg) {
     cfg->num_hidden_services = 0;
     cfg->pir = 1;
     cfg->pir_dpf = 1;  /* DPF-PIR preferred over XOR-bitmask PIR */
+    snprintf(cfg->dns_server_addr, sizeof(cfg->dns_server_addr), "127.0.0.1");
+    snprintf(cfg->dns_server_upstream, sizeof(cfg->dns_server_upstream),
+             "1.1.1.1");
+    cfg->dns_server_upstream_port = 53;
 }
 
 /* Parse an IPv4 address string to host-byte-order uint32_t */
@@ -700,6 +704,32 @@ int moor_config_set(moor_config_t *cfg, const char *key, const char *value) {
     }
     else if (strcmp(key, "DNSListenAddress") == 0) {
         snprintf(cfg->dns_addr, sizeof(cfg->dns_addr), "%s", value);
+    }
+    else if (strcmp(key, "DNSServerPort") == 0) {
+        int p = atoi(value);
+        if (p > 0 && p <= 65535) cfg->dns_server_port = (uint16_t)p;
+    }
+    else if (strcmp(key, "DNSServerListenAddress") == 0) {
+        snprintf(cfg->dns_server_addr, sizeof(cfg->dns_server_addr), "%s", value);
+    }
+    else if (strcmp(key, "DNSServerUpstream") == 0) {
+        /* Format: "addr" or "addr:port" (IPv4 only). */
+        const char *colon = strrchr(value, ':');
+        if (colon) {
+            size_t n = (size_t)(colon - value);
+            if (n >= sizeof(cfg->dns_server_upstream))
+                n = sizeof(cfg->dns_server_upstream) - 1;
+            memcpy(cfg->dns_server_upstream, value, n);
+            cfg->dns_server_upstream[n] = '\0';
+            int p = atoi(colon + 1);
+            if (p > 0 && p <= 65535) cfg->dns_server_upstream_port = (uint16_t)p;
+        } else {
+            snprintf(cfg->dns_server_upstream,
+                     sizeof(cfg->dns_server_upstream), "%s", value);
+        }
+    }
+    else if (strcmp(key, "ExitNotice") == 0) {
+        cfg->exit_notice = atoi(value);
     }
     else if (strcmp(key, "ClientUseIPv6") == 0) {
         cfg->client_use_ipv6 = atoi(value);

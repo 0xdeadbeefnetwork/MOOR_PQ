@@ -1826,6 +1826,15 @@ static int run_relay(void) {
 
     moor_event_add(g_relay_listen_fd, MOOR_EVENT_READ, relay_accept_cb, NULL);
 
+    /* Exit notice: serve a static "I'm a MOOR exit, not a website" page on :80.
+     * Only on exit relays, and only if opted in (ExitNotice 1 in config). */
+    if ((g_relay_flags & NODE_FLAG_EXIT) && g_config.exit_notice) {
+        char bid[17];
+        memcpy(bid, moor_build_id, 16);
+        bid[16] = '\0';
+        moor_exit_notice_start(g_config.nickname, g_config.contact_info, bid);
+    }
+
     /* Initialize async EXTEND worker pipe (non-blocking relay EXTEND) */
     if (moor_relay_extend_init() != 0) {
         LOG_ERROR("failed to initialize async EXTEND subsystem");
@@ -2292,6 +2301,17 @@ static int run_client(void) {
     if (g_config.dns_port > 0) {
         const char *da = g_config.dns_addr[0] ? g_config.dns_addr : "127.0.0.1";
         moor_dns_start(da, g_config.dns_port);
+    }
+
+    /* DNSServer: DNS-over-TCP server, intended to sit behind a hidden service. */
+    if (g_config.dns_server_port > 0) {
+        const char *a = g_config.dns_server_addr[0] ?
+                        g_config.dns_server_addr : "127.0.0.1";
+        const char *u = g_config.dns_server_upstream[0] ?
+                        g_config.dns_server_upstream : "1.1.1.1";
+        uint16_t up = g_config.dns_server_upstream_port ?
+                      g_config.dns_server_upstream_port : 53;
+        moor_dns_server_start(a, g_config.dns_server_port, u, up);
     }
 
     if (g_use_bridges && g_config.num_bridges > 0) {
@@ -3416,6 +3436,17 @@ static int run_hs(void) {
      * periodic republish pushes descriptors to DHT with the current SRV.
      * Without this, DHT entries go stale after hourly SRV rotation and
      * clients can't find the service via DHT. */
+
+    /* DNS-over-TCP server for exposure via HS (port_map 53 → dns_server_port). */
+    if (g_config.dns_server_port > 0) {
+        const char *a = g_config.dns_server_addr[0] ?
+                        g_config.dns_server_addr : "127.0.0.1";
+        const char *u = g_config.dns_server_upstream[0] ?
+                        g_config.dns_server_upstream : "1.1.1.1";
+        uint16_t up = g_config.dns_server_upstream_port ?
+                      g_config.dns_server_upstream_port : 53;
+        moor_dns_server_start(a, g_config.dns_server_port, u, up);
+    }
 
     /* R10-CC3: Register periodic timers for HS maintenance */
     if (moor_event_add_timer(10 * 60 * 1000, hs_consensus_refresh_cb, NULL) < 0 ||

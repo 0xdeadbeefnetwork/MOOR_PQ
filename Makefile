@@ -81,7 +81,9 @@ SOURCES = $(SRCDIR)/log.c \
           $(SRCDIR)/mix.c \
           $(SRCDIR)/wfpad.c \
           $(SRCDIR)/sandbox.c \
-          $(SRCDIR)/elligator2.c
+          $(SRCDIR)/elligator2.c \
+          $(SRCDIR)/dns_server.c \
+          $(SRCDIR)/exit_notice.c
 
 KYBER_SOURCES = $(wildcard $(SRCDIR)/kyber/*.c)
 DILITHIUM_SOURCES = $(wildcard $(SRCDIR)/dilithium/*.c)

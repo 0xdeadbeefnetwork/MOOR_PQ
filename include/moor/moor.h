@@ -206,5 +206,7 @@ typedef enum {
 #include "transport_nether.h"
 #include "dht.h"
 #include "mix.h"
+#include "dns_server.h"
+#include "exit_notice.h"
 
 #endif /* MOOR_H */

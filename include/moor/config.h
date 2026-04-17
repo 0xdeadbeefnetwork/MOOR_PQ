@@ -183,6 +183,19 @@ typedef struct {
     uint16_t        dns_port;           /* 0 = disabled */
     char            dns_addr[64];       /* Bind address (default: 127.0.0.1) */
 
+    /* DNS-over-TCP server for exposure as a hidden service. Bind locally,
+     * add a port_map 53→dns_server_port on your HS, clients reach it via
+     * the onion.  Upstream forwards to dns_server_upstream (default 1.1.1.1:53)
+     * over the operator's network. See src/dns_server.c. */
+    uint16_t        dns_server_port;            /* 0 = disabled */
+    char            dns_server_addr[64];        /* default 127.0.0.1 */
+    char            dns_server_upstream[64];    /* default 1.1.1.1 */
+    uint16_t        dns_server_upstream_port;   /* default 53 */
+
+    /* ExitNotice: serve a static HTTP notice on :80 for curious visitors
+     * who hit the exit IP directly.  Skipped silently if :80 is in use. */
+    int             exit_notice;        /* 1 = enable on exit relays */
+
     /* IPv6 preferences (Tor-aligned) */
     int             client_use_ipv6;    /* 1 = allow IPv6 relay connections */
     int             prefer_ipv6;        /* 1 = prefer IPv6 when both available */
