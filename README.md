@@ -8,7 +8,7 @@ MOOR is an onion router. Your traffic goes through three relays. Each relay peel
 
 Every key exchange uses hybrid post-quantum cryptography: X25519 + Kyber768. Traffic recorded today cannot be decrypted by a quantum computer tomorrow.
 
-~50,000 lines of C. Three dependencies (libsodium, zlib, pthreads). No OpenSSL.
+~53,000 lines of C. Three dependencies (libsodium, zlib, pthreads). No OpenSSL.
 
 ```
 You  --->  Guard  --->  Middle  --->  Exit  --->  Destination
@@ -67,6 +67,7 @@ HiddenServicePort 22           # virtual 22 -> localhost:22
 - **Argon2id PoW** — memory-hard proof-of-work prevents intro flooding
 - **OnionBalance** — load balance across multiple backend instances
 - **Client authorization** — restrict descriptor access per-client
+- **Built-in DNS-over-TCP** — host an onion-wrapped recursive resolver (`--dns-server-port`)
 
 ## Cryptography
 
@@ -121,6 +122,8 @@ Six pluggable transports for censorship circumvention:
 - **Argon2id PoW** — mandatory for relay admission, configurable difficulty
 - **seccomp-bpf sandbox** — syscall filtering, no_new_privs, rlimits
 - **TransPort + DNSPort** — transparent proxy and encrypted DNS resolution
+- **Build-ID fleet gate** — DAs reject descriptors whose git hash differs from theirs; mixed-commit fleets cannot form (coordinated upgrades required)
+- **Mandatory exit notice** — every exit relay serves an HTTP notice on :80 explaining it's a MOOR exit, not a website (safe-harbor / mere-conduit posture)
 
 ## Enclaves
 
@@ -165,7 +168,7 @@ moor --enclave mynet.enclave  # client
 
 ## Source
 
-~50,000 lines of C across 64 source files and 47 headers. ~3,000 lines of vendored NIST PQ reference implementations (Kyber768, ML-DSA-65).
+~53,000 lines of C across 48 source files and 48 headers. ~3,000 lines of vendored NIST PQ reference implementations (Kyber768, ML-DSA-65).
 
 Website: [https://moor.afflicted.sh](https://moor.afflicted.sh)
 

@@ -19,9 +19,11 @@ payload     (509 bytes)
 | CREATED | 2 | Relay->Client | Classical handshake response |
 | RELAY | 3 | Both | Encrypted relay payload |
 | DESTROY | 4 | Both | Tear down circuit |
+| NETINFO | 5 | Both | Link-level peer info exchange |
 | CREATE_PQ | 6 | Client->Relay | PQ hybrid circuit handshake |
 | CREATED_PQ | 7 | Relay->Client | PQ hybrid handshake response |
 | KEM_CT | 8 | Both | KEM ciphertext fragment (PQ hybrid handshake) |
+| RELAY_EARLY | 9 | Both | Like RELAY but allowed to carry EXTEND (max 8/circuit) |
 
 ### Relay commands (inside RELAY cells)
 
@@ -43,10 +45,42 @@ data           (up to 498 bytes)
 | RELAY_SENDME | 5 | Flow control acknowledgment |
 | RELAY_EXTEND | 6 | Extend circuit to next hop (classical) |
 | RELAY_EXTENDED | 7 | Extension successful |
+| RELAY_EXTEND2 | 8 | Extend via typed link specifiers (Tor-aligned) |
+| RELAY_EXTENDED2 | 9 | EXTEND2 response |
+| RELAY_DROP | 10 | Drop (padding/cover) |
+| RELAY_RESOLVE | 11 | Remote DNS resolve request |
+| RELAY_RESOLVED | 12 | DNS resolve response |
+| RELAY_BEGIN_UDP | 28 | UDP stream begin |
+| RELAY_ESTABLISH_INTRO | 32 | HS: establish introduction point |
+| RELAY_INTRO_ESTABLISHED | 33 | HS: intro point ack |
+| RELAY_INTRODUCE1 | 34 | HS: client -> intro point |
+| RELAY_INTRODUCE2 | 35 | HS: intro point -> service |
+| RELAY_RENDEZVOUS1 | 36 | HS: service -> rendezvous point |
+| RELAY_RENDEZVOUS2 | 37 | HS: rendezvous point -> client |
+| RELAY_ESTABLISH_RENDEZVOUS | 38 | HS: client establishes RP |
+| RELAY_RENDEZVOUS_ESTABLISHED | 39 | HS: RP ack |
+| RELAY_FRAGMENT | 40 | Multi-cell payload: more follows |
+| RELAY_FRAGMENT_END | 41 | Multi-cell payload: last fragment |
 | RELAY_EXTEND_PQ | 42 | PQ hybrid extend |
 | RELAY_EXTENDED_PQ | 43 | PQ hybrid extend response |
 | RELAY_KEM_OFFER | 44 | Kyber768 ciphertext (chunked) |
 | RELAY_KEM_ACCEPT | 45 | Kyber768 KEM accept |
+| RELAY_E2E_KEM_CT | 46 | PQ e2e: client sends KEM CT to HS |
+| RELAY_E2E_KEM_ACK | 47 | PQ e2e: HS acks rekey complete |
+| RELAY_CONFLUX_LINK | 50 | Link circuit to conflux set |
+| RELAY_CONFLUX_LINKED | 51 | Conflux link ack |
+| RELAY_CONFLUX_SWITCH | 52 | Switch active conflux leg |
+| RELAY_XON | 53 | Stream flow: resume sending (Prop 344) |
+| RELAY_XOFF | 54 | Stream flow: pause sending (Prop 344) |
+| RELAY_DHT_STORE | 60 | Store HS descriptor in DHT |
+| RELAY_DHT_STORED | 61 | DHT store ack |
+| RELAY_DHT_FETCH | 62 | Fetch HS descriptor from DHT |
+| RELAY_DHT_FOUND | 63 | DHT fetch: descriptor found |
+| RELAY_DHT_NOT_FOUND | 64 | DHT fetch: descriptor not found |
+| RELAY_DHT_PIR_QUERY | 66 | PIR: 256-bit bitmask query (legacy) |
+| RELAY_DHT_PIR_RESPONSE | 67 | PIR: XOR-aggregated response |
+| RELAY_DHT_DPF_QUERY | 68 | DPF-PIR: DPF key query |
+| RELAY_DHT_DPF_RESPONSE | 69 | DPF-PIR: DPF-evaluated response |
 
 ## Link handshake
 

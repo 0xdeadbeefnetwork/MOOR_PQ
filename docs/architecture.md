@@ -101,6 +101,12 @@ src/
                       login sequence, and Plugin Channel framing
   sandbox.c          seccomp-bpf sandbox: syscall filtering, no_new_privs, rlimits
   elligator2.c       Elligator2 point encoding for key obfuscation in transports
+  dns_server.c       DNS-over-TCP recursive resolver, intended for exposure via HS
+                      (onion-wrapped LETHE-style resolver)
+  exit_notice.c      Mandatory HTTP notice page on :80 for every exit relay
+                      (safe-harbor / mere-conduit posture)
+  build_id.c         16-byte git-hash build ID stamped on every descriptor; DAs reject
+                      descriptors whose build_id differs from theirs (strict fleet gate)
 
   kyber/              Vendored Kyber768 (ML-KEM-768) reference implementation
   dilithium/          Vendored Dilithium3 (ML-DSA-65) reference implementation

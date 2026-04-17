@@ -131,6 +131,9 @@ Verbose 1
 | `--pow-difficulty <n>` | `PowDifficulty` | 0 | Argon2id proof-of-work difficulty for DA registration (0-64) |
 | `--pow-memlimit <KB>` | `PowMemLimit` | 0 | Argon2id memory limit in KB (stored internally as bytes) |
 | `--mix-delay <ms>` | `MixDelay` | 0 | Poisson mixing delay in milliseconds (0 = disabled) |
+| `--exit-notice` | `ExitNotice` | 1 (on for exits) | Serve mandatory HTTP notice page on :80 ("this is a MOOR exit, not a website") |
+| `--dns-server-port <p>` | `DNSServerPort` | 0 (off) | DNS-over-TCP listener port, intended to sit behind a hidden service |
+| `--dns-server-upstream <host[:p]>` | `DNSServerUpstream` | 1.1.1.1:53 | Upstream recursive resolver for DNS-over-TCP |
 
 **Additional relay config-file-only options:**
 
@@ -142,6 +145,11 @@ Verbose 1
 | `RateLimit` | 0 (off) | Rate limit in bytes/s |
 | `DirCache` | 0 | Cache and serve directory data |
 | `UseMicrodescriptors` | 0 | Use microdescriptors instead of full descriptors |
+
+**Strict build-ID fleet gate:** every node stamps a 16-byte git-hash build ID into its
+descriptor. Directory authorities reject descriptors whose build_id differs from their
+own -- mixed-commit fleets cannot form. Coordinated full-fleet upgrades are required
+when the build ID changes.
 
 ---
 
@@ -522,6 +530,9 @@ Every key accepted in a config file, listed alphabetically:
 | `Daemon` | 0/1 | 0 | `--daemon` |
 | `DataDir` / `DataDirectory` | path | ~/.moor | `--data-dir` / `--DataDirectory` |
 | `DirCache` | 0/1 | 0 | |
+| `DNSServerPort` | port | 0 | `--dns-server-port` |
+| `DNSServerUpstream` | host[:port] | 1.1.1.1:53 | `--dns-server-upstream` |
+| `ExitNotice` | 0/1 | 1 (exits) | `--exit-notice` |
 | `DirPort` | port | 9030 | `--dir-port` / `--DirPort` |
 | `DNSListenAddress` | IP | | |
 | `DNSPort` | port | 0 | `--DNSPort` |
