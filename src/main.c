@@ -334,6 +334,15 @@ static void parse_args_into_config(moor_config_t *cfg, int argc, char **argv) {
         else if (strcmp(argv[i], "--nickname") == 0 && i + 1 < argc) {
             moor_config_set(cfg, "Nickname", argv[++i]);
         }
+        else if (strcmp(argv[i], "--exit-notice") == 0) {
+            moor_config_set(cfg, "ExitNotice", "1");
+        }
+        else if (strcmp(argv[i], "--dns-server-port") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "DNSServerPort", argv[++i]);
+        }
+        else if (strcmp(argv[i], "--dns-server-upstream") == 0 && i + 1 < argc) {
+            moor_config_set(cfg, "DNSServerUpstream", argv[++i]);
+        }
         else if (strcmp(argv[i], "--geoip") == 0 && i + 1 < argc) {
             moor_config_set(cfg, "GeoIPFile", argv[++i]);
         }
