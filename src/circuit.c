@@ -3923,12 +3923,33 @@ static void cbuild_finish(moor_circuit_t *circ, int status) {
 
     void (*cb)(moor_circuit_t *, int, void *) = ctx->on_complete;
     void *arg = ctx->on_complete_arg;
+    int was_timeout = ctx->timed_out;
+
+    if (status == 0 && circ->chan) {
+        /* Successful build resets the wedge counter on this guard channel */
+        circ->chan->consecutive_cbt_timeouts = 0;
+    }
 
     if (status != 0) {
         /* Tor-aligned: mark guard as unreachable on build failure */
         if (circ->hops[0].node_id[0] != 0)
             moor_guard_mark_unreachable(&g_pathbias_guard_state,
                                          circ->hops[0].node_id);
+        /* Guard-wedge circuit breaker: N consecutive CBT timeouts on the
+         * same channel → evict the channel so next build picks a fresh
+         * TCP connection (possibly a different guard) instead of piling
+         * more builds onto a hung relay. */
+        if (was_timeout && circ->chan && !circ->chan->bad_for_new_circs) {
+            circ->chan->consecutive_cbt_timeouts++;
+            if (circ->chan->consecutive_cbt_timeouts >= MOOR_CHAN_CBT_TIMEOUT_THRESHOLD) {
+                LOG_WARN("channel %llu: %u consecutive CBT timeouts, evicting wedged guard",
+                         (unsigned long long)circ->chan->id,
+                         circ->chan->consecutive_cbt_timeouts);
+                circ->chan->bad_for_new_circs = 1;
+                moor_channel_circuits_mark_for_close(circ->chan, DESTROY_REASON_TIMEOUT);
+                moor_channel_mark_for_close(circ->chan);
+            }
+        }
         /* Detach from channel mux */
         if (circ->chan) {
             moor_circuitmux_detach(circ->chan, circ);
@@ -4001,6 +4022,7 @@ static void cbuild_timeout_cb(void *arg) {
      * Without this, fire_timers rearms it and it fires on a freed slot. */
     int tid = circ->build_ctx->timeout_timer_id;
     circ->build_ctx->timeout_timer_id = -1;
+    circ->build_ctx->timed_out = 1;
     if (tid >= 0) moor_event_remove_timer(tid);
     cbuild_finish(circ, -1);
 }

@@ -199,6 +199,7 @@ typedef struct moor_cbuild_ctx {
     uint64_t start_ms;
     int      cancelled;
     int      timeout_timer_id;              /* event timer for build deadline */
+    int      timed_out;                     /* 1 if cbuild_timeout_cb fired */
 } moor_cbuild_ctx_t;
 
 /* Process incoming CREATED/CREATED_PQ for a building circuit.

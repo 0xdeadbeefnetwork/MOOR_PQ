@@ -60,6 +60,12 @@ typedef struct {
 /* ---- Channel ---- */
 #define MOOR_MAX_CHANNELS  256
 
+/* Guard-wedge circuit breaker: after this many consecutive CBT timeouts
+ * on one channel, evict it (bad_for_new_circs + mark_for_close) so the
+ * next build opens a fresh TCP connection instead of piling more builds
+ * onto a hung guard. */
+#define MOOR_CHAN_CBT_TIMEOUT_THRESHOLD 3
+
 typedef struct moor_channel {
     uint64_t          id;               /* globally unique channel ID */
     moor_chan_state_t state;
@@ -70,6 +76,7 @@ typedef struct moor_channel {
     int               is_incoming;       /* 1 = they connected to us */
     int               is_client;         /* 1 = peer is a client (no extends) */
     int               bad_for_new_circs; /* 1 = too old, failing, etc. */
+    uint32_t          consecutive_cbt_timeouts; /* client-side: builds that timed out on this channel in a row; reset on success */
 
     /* Circuit multiplexing */
     moor_circuitmux_t mux;
