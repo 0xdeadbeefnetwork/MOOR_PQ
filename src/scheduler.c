@@ -145,6 +145,13 @@ int moor_queue_flush(moor_cell_queue_t *q, struct moor_connection *conn,
             if (g_global_queued > 0) g_global_queued--;
             free(cell);
             flushed++;
+            /* Forward progress: bump the stall watchdog.  Clear when fully
+             * drained, otherwise advance to "now" so the watchdog measures
+             * time since the last successful drain, not since first enqueue. */
+            if (q->head == NULL)
+                conn->outq_stuck_since = 0;
+            else
+                conn->outq_stuck_since = (uint64_t)time(NULL);
         } else {
             /* Partial write -- stop and wait for POLLOUT */
             return flushed;

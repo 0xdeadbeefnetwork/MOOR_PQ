@@ -2489,6 +2489,18 @@ void moor_socks5_check_stream_timeouts(void) {
                                                          c->stream_id);
             if (s) s->stream_id = 0;
         }
+        /* HS-specific: a stale cached RV circuit can survive its HS-side
+         * peer silently; BEGIN never gets a CONNECTED back.  Evict the
+         * cache entry so the next request does a fresh DHT + RP build
+         * instead of re-hitting the zombie. */
+        if (c->circuit && moor_is_moor_address(c->target_addr)) {
+            moor_circuit_t *dead = c->circuit;
+            LOG_WARN("HS: invalidating stale cached circuit for %s",
+                     c->target_addr);
+            moor_socks5_invalidate_circuit(dead);
+            if (!MOOR_CIRCUIT_IS_MARKED(dead))
+                moor_circuit_mark_for_close(dead, DESTROY_REASON_TIMEOUT);
+        }
         moor_event_remove(c->client_fd);
         close(c->client_fd);
         c->client_fd = -1;

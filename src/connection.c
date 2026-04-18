@@ -1375,6 +1375,10 @@ int moor_connection_send_cell(moor_connection_t *conn,
                     conn->state = CONN_STATE_NONE;
                     return -1;
                 }
+                /* Start outq stall watchdog: if this was the first cell
+                 * queued after the last successful drain, stamp now. */
+                if (conn->outq_stuck_since == 0)
+                    conn->outq_stuck_since = (uint64_t)time(NULL);
                 moor_event_modify(conn->fd, MOOR_EVENT_READ | MOOR_EVENT_WRITE);
                 sent = total;
             } else {
@@ -2257,4 +2261,33 @@ void moor_connection_send_keepalive(int idle_threshold_sec) {
 
     if (sent > 0)
         LOG_DEBUG("keepalive: padded %d idle connections", sent);
+}
+
+/* Force-close connections whose outq has been non-empty with no successful
+ * drain for stuck_sec seconds.  Prevents silent peer-side wedges (TCP up,
+ * peer event loop stalled) from filling our queue until OOM. */
+int moor_connection_reap_stalled(int stuck_sec) {
+    uint64_t now = (uint64_t)time(NULL);
+    int closed = 0;
+
+    conn_pool_lock();
+    for (int i = 0; i < MOOR_MAX_CONNECTIONS; i++) {
+        moor_connection_t *c = &g_conn_pool[i];
+        if (c->fd < 0 || c->state != CONN_STATE_OPEN) continue;
+        if (c->outq_stuck_since == 0) continue;
+        if ((int64_t)(now - c->outq_stuck_since) <= stuck_sec) continue;
+
+        int qdepth = moor_queue_count(&c->outq);
+        LOG_WARN("watchdog: fd=%d outq stalled %lus (q=%d cells) -- closing wedged connection",
+                 c->fd, (unsigned long)(now - c->outq_stuck_since), qdepth);
+        conn_pool_unlock();
+        moor_event_remove(c->fd);
+        moor_circuit_teardown_for_conn(c);
+        moor_connection_close(c);
+        conn_pool_lock();
+        closed++;
+    }
+    conn_pool_unlock();
+
+    return closed;
 }

@@ -87,6 +87,13 @@ struct moor_connection {
     /* Last cell activity timestamp (seconds since epoch).
      * Used by connection reaper to cull idle connections. */
     uint64_t last_activity;
+    /* Outq stall watchdog: timestamp (seconds) of the most recent moment
+     * where outq had pending cells but nothing had drained since.
+     * Set when a cell is enqueued onto a previously-empty outq, reset to
+     * "now" when any full cell drains, cleared to 0 when outq fully drains.
+     * If this stays nonzero and stale for too long, the connection is
+     * silently wedged (TCP up, peer not reading) and gets force-closed. */
+    uint64_t outq_stuck_since;
 };
 
 /* Initialize connection pool */
@@ -211,5 +218,11 @@ int moor_connection_reap_idle(int max_idle_sec);
 /* Send CELL_PADDING on connections that have circuits but have been idle
  * for idle_threshold_sec.  Keeps relay-to-relay links alive. */
 void moor_connection_send_keepalive(int idle_threshold_sec);
+
+/* Force-close connections whose outq has stopped draining for longer than
+ * stuck_sec.  Symptom: peer's TCP is up but it's not reading (event-loop
+ * wedge on the other side); our outq grows unboundedly until OOM kills us.
+ * Returns number of connections closed. */
+int moor_connection_reap_stalled(int stuck_sec);
 
 #endif /* MOOR_CONNECTION_H */

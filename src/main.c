@@ -658,6 +658,7 @@ static void conn_reap_timer_cb(void *arg) {
     (void)arg;
     moor_connection_send_keepalive(45); /* pad connections idle > 45s */
     moor_connection_reap_idle(120);     /* reap connections idle > 120s with no circuits */
+    moor_connection_reap_stalled(30);   /* force-close conns whose outq hasn't drained for 30s */
 }
 
 /* Relay event callbacks */
