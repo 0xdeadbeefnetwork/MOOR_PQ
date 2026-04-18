@@ -1928,32 +1928,40 @@ static int da_dispatch_request(int client_fd, moor_da_config_t *config,
         moor_node_descriptor_t desc;
         int desc_len = moor_node_descriptor_deserialize(&desc, desc_buf, len);
         if (desc_len > 0) {
-            /* Verify source IP matches advertised address */
+            /* Verify source IP matches advertised address. Fail-closed:
+             * if getpeername fails we cannot verify, so reject -- otherwise
+             * a descriptor advertising any IP would be trusted whenever the
+             * kernel refuses the lookup (e.g. socket torn down under us). */
             {
                 struct sockaddr_storage peer_ss;
                 socklen_t peer_len = sizeof(peer_ss);
                 if (getpeername(client_fd, (struct sockaddr *)&peer_ss,
-                                &peer_len) == 0) {
-                    char peer_ip[INET6_ADDRSTRLEN];
-                    if (peer_ss.ss_family == AF_INET6) {
-                        struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&peer_ss;
-                        inet_ntop(AF_INET6, &a6->sin6_addr,
-                                  peer_ip, sizeof(peer_ip));
-                    } else {
-                        struct sockaddr_in *a4 = (struct sockaddr_in *)&peer_ss;
-                        inet_ntop(AF_INET, &a4->sin_addr,
-                                  peer_ip, sizeof(peer_ip));
-                    }
-                    if (strcmp(peer_ip, desc.address) != 0 &&
-                        (desc.address6[0] == '\0' ||
-                         strcmp(peer_ip, desc.address6) != 0)) {
-                        LOG_WARN("DA: rejecting relay: source IP %s != advertised %s/%s",
-                                 peer_ip, desc.address,
-                                 desc.address6[0] ? desc.address6 : "none");
-                        send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
-                        free(desc_buf);
-                        return 0;
-                    }
+                                &peer_len) != 0) {
+                    LOG_WARN("DA: rejecting relay: getpeername failed: %s",
+                             strerror(errno));
+                    send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
+                    free(desc_buf);
+                    return 0;
+                }
+                char peer_ip[INET6_ADDRSTRLEN];
+                if (peer_ss.ss_family == AF_INET6) {
+                    struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&peer_ss;
+                    inet_ntop(AF_INET6, &a6->sin6_addr,
+                              peer_ip, sizeof(peer_ip));
+                } else {
+                    struct sockaddr_in *a4 = (struct sockaddr_in *)&peer_ss;
+                    inet_ntop(AF_INET, &a4->sin_addr,
+                              peer_ip, sizeof(peer_ip));
+                }
+                if (strcmp(peer_ip, desc.address) != 0 &&
+                    (desc.address6[0] == '\0' ||
+                     strcmp(peer_ip, desc.address6) != 0)) {
+                    LOG_WARN("DA: rejecting relay: source IP %s != advertised %s/%s",
+                             peer_ip, desc.address,
+                             desc.address6[0] ? desc.address6 : "none");
+                    send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
+                    free(desc_buf);
+                    return 0;
                 }
             }
             /* Verify PoW -- always required (minimum = default difficulty) */
@@ -2956,6 +2964,19 @@ int moor_da_sync_relays(moor_da_config_t *config) {
                     off += dlen;
                     continue;
                 }
+                /* Strict build_id gate also applies to sync-update path.
+                 * da_add_relay_unlocked enforces this for new relays at :434;
+                 * without this check, a relay can flip its build_id via the
+                 * sync-update path and stay in consensus, defeating the gate. */
+                if (memcmp(desc.build_id, moor_build_id, MOOR_BUILD_ID_LEN) != 0) {
+                    char their[17], ours[17];
+                    memcpy(their, desc.build_id, 16); their[16] = '\0';
+                    memcpy(ours, moor_build_id, 16);  ours[16]  = '\0';
+                    LOG_WARN("DA sync: rejecting %s:%u -- build_id '%s' != ours '%s'",
+                             desc.address, desc.or_port, their, ours);
+                    off += dlen;
+                    continue;
+                }
                 int known = 0;
                 for (uint32_t j = 0; j < config->consensus.num_relays; j++) {
                     if (sodium_memcmp(config->consensus.relays[j].identity_pk,
@@ -3617,8 +3638,16 @@ int moor_hs_descriptor_deserialize(moor_hs_descriptor_t *desc,
                          desc->num_auth_entries);
                 return -1;
             }
+            /* Reject rather than silently accept a partial auth list: a
+             * truncated descriptor that claims N entries but only contains K<N
+             * would otherwise leave the remaining slots uninitialized, letting
+             * a client appear authorized or failing auth randomly. */
             for (int i = 0; i < desc->num_auth_entries; i++) {
-                if (off + 80 > data_len) break;
+                if (off + 80 > data_len) {
+                    LOG_WARN("descriptor truncated in auth section (need %d entries, have %d)",
+                             desc->num_auth_entries, i);
+                    return -1;
+                }
                 memcpy(desc->auth_entries[i], data + off, 80);
                 off += 80;
             }

@@ -1,5 +1,5 @@
-#ifndef MOOR_EXIT_NOTICE_H
-#define MOOR_EXIT_NOTICE_H
+#ifndef MOOR_EXIT_NOTICE_HTML_H
+#define MOOR_EXIT_NOTICE_HTML_H
 
 static const char MOOR_EXIT_NOTICE_HTML[] =
     "<!DOCTYPE html>\n"
@@ -37,4 +37,4 @@ static const char MOOR_EXIT_NOTICE_HTML[] =
     "</body>\n"
     "</html>\n";
 
-#endif /* MOOR_EXIT_NOTICE_H */
+#endif /* MOOR_EXIT_NOTICE_HTML_H */

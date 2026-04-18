@@ -188,10 +188,19 @@ int moor_dht_store_put(moor_dht_store_t *store,
     if (!store || !data || data_len == 0 || data_len > MOOR_DHT_MAX_DESC_DATA)
         return -1;
 
-    /* Update existing entry */
+    /* Update existing entry. Reject older or equal epoch to prevent an
+     * attacker from rolling back a newer descriptor by replaying a stale
+     * signed blob -- the responsible-replica invariant assumes monotonic
+     * epoch, so without this check a newer publish can be silently erased. */
     for (uint32_t i = 0; i < store->num_entries; i++) {
         if (sodium_memcmp(store->entries[i].address_hash,
                           address_hash, 32) == 0) {
+            if (epoch < store->entries[i].epoch) {
+                LOG_WARN("DHT store: rejecting stale publish (epoch %llu < %llu)",
+                         (unsigned long long)epoch,
+                         (unsigned long long)store->entries[i].epoch);
+                return -1;
+            }
             memcpy(store->entries[i].data, data, data_len);
             /* Zero residual bytes from previous (possibly longer) descriptor */
             if (data_len < store->entries[i].data_len)
@@ -1226,20 +1235,27 @@ int moor_dht_publish(const uint8_t address_hash[32],
             moor_cell_t ack_cell;
             int ack_ret = dht_recv_cell(conn, &ack_cell, 10000);
             if (ack_ret > 0) {
-                /* Decrypt and check for STORED ack */
+                /* Must verify AEAD + explicit STORED command. Treating
+                 * decrypt-fail or timeout as success hid dead/malicious
+                 * replicas and gave a false "publish OK" return (MAC can
+                 * fail on real tamper or key desync -- not benign). */
                 if (moor_circuit_decrypt_backward(circ, &ack_cell) == 0) {
                     moor_relay_payload_t ack_relay;
                     moor_relay_unpack(&ack_relay, ack_cell.payload);
-                    if (ack_relay.relay_command == RELAY_DHT_STORED)
+                    if (ack_relay.relay_command == RELAY_DHT_STORED) {
                         success++;
-                    else
+                    } else {
                         LOG_WARN("DHT publish: unexpected response cmd=%d",
                                  ack_relay.relay_command);
+                    }
                 } else {
-                    success++; /* Decrypt failed but data likely stored */
+                    moor_stats_t *s = moor_monitor_stats();
+                    s->e2e_mac_failures++;
+                    LOG_WARN("DHT publish: STORED ack MAC failed -- "
+                             "counting as failure");
                 }
             } else {
-                success++; /* Timeout but data likely stored */
+                LOG_WARN("DHT publish: STORED ack timeout -- counting as failure");
             }
         }
 

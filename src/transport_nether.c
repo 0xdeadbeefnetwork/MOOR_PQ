@@ -562,6 +562,13 @@ static ssize_t nether_recv(moor_transport_state_t *state, int fd,
     /* The ciphertext follows the packet ID */
     size_t ct_len = (size_t)(n - id_len);
     if (ct_len < 16) return -1;
+    /* Cap ct_len so decrypted output fits plain_buf: pt_len = ct_len - 16,
+     * and plain_buf is sizeof(st->plain_buf). Without this a peer that
+     * crafts a valid MC packet with ct_len > 4112 overflows plain_buf. */
+    if (ct_len > sizeof(st->plain_buf) + 16) {
+        LOG_WARN("nether: rejecting oversized packet (ct_len=%zu)", ct_len);
+        return -1;
+    }
 
     size_t pt_len;
     if (moor_crypto_aead_decrypt(st->plain_buf, &pt_len, pkt + id_len, ct_len,

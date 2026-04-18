@@ -471,7 +471,13 @@ static void prebuilt_build_complete(moor_circuit_t *circ, int status, void *arg)
         e->conn = circ->conn;
         /* Connection is already in event loop (registered by cbuild_on_connect) */
     } else {
+        /* Pool full: close the guard connection too, not just the circuit.
+         * moor_circuit_destroy alone leaks the fd + event registration that
+         * cbuild_on_connect installed, so every overflow build leaked a
+         * socket until process exit. */
+        moor_connection_t *conn = circ->conn;
         moor_circuit_destroy(circ);
+        if (conn) moor_connection_close(conn);
         return;
     }
 
@@ -770,8 +776,20 @@ static void hs_rp_read_cb(int fd, int events, void *arg) {
                     if (pending->hs_kem_available) {
                         memcpy(pending->rp_circ->e2e_dh_shared, shared, 32);
                         uint8_t kem_ct[1088], kem_ss[32];
-                        moor_kem_encapsulate(kem_ct, kem_ss,
-                                             pending->hs_kem_pk);
+                        if (moor_kem_encapsulate(kem_ct, kem_ss,
+                                                 pending->hs_kem_pk) != 0) {
+                            /* kem_ct/kem_ss are zeroed on fail; sending them
+                             * would silently degrade PQ hybrid to classical-only
+                             * (both sides would derive H(dh||0)). Tear down
+                             * instead — user gets a visible failure. */
+                            LOG_ERROR("HS: KEM encapsulate FAILED -- "
+                                      "refusing silent PQ downgrade");
+                            moor_crypto_wipe(kem_ss, 32);
+                            moor_crypto_wipe(shared, 32);
+                            moor_crypto_wipe(pending->rp_circ->e2e_eph_sk, 32);
+                            hs_pending_complete(pending);
+                            return;
+                        }
 
                         /* Send KEM CT as RELAY_E2E_KEM_CT cells (3 cells) */
                         size_t ct_off = 0;
@@ -1173,9 +1191,17 @@ static int process_circuit_cell(moor_connection_t *conn, moor_cell_t *cell) {
          * but not added to g_circuit_cache until build completes. */
         moor_circuit_t *bcirc = moor_circuit_find(cell->circuit_id, conn);
         if (bcirc && bcirc->build_ctx) {
-            /* Decrypt through existing hops */
-            if (moor_circuit_decrypt_backward(bcirc, cell) != 0)
+            /* Decrypt through existing hops. On MAC fail tear down — a
+             * silent drop hides injected/corrupt cells and desyncs future
+             * e2e nonce counting on this circuit (same shape as :1247 fix). */
+            if (moor_circuit_decrypt_backward(bcirc, cell) != 0) {
+                moor_stats_t *s = moor_monitor_stats();
+                s->e2e_mac_failures++;
+                LOG_WARN("build-circuit MAC fail circuit %u -- destroying",
+                         bcirc->circuit_id);
+                moor_circuit_mark_for_close(bcirc, DESTROY_REASON_PROTOCOL);
                 return 0;
+            }
             moor_relay_payload_t brelay;
             moor_relay_unpack(&brelay, cell->payload);
             if (brelay.recognized != 0)
@@ -1183,9 +1209,14 @@ static int process_circuit_cell(moor_connection_t *conn, moor_cell_t *cell) {
             if (brelay.relay_command == RELAY_EXTENDED ||
                 brelay.relay_command == RELAY_EXTENDED2 ||
                 brelay.relay_command == RELAY_EXTENDED_PQ) {
-                moor_circuit_build_handle_extended(bcirc, brelay.relay_command,
-                                                    brelay.data,
-                                                    brelay.data_length);
+                if (moor_circuit_build_handle_extended(bcirc,
+                                                        brelay.relay_command,
+                                                        brelay.data,
+                                                        brelay.data_length) != 0) {
+                    LOG_WARN("build-circuit EXTENDED handle failed %u -- destroying",
+                             bcirc->circuit_id);
+                    moor_circuit_mark_for_close(bcirc, DESTROY_REASON_PROTOCOL);
+                }
             }
             return 0;
         }
@@ -1252,11 +1283,20 @@ static int process_circuit_cell(moor_connection_t *conn, moor_cell_t *cell) {
                                           relay.data, relay.data_length,
                                           NULL, 0, circ->e2e_recv_key,
                                           nonce) != 0) {
-                LOG_ERROR("e2e decrypt FAILED: stream=%u dlen=%u nonce=%llu "
-                          "send_nonce=%llu",
-                          relay.stream_id, relay.data_length,
-                          (unsigned long long)nonce,
+                /* E2e MAC fail is unrecoverable: either wire corruption,
+                 * injection, or (if conflux or similar ever delivers out
+                 * of order) a strict-ordering violation.  In all three
+                 * cases the circuit state is desynced — kill it loudly
+                 * so the failure shows up in metrics, not as a silent
+                 * black hole. */
+                moor_stats_t *st = moor_monitor_stats();
+                if (st) st->e2e_mac_failures++;
+                LOG_ERROR("e2e MAC fail circ=%u stream=%u dlen=%u "
+                          "expect_nonce=%llu send_nonce=%llu — tearing down",
+                          circ->circuit_id, relay.stream_id,
+                          relay.data_length, (unsigned long long)nonce,
                           (unsigned long long)circ->e2e_send_nonce);
+                moor_circuit_mark_for_close(circ, DESTROY_REASON_PROTOCOL);
                 break;
             }
             if (dec_len > MOOR_RELAY_DATA) {

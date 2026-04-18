@@ -728,9 +728,6 @@ int moor_config_set(moor_config_t *cfg, const char *key, const char *value) {
                      sizeof(cfg->dns_server_upstream), "%s", value);
         }
     }
-    else if (strcmp(key, "ExitNotice") == 0) {
-        cfg->exit_notice = atoi(value);
-    }
     else if (strcmp(key, "ClientUseIPv6") == 0) {
         cfg->client_use_ipv6 = atoi(value);
     }

@@ -49,6 +49,9 @@ typedef struct {
     uint32_t circuits_active;
     uint64_t cells_queued;        /* total ever enqueued */
     uint64_t cells_dropped;       /* queue-full drops */
+    uint64_t e2e_mac_failures;    /* HS rendezvous e2e AEAD decrypt failures —
+                                     canary for ordering/key-desync/injection.
+                                     Should stay 0 in a healthy fleet. */
     uint64_t started_at;          /* moor_time_ms() at init */
     /* BW tracking for event notification */
     uint64_t bw_read_last;        /* bytes_recv at last BW event */

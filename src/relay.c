@@ -320,11 +320,17 @@ static void extend_complete_cb(int fd, int events, void *arg) {
          * Check NULL first (could be cleared by nullify_conn), then state
          * (freed/poisoned connection has state=NONE), then generation to
          * detect slot reuse (#CWE-362). */
-        if (!w->prev_conn ||
-            w->prev_conn->state == CONN_STATE_NONE ||
+        if (!w->prev_conn) {
+            LOG_WARN("EXTEND: prev_conn cleared (nullify), discarding result");
+            if (w->next_conn) moor_connection_close(w->next_conn);
+            extend_work_free(w);
+            continue;
+        }
+        if (w->prev_conn->state == CONN_STATE_NONE ||
             w->prev_conn->generation != w->prev_conn_generation) {
-            LOG_WARN("EXTEND: prev_conn reused (gen %u != %u), discarding result",
-                     w->prev_conn->generation, w->prev_conn_generation);
+            LOG_WARN("EXTEND: prev_conn reused (gen %u != %u, state=%d), discarding result",
+                     w->prev_conn->generation, w->prev_conn_generation,
+                     (int)w->prev_conn->state);
             if (w->next_conn) moor_connection_close(w->next_conn);
             extend_work_free(w);
             continue;
@@ -2385,6 +2391,13 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                     LOG_WARN("ESTABLISH_INTRO: invalid signature");
                     return -1;
                 }
+                /* Note: no runtime replay cache. The signed material is just
+                 * blinded_pk, so a deterministic Ed25519 sig repeats every
+                 * time the same HS re-establishes (normal: multi-intro
+                 * redundancy + circuit rebuilds). A cache would block these
+                 * legitimate repeats. The proper defense is protocol-level —
+                 * include a circuit nonce in the signed material so each
+                 * ESTABLISH_INTRO produces a unique signature. Deferred. */
                 memcpy(circ->intro_service_pk, relay.data, 32);
                 /* Check for PoW params appended after the sig */
                 if (relay.data_length >= 96 + 33) {
@@ -3871,13 +3884,22 @@ int moor_relay_self_test(const moor_relay_config_t *config) {
     return -1;
 }
 
-void moor_relay_periodic(void) {
+/* Main-thread wrapper: mutates the same g_relay_config that CREATE/CREATE_PQ
+ * cells read in the event loop. Must be called from the main thread only. */
+void moor_relay_check_key_rotation_main(void) {
     moor_relay_check_key_rotation(&g_relay_config);
+}
+
+void moor_relay_periodic(void) {
+    /* moor_relay_check_key_rotation is now called from relay_periodic_cb
+     * (main thread) so it doesn't race with CREATE/CREATE_PQ processing
+     * that reads onion_pk/onion_sk/prev_onion_* from the event loop. */
     if (!g_relay_config.is_bridge) {
         if (moor_relay_register(&g_relay_config) != 0)
             LOG_WARN("relay: periodic re-registration FAILED (will retry in 30 min)");
     }
-    moor_dht_store_expire(&g_dht_store);
+    /* moor_dht_store_expire is now called from relay_periodic_cb (main thread)
+     * so it doesn't race with moor_dht_store_put/get on the event loop. */
 
     /* Refresh consensus for EXTEND address resolution (#183).
      * Use multi-DA fetch so we try all configured DAs, not just the first. */

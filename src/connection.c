@@ -1175,6 +1175,12 @@ int moor_connection_connect(moor_connection_t *conn,
     /* Clear handshake timeout -- must not persist on data-path sockets */
     moor_set_socket_timeout(fd, 0);
 
+    /* Flip FD non-blocking for event-loop phase. tcp_connect_simple set it
+     * blocking for the handshake recv loops; send_cell's EAGAIN→queue fallback
+     * requires non-blocking or the event loop wedges in sk_stream_wait_memory
+     * whenever a peer is slow or self-connected (fleet wedge 2026-04-17). */
+    moor_set_nonblocking(fd);
+
     /* Aggressive TCP keepalive to survive NAT/firewall idle timeouts.
      * Without short intervals, NAT routers drop the mapping after ~4 min
      * and intro circuit connections silently die. */
@@ -1241,6 +1247,13 @@ int moor_connection_accept_fd(moor_connection_t *conn, int client_fd,
 
     /* Clear handshake timeout -- must not persist on data-path sockets */
     moor_set_socket_timeout(client_fd, 0);
+
+    /* Flip FD non-blocking for event-loop phase. relay_accept_cb flipped it
+     * blocking for the handshake; send_cell's EAGAIN→queue fallback requires
+     * non-blocking or the single-threaded event loop wedges in
+     * sk_stream_wait_memory on any slow or self-connected peer
+     * (fleet wedge 2026-04-17, 19/20 AWS nodes). */
+    moor_set_nonblocking(client_fd);
 
     /* Aggressive TCP keepalive: detect dead connections in ~90s instead
      * of the default ~2h.  Prevents connection pool exhaustion when

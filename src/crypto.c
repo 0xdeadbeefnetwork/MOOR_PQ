@@ -706,17 +706,17 @@ static int read_key_file(const char *path, uint8_t *data, size_t len) {
                     rename(tmp_path, path);
                 }
             } else {
-                /* MAC mismatch: accept key anyway to prevent key loss on
-                 * binary upgrades (different MAC base or path-binding change).
-                 * Re-save with current MAC for next startup. */
-                LOG_WARN("key file %s: MAC mismatch (accepting, re-saving)", path);
-                memcpy(data, buf, len);
-                ret = 0;
-                int is_secret_f = 1;
-                char tmp_path_f[4096];
-                snprintf(tmp_path_f, sizeof(tmp_path_f), "%s.tmp", path);
-                if (write_key_file(tmp_path_f, buf, len, is_secret_f) == 0)
-                    rename(tmp_path_f, path);
+                /* Both MACs invalid: refuse the file. Self-healing here lets a
+                 * local attacker who can write to keys/ swap identity/onion/PQ
+                 * keys silently — the process would re-sign over its own MAC.
+                 * Legacy no-MAC migration is handled below (rd == len path);
+                 * a file that HAS a MAC but fails BOTH derivations is either
+                 * tampered, corrupt, or keyed for a different install. None of
+                 * those should silently succeed. */
+                LOG_ERROR("key file %s: BOTH MACs invalid -- refusing to load "
+                          "(possible tamper). Move the file aside manually "
+                          "if you've deliberately rotated MAC keys.", path);
+                ret = -1;
             }
         }
         sodium_memzero(mac_key, 32);

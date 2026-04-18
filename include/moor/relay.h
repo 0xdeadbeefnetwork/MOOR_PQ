@@ -91,6 +91,9 @@ void moor_relay_extend_shutdown(void);
 /* Onion key rotation */
 int moor_relay_rotate_onion_key(moor_relay_config_t *config);
 int moor_relay_check_key_rotation(moor_relay_config_t *config);
+/* Rotates keys on the relay.c-owned g_relay_config (the struct CREATE cells
+ * actually read). Must be called from the main event-loop thread. */
+void moor_relay_check_key_rotation_main(void);
 
 /* Relay self-test: connect to our own OR port and verify reachability */
 int moor_relay_self_test(const moor_relay_config_t *config);

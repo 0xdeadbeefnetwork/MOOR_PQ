@@ -90,6 +90,12 @@ static const char MACS[] =
 
 static const char COMP[] = "none,zlib@openssh.com";
 
+/* recv_buf holds 4 (length) + packet_len + 16 (MAC). Max inbound packet_len
+ * is capped to leave room for header+MAC without overflow. Sender uses the
+ * same cap for its outbound payload budget. */
+#define MOOR_SPEAKEASY_BUF_SIZE 32768
+#define MOOR_SPEAKEASY_MAX_PKT  (MOOR_SPEAKEASY_BUF_SIZE - 4 - 16)
+
 /* ---- Transport state ---- */
 typedef struct {
     /* chacha20-poly1305@openssh.com uses TWO keys per direction:
@@ -100,7 +106,7 @@ typedef struct {
     uint8_t  recv_key_header[32];
     uint64_t send_seq;  /* packet sequence number (nonce) */
     uint64_t recv_seq;
-    uint8_t  recv_buf[32768];
+    uint8_t  recv_buf[MOOR_SPEAKEASY_BUF_SIZE];
     size_t   recv_len;
 } speakeasy_state_t;
 
@@ -180,6 +186,9 @@ static int se_recv_packet(int fd, uint8_t *msg_type,
     if (packet_len < 2 || packet_len > 65536) return -1;
 
     uint8_t pad_len = hdr[4];
+    /* Guard against peer-controlled pad_len underflowing payload_len.
+     * Require at least 1 byte of payload (msg_type) after padding. */
+    if ((size_t)pad_len + 2 > packet_len) return -1;
     size_t payload_len = packet_len - 1 - pad_len;
 
     /* Read remaining: payload + padding (we already read padding_length byte) */
@@ -552,7 +561,11 @@ static ssize_t speakeasy_send(moor_transport_state_t *state, int fd,
                                 const uint8_t *data, size_t len) {
     speakeasy_state_t *st = (speakeasy_state_t *)state;
 
-    if (len > 32768) len = 32768;
+    /* Cap outbound data so packet_len (1 + len + pad, pad ≤ 15) stays ≤
+     * MOOR_SPEAKEASY_MAX_PKT, matching the receiver's hard cap. Peers that
+     * send longer packets would be silently dropped — keep sender ≤ receiver. */
+    const size_t pkt_max_data = MOOR_SPEAKEASY_MAX_PKT - 1 - 15;
+    if (len > pkt_max_data) len = pkt_max_data;
 
     /* Build plaintext packet: padding_length(1) + data + random_padding */
     size_t payload_len = 1 + len;
@@ -633,7 +646,11 @@ static ssize_t speakeasy_recv(moor_transport_state_t *state, int fd,
         sodium_memzero(block, 64);
     }
     uint32_t packet_len = se_get32(enc_len);
-    if (packet_len < 2 || packet_len > 32768) return -1;
+    /* total_needed = 4 (length) + packet_len + 16 (Poly1305 MAC). Must fit
+     * in recv_buf or the recv-loop below overflows the struct by up to 20
+     * bytes of attacker-controlled data BEFORE AEAD auth. Cap to leave room
+     * for header+MAC. Sender uses the same cap (MOOR_SPEAKEASY_MAX_PKT). */
+    if (packet_len < 2 || packet_len > MOOR_SPEAKEASY_MAX_PKT) return -1;
 
     size_t total_needed = 4 + packet_len + 16; /* header + ct + MAC */
 

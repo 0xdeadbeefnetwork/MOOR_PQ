@@ -192,10 +192,6 @@ typedef struct {
     char            dns_server_upstream[64];    /* default 1.1.1.1 */
     uint16_t        dns_server_upstream_port;   /* default 53 */
 
-    /* ExitNotice: serve a static HTTP notice on :80 for curious visitors
-     * who hit the exit IP directly.  Skipped silently if :80 is in use. */
-    int             exit_notice;        /* 1 = enable on exit relays */
-
     /* IPv6 preferences (Tor-aligned) */
     int             client_use_ipv6;    /* 1 = allow IPv6 relay connections */
     int             prefer_ipv6;        /* 1 = prefer IPv6 when both available */

@@ -27,7 +27,10 @@ hs_keys/
 site/
 fuzz/
 deploy.sh
+deploy-debug.sh
 fuzzer.sh
+BUG_AUDIT.md
+BUILD_ID
 promo/
 .claude/
 *.mp3

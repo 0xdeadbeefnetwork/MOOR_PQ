@@ -1620,16 +1620,29 @@ int moor_circuit_relay_decrypt(moor_circuit_t *circ, moor_cell_t *cell) {
     return 0;
 }
 
-/* Relay-side: add one layer (backward direction -- toward client) */
+/* Relay-side: add one layer (backward direction -- toward client).
+ * Safe-by-default: on any failure we wipe the cell payload so that even
+ * callers that don't check the return value can't leak plaintext onto the
+ * wire (27+ call sites, many unchecked — auditing each was infeasible).
+ * We also mark the circuit for close so the next event-loop tick tears it
+ * down. The -1 return is still meaningful for callers that do check. */
 int moor_circuit_relay_encrypt(moor_circuit_t *circ, moor_cell_t *cell) {
     if (circ->relay_backward_nonce == UINT64_MAX) {
-        LOG_ERROR("circuit %u relay backward nonce exhausted", circ->circuit_id);
+        LOG_ERROR("circuit %u relay backward nonce exhausted -- killing circuit",
+                  circ->circuit_id);
+        sodium_memzero(cell->payload, MOOR_CELL_PAYLOAD);
+        moor_circuit_mark_for_close(circ, DESTROY_REASON_PROTOCOL);
         return -1;
     }
     if (moor_crypto_stream_xor(cell->payload, MOOR_CELL_PAYLOAD,
                                 circ->relay_backward_key,
-                                circ->relay_backward_nonce) != 0)
+                                circ->relay_backward_nonce) != 0) {
+        LOG_ERROR("circuit %u stream_xor failed -- killing circuit",
+                  circ->circuit_id);
+        sodium_memzero(cell->payload, MOOR_CELL_PAYLOAD);
+        moor_circuit_mark_for_close(circ, DESTROY_REASON_PROTOCOL);
         return -1;
+    }
     circ->relay_backward_nonce++;
     return 0;
 }
@@ -1639,18 +1652,27 @@ int moor_circuit_open_stream(moor_circuit_t *circ, uint16_t *stream_id,
     /* Find free stream slot */
     for (int i = 0; i < MOOR_MAX_STREAMS; i++) {
         if (circ->streams[i].stream_id == 0) {
-            circ->streams[i].stream_id = circ->next_stream_id;
-            circ->next_stream_id++;
-            if (circ->next_stream_id == 0) {
-                circ->next_stream_id = 1;
-                /* L2: After wrap, check for stream ID collision */
+            /* Allocate next id, skipping any still in use by other streams.
+             * Old code only checked on the first wrap, so a long-lived stream
+             * from before the wrap could alias a newly-allocated id. */
+            uint32_t tries = 0;
+            for (;;) {
+                uint16_t candidate = circ->next_stream_id;
+                circ->next_stream_id++;
+                if (circ->next_stream_id == 0) circ->next_stream_id = 1;
+                int in_use = 0;
                 for (int j = 0; j < MOOR_MAX_STREAMS; j++) {
                     if (j == i) continue;
-                    if (circ->streams[j].stream_id == circ->streams[i].stream_id) {
-                        circ->streams[i].stream_id = 0;
-                        LOG_ERROR("stream ID collision after wrap -- circuit exhausted");
-                        return -1;
-                    }
+                    if (circ->streams[j].stream_id == candidate) { in_use = 1; break; }
+                }
+                if (!in_use) {
+                    circ->streams[i].stream_id = candidate;
+                    break;
+                }
+                if (++tries >= 65535) {
+                    LOG_ERROR("stream ID space exhausted on circuit %u",
+                              circ->circuit_id);
+                    return -1;
                 }
             }
             strncpy(circ->streams[i].target_addr, addr,
@@ -2382,6 +2404,23 @@ int moor_circuit_build(moor_circuit_t *circ,
         else
             LOG_WARN("EntryNode '%s' not found in consensus, falling back",
                      g_config.entry_node);
+    }
+    /* Prop 271 guard pinning: try sampled/primary guards before random pick.
+     * Without this, the sync builder defeats guard persistence -- every sync
+     * circuit uses a different random guard, enabling profiling attacks even
+     * when the async builder correctly pins. */
+    if (!guard) {
+        const moor_guard_entry_t *ge = moor_guard_select(&g_pathbias_guard_state);
+        if (ge) {
+            for (uint32_t ri = 0; ri < consensus->num_relays; ri++) {
+                if (sodium_memcmp(consensus->relays[ri].identity_pk,
+                                  ge->identity_pk, 32) == 0 &&
+                    (consensus->relays[ri].flags & NODE_FLAG_RUNNING)) {
+                    guard = &consensus->relays[ri];
+                    break;
+                }
+            }
+        }
     }
     if (!guard) {
         guard = moor_node_select_relay(consensus, NODE_FLAG_GUARD | NODE_FLAG_RUNNING,
@@ -4494,10 +4533,18 @@ int moor_circuit_build_async(moor_circuit_t *circ,
     /* Set peer identity for IK handshake */
     memcpy(conn->peer_identity, guard->identity_pk, 32);
 
+    /* Publish conn on circ BEFORE starting async connect so cbuild_finish
+     * (timeout/DESTROY path) can reach conn->hs_state and disarm the
+     * on_complete callback. Otherwise a timeout frees circ while the
+     * async connect is still in flight, and the later callback fires
+     * with a dangling pointer → UAF crash in cbuild_on_connect. */
+    circ->conn = conn;
+
     /* Start async connect */
     if (moor_connection_connect_async(conn, guard->address, guard->or_port,
                                        our_pk, our_sk, NULL, NULL,
                                        cbuild_on_connect, circ) != 0) {
+        circ->conn = NULL;
         moor_channel_mark_for_close(chan);
         circ->chan = NULL;
         moor_crypto_wipe(ctx, sizeof(*ctx));

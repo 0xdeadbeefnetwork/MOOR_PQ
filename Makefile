@@ -191,10 +191,12 @@ $(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # build_id.o is always rebuilt so the baked-in git hash matches current HEAD.
-# Uses shell command substitution ($$) so git runs at recipe-execution time.
+# MOOR_BUILD_ID can be overridden from the command line (e.g. by deploy scripts
+# that build on machines without a git repo). Falls back to git, then "unknown".
+MOOR_BUILD_ID ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || cat BUILD_ID 2>/dev/null || echo unknown)
 .PHONY: $(OBJDIR)/build_id.o
 $(OBJDIR)/build_id.o: $(SRCDIR)/build_id.c | $(OBJDIR)
-	$(CC) $(CFLAGS) -DMOOR_BUILD_ID="\"$$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)\"" -c $< -o $@
+	$(CC) $(CFLAGS) -DMOOR_BUILD_ID="\"$(MOOR_BUILD_ID)\"" -c $< -o $@
 
 $(OBJDIR)/kyber/%.o: $(SRCDIR)/kyber/%.c | $(OBJDIR)/kyber
 	$(CC) $(CFLAGS) -c $< -o $@

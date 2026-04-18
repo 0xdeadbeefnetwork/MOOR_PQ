@@ -1072,6 +1072,36 @@ int moor_hs_handle_introduce(moor_hs_config_t *config,
 
     moor_crypto_wipe(decrypted, sizeof(decrypted));
 
+    /* Replay cache keyed on (rendezvous_cookie, client_eph_pk): a replayed
+     * INTRODUCE2 would cause us to build a second rendezvous circuit to the
+     * same cookie, wasting our circuit budget and leaking intro-point
+     * activity. Time-bounded so a legitimate client that somehow reuses
+     * eph_pk (buggy retry) eventually recovers. */
+    {
+        #define INTRO2_REPLAY_SLOTS 512
+        #define INTRO2_REPLAY_TTL   600   /* 10 minutes */
+        static uint8_t seen_cookies[INTRO2_REPLAY_SLOTS][20 + 32];
+        static uint64_t seen_time[INTRO2_REPLAY_SLOTS];
+        static uint32_t seen_next = 0;
+        uint8_t key[20 + 32];
+        memcpy(key, rendezvous_cookie, 20);
+        memcpy(key + 20, client_eph_pk, 32);
+        uint64_t now = (uint64_t)time(NULL);
+        for (uint32_t si = 0; si < INTRO2_REPLAY_SLOTS; si++) {
+            if (seen_time[si] == 0) continue;
+            if (now - seen_time[si] > INTRO2_REPLAY_TTL) continue;
+            if (sodium_memcmp(seen_cookies[si], key, sizeof(key)) == 0) {
+                LOG_WARN("INTRODUCE2: rejected replay");
+                moor_crypto_wipe(key, sizeof(key));
+                return -1;
+            }
+        }
+        memcpy(seen_cookies[seen_next], key, sizeof(key));
+        seen_time[seen_next] = now;
+        seen_next = (seen_next + 1) % INTRO2_REPLAY_SLOTS;
+        moor_crypto_wipe(key, sizeof(key));
+    }
+
     /* Build circuit to rendezvous point -- use cached consensus if available */
     return moor_hs_rendezvous(config, rendezvous_cookie, client_eph_pk,
                                rp_node_id, config->cached_consensus);
@@ -1168,12 +1198,15 @@ int moor_hs_rendezvous(moor_hs_config_t *config,
     if (moor_circuit_encrypt_forward(rp_circ, &cell) != 0 ||
         moor_connection_send_cell(rp_circ->conn, &cell) != 0) {
         LOG_ERROR("HS rendezvous: failed to send RENDEZVOUS1");
-        /* Tear down the RP circuit properly: send DESTROY cells through
-         * the guard and free the conn.  moor_circuit_free alone would
-         * leak rp_conn and leave phantom circuits on the network. */
+        /* Tear down the RP circuit properly. Order matters:
+         *   1. mark_for_close (via moor_circuit_destroy) defers DESTROY
+         *      sends to end-of-loop via close_all_marked.
+         *   2. moor_connection_close nullifies circ->conn refs to rp_conn
+         *      BEFORE freeing it, so close_all_marked's deferred DESTROY
+         *      pass sees conn==NULL and skips — no UAF.
+         * Previously: close(fd)+connection_free left circ->conn dangling. */
         moor_circuit_destroy(rp_circ);
-        if (rp_conn->fd >= 0) close(rp_conn->fd);
-        moor_connection_free(rp_conn);
+        moor_connection_close(rp_conn);
         free(heap_cons);
         moor_crypto_wipe(shared, 32);
         moor_crypto_wipe(eph_sk, 32);
@@ -1864,6 +1897,24 @@ int moor_hs_check_intro_rotation(moor_hs_config_t *config,
 
     for (int i = 0; i < config->num_intro_circuits; i++) {
         int needs_rotate = 0;
+        moor_circuit_t *circ = config->intro_circuits[i];
+
+        /* Check liveness: intro circuits can die silently (relay-side DESTROY
+         * not delivered, NAT black-hole, kernel-detected socket error that
+         * never propagated to invalidate_circuit). Without this, a non-NULL
+         * but dead circ pointer means the HS becomes permanently unreachable
+         * because the rotation code below thinks the intro is healthy. */
+        if (circ && (MOOR_CIRCUIT_IS_MARKED(circ) ||
+                     !circ->conn ||
+                     circ->conn->state != CONN_STATE_OPEN ||
+                     circ->conn->fd < 0)) {
+            LOG_INFO("HS: intro point %d circuit dead (marked=%u state=%d fd=%d), rotating",
+                     i,
+                     circ->marked_for_close,
+                     circ->conn ? (int)circ->conn->state : -1,
+                     circ->conn ? circ->conn->fd : -1);
+            needs_rotate = 1;
+        }
 
         /* Check age: rotate after MOOR_HS_INTRO_MAX_LIFETIME_SEC */
         if (config->intro_established_at[i] > 0 &&

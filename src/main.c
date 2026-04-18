@@ -8,6 +8,8 @@
 #include "moor/transport_mirage.h"
 #include "moor/transport_nether.h"
 #include "moor/sandbox.h"
+#include "moor/dht.h"
+extern moor_dht_store_t g_dht_store;
 #include <sodium.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -333,9 +335,6 @@ static void parse_args_into_config(moor_config_t *cfg, int argc, char **argv) {
         }
         else if (strcmp(argv[i], "--nickname") == 0 && i + 1 < argc) {
             moor_config_set(cfg, "Nickname", argv[++i]);
-        }
-        else if (strcmp(argv[i], "--exit-notice") == 0) {
-            moor_config_set(cfg, "ExitNotice", "1");
         }
         else if (strcmp(argv[i], "--dns-server-port") == 0 && i + 1 < argc) {
             moor_config_set(cfg, "DNSServerPort", argv[++i]);
@@ -1175,6 +1174,17 @@ static void relay_periodic_cb(void *arg) {
     }
     moor_monitor_sample_observed_bw();
 
+    /* Expire stale DHT entries on the main thread -- concurrent modification
+     * from the periodic thread while moor_dht_store_put/get run here races
+     * on num_entries (swap-and-shrink vs. read-then-write). This callback
+     * is only scheduled for relay nodes, so g_dht_store is always valid. */
+    moor_dht_store_expire(&g_dht_store);
+
+    /* Onion-key rotation also runs here rather than in the periodic thread:
+     * it mutates relay.c's g_relay_config.onion_pk/onion_sk/prev_onion_*
+     * which the main event loop reads to service CREATE/CREATE_PQ cells. */
+    moor_relay_check_key_rotation_main();
+
     /* Run blocking registration + consensus fetch in a background thread.
      * Skip if the previous periodic is still running — BUT detect stuck
      * threads that never released the flag (hung DNS/TCP connect) and
@@ -1836,8 +1846,13 @@ static int run_relay(void) {
     moor_event_add(g_relay_listen_fd, MOOR_EVENT_READ, relay_accept_cb, NULL);
 
     /* Exit notice: serve a static "I'm a MOOR exit, not a website" page on :80.
-     * Only on exit relays, and only if opted in (ExitNotice 1 in config). */
-    if ((g_relay_flags & NODE_FLAG_EXIT) && g_config.exit_notice) {
+     * Mandatory for every exit relay — operators cannot opt out. Serving this
+     * notice is part of the safe-harbor / mere-conduit posture: anyone who
+     * hits the IP in a browser or an abuse report needs to see "this is an
+     * exit relay" instead of a refused connection. If :80 is unavailable
+     * (EADDRINUSE / EACCES), moor_exit_notice_start logs and skips — it does
+     * not fail the relay. */
+    if (g_relay_flags & NODE_FLAG_EXIT) {
         char bid[17];
         memcpy(bid, moor_build_id, 16);
         bid[16] = '\0';
@@ -2523,17 +2538,21 @@ static void hs_target_read_cb(int fd, int events, void *arg) {
     uint8_t e2e_enc_buf[MOOR_RELAY_DATA];
     if (map->circ->e2e_active) {
         size_t enc_len;
+        uint64_t n_use = map->circ->e2e_send_nonce;
         LOG_DEBUG("HS e2e encrypt: stream=%u len=%zd nonce=%llu",
-                  map->stream_id, n,
-                  (unsigned long long)map->circ->e2e_send_nonce);
+                  map->stream_id, n, (unsigned long long)n_use);
         if (moor_crypto_aead_encrypt(e2e_enc_buf, &enc_len, buf, (size_t)n,
                                       NULL, 0, map->circ->e2e_send_key,
-                                      map->circ->e2e_send_nonce++) != 0) {
-            LOG_ERROR("HS e2e encrypt FAILED: stream=%u nonce=%llu",
-                      map->stream_id,
-                      (unsigned long long)(map->circ->e2e_send_nonce - 1));
+                                      n_use) != 0) {
+            LOG_ERROR("HS e2e encrypt FAILED: stream=%u nonce=%llu -- "
+                      "tearing down circuit", map->stream_id,
+                      (unsigned long long)n_use);
+            moor_stats_t *s = moor_monitor_stats();
+            s->e2e_mac_failures++;
+            moor_circuit_mark_for_close(map->circ, DESTROY_REASON_PROTOCOL);
             return;
         }
+        map->circ->e2e_send_nonce = n_use + 1;
         send_data = e2e_enc_buf;
         send_len = (uint16_t)enc_len;
     }
@@ -2735,24 +2754,33 @@ static void hs_rp_read_cb(int fd, int events, void *arg) {
         }
 
         case RELAY_DATA: {
-            /* E2e decrypt for HS rendezvous circuits (#197) */
+            /* E2e decrypt for HS rendezvous circuits (#197).
+             * CRITICAL: read nonce into a local and only advance on success.
+             * The previous postfix-increment-in-arglist form advanced the
+             * counter even on MAC fail, permanently desyncing the stream
+             * after any bit-flip or injected cell. */
             if (circ->e2e_active && relay.data_length > 16) {
                 uint8_t dec_buf[MOOR_RELAY_DATA];
                 size_t dec_len;
+                uint64_t nonce = circ->e2e_recv_nonce;
                 LOG_DEBUG("HS e2e decrypt: stream=%u dlen=%u nonce=%llu",
                           relay.stream_id, relay.data_length,
-                          (unsigned long long)circ->e2e_recv_nonce);
+                          (unsigned long long)nonce);
                 if (moor_crypto_aead_decrypt(dec_buf, &dec_len,
                                               relay.data, relay.data_length,
                                               NULL, 0, circ->e2e_recv_key,
-                                              circ->e2e_recv_nonce++) != 0) {
-                    LOG_ERROR("HS e2e decrypt FAILED: stream=%u dlen=%u nonce=%llu "
-                              "send_nonce=%llu",
-                              relay.stream_id, relay.data_length,
-                              (unsigned long long)(circ->e2e_recv_nonce - 1),
+                                              nonce) != 0) {
+                    moor_stats_t *st = moor_monitor_stats();
+                    if (st) st->e2e_mac_failures++;
+                    LOG_ERROR("HS e2e MAC fail circ=%u stream=%u dlen=%u "
+                              "expect_nonce=%llu send_nonce=%llu — tearing down",
+                              circ->circuit_id, relay.stream_id,
+                              relay.data_length, (unsigned long long)nonce,
                               (unsigned long long)circ->e2e_send_nonce);
+                    moor_circuit_mark_for_close(circ, DESTROY_REASON_PROTOCOL);
                     break;
                 }
+                circ->e2e_recv_nonce = nonce + 1;
                 memcpy(relay.data, dec_buf, dec_len);
                 relay.data_length = (uint16_t)dec_len;
             }
@@ -3724,12 +3752,12 @@ static void emergency_wipe_keys(void) {
     if (g_hs_configs) {
         for (int h = 0; h < g_num_hs_configs; h++)
             sodium_memzero(&g_hs_configs[h], sizeof(g_hs_configs[h]));
-        free(g_hs_configs);
-        g_hs_configs = NULL;
-        g_num_hs_configs = 0;
+        /* Intentionally no free(): this path is shared with crash_handler,
+         * where free() is not async-signal-safe and can deadlock on a
+         * corrupted heap. Both callers are terminal (crash re-raise or
+         * main() return), so leaking the allocation is safe. */
     }
-    free(g_hs_intro_ctxs);
-    g_hs_intro_ctxs = NULL;
+    /* Same reasoning -- do not free(g_hs_intro_ctxs) here. */
 }
 
 #ifndef _WIN32
@@ -3776,6 +3804,7 @@ static void write_dec(int fd, int val) {
  * All output uses write(2) — async-signal-safe.  No malloc, no stdio.
  */
 static void crash_handler(int sig, siginfo_t *si, void *uctx) {
+    (void)uctx;
     /* Emergency key wipe first -- best-effort */
     emergency_wipe_keys();
 
