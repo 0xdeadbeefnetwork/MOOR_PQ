@@ -2332,7 +2332,7 @@ static int run_client(void) {
         const char *a = g_config.dns_server_addr[0] ?
                         g_config.dns_server_addr : "127.0.0.1";
         const char *u = g_config.dns_server_upstream[0] ?
-                        g_config.dns_server_upstream : "1.1.1.1";
+                        g_config.dns_server_upstream : "91.239.100.100";
         uint16_t up = g_config.dns_server_upstream_port ?
                       g_config.dns_server_upstream_port : 53;
         moor_dns_server_start(a, g_config.dns_server_port, u, up);
@@ -3479,7 +3479,7 @@ static int run_hs(void) {
         const char *a = g_config.dns_server_addr[0] ?
                         g_config.dns_server_addr : "127.0.0.1";
         const char *u = g_config.dns_server_upstream[0] ?
-                        g_config.dns_server_upstream : "1.1.1.1";
+                        g_config.dns_server_upstream : "91.239.100.100";
         uint16_t up = g_config.dns_server_upstream_port ?
                       g_config.dns_server_upstream_port : 53;
         moor_dns_server_start(a, g_config.dns_server_port, u, up);

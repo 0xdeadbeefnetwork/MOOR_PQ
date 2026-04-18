@@ -84,6 +84,9 @@ int moor_socks5_forward_to_client(moor_socks5_client_t *client,
 /* Check if address is a .moor hidden service address */
 int moor_is_moor_address(const char *addr);
 
+/* Check if address is a Tor .onion address (unsupported by MOOR). */
+int moor_is_tor_onion(const char *addr);
+
 /* Get pointer to client consensus (for direct read on main thread) */
 moor_consensus_t *moor_socks5_get_consensus(void);
 

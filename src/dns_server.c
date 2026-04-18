@@ -68,7 +68,7 @@ typedef struct {
 } dns_cache_entry_t;
 
 static dns_cache_entry_t g_cache[DNS_CACHE_SIZE];
-static char     g_upstream_addr[64] = "1.1.1.1";
+static char     g_upstream_addr[64] = "91.239.100.100";
 static uint16_t g_upstream_port     = 53;
 static int      g_listen_fd         = -1;
 

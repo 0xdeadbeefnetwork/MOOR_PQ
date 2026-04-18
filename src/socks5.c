@@ -860,11 +860,18 @@ int moor_is_moor_address(const char *addr) {
     size_t len = strlen(addr);
     if (len > 5 && strcmp(addr + len - 5, ".moor") == 0)
         return 1;
-    /* Tor .onion addresses: route through HS path, NEVER to exit relays.
-     * Sending .onion to an exit leaks the address and always fails. */
-    if (len > 6 && strcmp(addr + len - 6, ".onion") == 0)
-        return 1;
     return 0;
+}
+
+/* Tor .onion addresses are NOT MOOR addresses. MOOR can't fetch their
+ * descriptors from the Tor DHT, and sending them to an exit relay leaks
+ * the target and always fails. Browsers keep trying them via Onion-Location
+ * alt-svc headers (e.g. CF-fronted sites advertising cflareki...onion),
+ * so we reject them at SOCKS5 ingress to keep logs clean. */
+int moor_is_tor_onion(const char *addr) {
+    if (!addr) return 0;
+    size_t len = strlen(addr);
+    return len > 6 && strcmp(addr + len - 6, ".onion") == 0;
 }
 
 /* Extract base domain (eTLD+1) from hostname for circuit isolation.
@@ -1880,6 +1887,17 @@ int moor_socks5_handle_request(moor_socks5_client_t *client,
     }
 
     client->target_port = ((uint16_t)data[addr_off] << 8) | data[addr_off + 1];
+
+    /* Reject Tor .onion addresses at ingress. Browsers advertise them via
+     * Onion-Location headers and HTTP Alt-Svc; MOOR can't resolve them and
+     * letting them reach the HS descriptor fetch or exit resolver path just
+     * spams logs. Single DEBUG line, SOCKS5 host-unreachable reply. */
+    if (moor_is_tor_onion(client->target_addr)) {
+        LOG_DEBUG("SOCKS5: rejecting Tor .onion (%s)", client->target_addr);
+        uint8_t fail[] = { 0x05, 0x04, 0x00, 0x01, 0,0,0,0, 0,0 };
+        send(client->client_fd, (char *)fail, sizeof(fail), MSG_NOSIGNAL);
+        return -1;
+    }
 
     /* SOCKS5 RESOLVE (0xF0): resolve hostname through circuit, return IP.
      * Tor-aligned: client sends domain name, we resolve and return IPv4. */

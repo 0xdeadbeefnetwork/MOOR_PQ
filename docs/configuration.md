@@ -133,7 +133,7 @@ Verbose 1
 | `--mix-delay <ms>` | `MixDelay` | 0 | Poisson mixing delay in milliseconds (0 = disabled) |
 | `--exit-notice` | `ExitNotice` | 1 (on for exits) | Serve mandatory HTTP notice page on :80 ("this is a MOOR exit, not a website") |
 | `--dns-server-port <p>` | `DNSServerPort` | 0 (off) | DNS-over-TCP listener port, intended to sit behind a hidden service |
-| `--dns-server-upstream <host[:p]>` | `DNSServerUpstream` | 1.1.1.1:53 | Upstream recursive resolver for DNS-over-TCP |
+| `--dns-server-upstream <host[:p]>` | `DNSServerUpstream` | 91.239.100.100:53 | Upstream recursive resolver for DNS-over-TCP (default: UncensoredDNS, anycast, no logs/filtering) |
 
 **Additional relay config-file-only options:**
 
@@ -531,7 +531,7 @@ Every key accepted in a config file, listed alphabetically:
 | `DataDir` / `DataDirectory` | path | ~/.moor | `--data-dir` / `--DataDirectory` |
 | `DirCache` | 0/1 | 0 | |
 | `DNSServerPort` | port | 0 | `--dns-server-port` |
-| `DNSServerUpstream` | host[:port] | 1.1.1.1:53 | `--dns-server-upstream` |
+| `DNSServerUpstream` | host[:port] | 91.239.100.100:53 | `--dns-server-upstream` |
 | `ExitNotice` | 0/1 | 1 (exits) | `--exit-notice` |
 | `DirPort` | port | 9030 | `--dir-port` / `--DirPort` |
 | `DNSListenAddress` | IP | | |

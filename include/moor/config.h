@@ -185,11 +185,12 @@ typedef struct {
 
     /* DNS-over-TCP server for exposure as a hidden service. Bind locally,
      * add a port_map 53→dns_server_port on your HS, clients reach it via
-     * the onion.  Upstream forwards to dns_server_upstream (default 1.1.1.1:53)
+     * the onion.  Upstream forwards to dns_server_upstream
+     * (default 91.239.100.100 — UncensoredDNS, anycast, no logs, no filter)
      * over the operator's network. See src/dns_server.c. */
     uint16_t        dns_server_port;            /* 0 = disabled */
     char            dns_server_addr[64];        /* default 127.0.0.1 */
-    char            dns_server_upstream[64];    /* default 1.1.1.1 */
+    char            dns_server_upstream[64];    /* default 91.239.100.100 (UncensoredDNS) */
     uint16_t        dns_server_upstream_port;   /* default 53 */
 
     /* IPv6 preferences (Tor-aligned) */

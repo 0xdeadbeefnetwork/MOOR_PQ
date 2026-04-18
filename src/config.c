@@ -144,7 +144,7 @@ void moor_config_defaults(moor_config_t *cfg) {
     cfg->pir_dpf = 1;  /* DPF-PIR preferred over XOR-bitmask PIR */
     snprintf(cfg->dns_server_addr, sizeof(cfg->dns_server_addr), "127.0.0.1");
     snprintf(cfg->dns_server_upstream, sizeof(cfg->dns_server_upstream),
-             "1.1.1.1");
+             "91.239.100.100");
     cfg->dns_server_upstream_port = 53;
 }
 

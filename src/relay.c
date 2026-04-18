@@ -3230,8 +3230,8 @@ int moor_relay_exit_connect(moor_circuit_t *circ, uint16_t stream_id,
             return -1;
         }
     } else {
-        /* Cache miss -- try encrypted DNS (Cloudflare 1.1.1.1) first,
-         * fall back to system resolver if it fails */
+        /* Cache miss -- try encrypted DNS (DNSCrypt v2, pinned provider keys)
+         * first, fall back to system resolver if it fails */
         int dns_ok = 0;
         if (resolve_dns_encrypted(addr, resolved_ip, sizeof(resolved_ip)) == 0) {
             /* Build addrinfo from resolved IP */
