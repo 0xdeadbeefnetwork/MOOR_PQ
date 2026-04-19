@@ -460,23 +460,28 @@ int moor_crypto_sign_blinded(uint8_t sig[64], const uint8_t *msg, size_t msg_len
 
 #endif /* SODIUM_LIBRARY_VERSION >= 1003 */
 
+/* PQ migration (dev-crypto): circuit/link symmetric keys are now derived
+ * purely from the ML-KEM shared secret. The X25519 DH input (curve_shared /
+ * dh_shared) is kept in the signature for ABI stability and for transcript
+ * binding via the auth_tag path (see cke_derive), but is NOT mixed into
+ * data-encryption key material. ECDLP-vulnerable primitives no longer
+ * contribute to circuit confidentiality/integrity keys.
+ *
+ * Forward secrecy for the KEM leg is provided by relay kem_pk rotation
+ * (see moor_relay_rotate_kem_key). Identity proof still flows through the
+ * X25519 auth_tag for now; Phase 3 replaces that with Falcon-512. */
 int moor_crypto_kx_hybrid(uint8_t send_key[32], uint8_t recv_key[32],
                            const uint8_t curve_shared[32],
                            const uint8_t kem_shared[32],
                            int is_client) {
-    /* Combine classical DH and KEM shared secrets */
-    uint8_t combined[64];
-    memcpy(combined, curve_shared, 32);
-    memcpy(combined + 32, kem_shared, 32);
+    (void)curve_shared; /* deliberately unused — PQ-only KDF */
 
     uint8_t hybrid[32];
-    moor_crypto_hash(hybrid, combined, 64);
+    moor_crypto_hash(hybrid, kem_shared, 32);
 
-    /* Derive directional keys */
     moor_crypto_kdf(send_key, 32, hybrid, is_client ? 0 : 1, "moorlink");
     moor_crypto_kdf(recv_key, 32, hybrid, is_client ? 1 : 0, "moorlink");
 
-    moor_crypto_wipe(combined, 64);
     moor_crypto_wipe(hybrid, 32);
     return 0;
 }
@@ -485,23 +490,16 @@ int moor_crypto_circuit_kx_hybrid(uint8_t fwd_key[32], uint8_t bwd_key[32],
                                    uint8_t fwd_digest[32], uint8_t bwd_digest[32],
                                    const uint8_t dh_shared[32],
                                    const uint8_t kem_shared[32]) {
-    /* Combine DH and KEM shared secrets */
-    uint8_t combined[64];
-    memcpy(combined, dh_shared, 32);
-    memcpy(combined + 32, kem_shared, 32);
+    (void)dh_shared; /* deliberately unused — PQ-only KDF */
 
     uint8_t hybrid[32];
-    moor_crypto_hash(hybrid, combined, 64);
+    moor_crypto_hash(hybrid, kem_shared, 32);
 
-    /* Derive circuit hop keys from the hybrid secret */
     moor_crypto_kdf(fwd_key, 32, hybrid, 1, "moorFWD!");
     moor_crypto_kdf(bwd_key, 32, hybrid, 2, "moorBWD!");
-
-    /* Derive running digest initial states (domain-separated from key derivation) */
     moor_crypto_kdf(fwd_digest, 32, hybrid, 3, "moorFDG!");
     moor_crypto_kdf(bwd_digest, 32, hybrid, 4, "moorBDG!");
 
-    moor_crypto_wipe(combined, 64);
     moor_crypto_wipe(hybrid, 32);
     return 0;
 }
