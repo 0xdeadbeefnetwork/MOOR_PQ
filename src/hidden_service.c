@@ -1134,8 +1134,9 @@ int moor_hs_handle_introduce(moor_hs_config_t *config,
                              moor_circuit_t *intro_circ,
                              const uint8_t *payload, size_t len) {
     /*
-     * INTRODUCE2 payload is sealed with crypto_box_seal to our onion_pk.
-     * Decrypt to get: rp_node_id(32) + rendezvous_cookie(20) + client_eph_pk(32)
+     * INTRODUCE2 payload is PQ-sealed (ML-KEM-768 + ChaCha20-Poly1305)
+     * to our KEM pk. Decrypt to get:
+     *   rp_node_id(32) + rendezvous_cookie(20) + client_eph_pk(32)
      * The introduction point cannot read this payload.
      */
     /* Increment intro_count for the matching introduction point */
@@ -1146,15 +1147,15 @@ int moor_hs_handle_introduce(moor_hs_config_t *config,
         }
     }
 
-    if (len < 84 + MOOR_SEAL_OVERHEAD) {
-        LOG_ERROR("INTRODUCE2 payload too short for sealed box");
+    if (len < 84 + MOOR_PQ_SEAL_OVERHEAD) {
+        LOG_ERROR("INTRODUCE2 payload too short for PQ sealed box (%zu)", len);
         return -1;
     }
 
     uint8_t decrypted[84];
-    if (moor_crypto_seal_open(decrypted, payload, 84 + MOOR_SEAL_OVERHEAD,
-                               config->onion_pk, config->onion_sk) != 0) {
-        LOG_ERROR("INTRODUCE2: sealed box decryption failed");
+    if (moor_crypto_pq_seal_open(decrypted, payload, 84 + MOOR_PQ_SEAL_OVERHEAD,
+                                  config->kem_sk) != 0) {
+        LOG_ERROR("INTRODUCE2: PQ sealed box decryption failed");
         return -1;
     }
 
@@ -1358,6 +1359,20 @@ int moor_hs_rendezvous(moor_hs_config_t *config,
     moor_crypto_wipe(shared, 32);
     moor_crypto_wipe(eph_sk, 32);
     return 0;
+}
+
+/* Fragment send callback: encrypt each fragment forward through the
+ * client's intro circuit and ship it to the guard. ctx = intro circuit. */
+static int hs_client_intro_send_cb(uint32_t circuit_id, uint8_t relay_cmd,
+                                    uint16_t stream_id,
+                                    const uint8_t *data, uint16_t data_len,
+                                    void *ctx) {
+    moor_circuit_t *intro_circ = (moor_circuit_t *)ctx;
+    moor_cell_t cell;
+    moor_cell_relay(&cell, circuit_id, relay_cmd, stream_id, data, data_len);
+    if (moor_circuit_encrypt_forward(intro_circ, &cell) != 0)
+        return -1;
+    return moor_connection_send_cell(intro_circ->conn, &cell);
 }
 
 int moor_hs_client_connect_start(const char *moor_address,
@@ -1848,6 +1863,18 @@ verify_descriptor:
     uint8_t eph_pk[32], eph_sk[32];
     moor_crypto_box_keygen(eph_pk, eph_sk);
 
+    /* PQ migration: descriptor must carry an ML-KEM pk -- we seal
+     * INTRODUCE1 to that key now, not the classical onion_pk. */
+    if (!hs_desc.kem_available) {
+        LOG_ERROR("HS: descriptor has no KEM pk (PQ-sealed INTRODUCE1 required)");
+        moor_crypto_wipe(eph_sk, 32);
+        moor_circuit_free(intro_circ);
+        moor_connection_close(intro_conn);
+        moor_circuit_free(rp_circ);
+        moor_connection_close(rp_conn);
+        return -1;
+    }
+
     /* Build INTRODUCE1 plaintext:
      *   rp_node_id(32) + cookie(20) + client_eph_pk(32) = 84 bytes */
     uint8_t intro_plaintext[84];
@@ -1860,11 +1887,12 @@ verify_descriptor:
     memcpy(intro_plaintext + 32, cookie, 20);
     memcpy(intro_plaintext + 52, eph_pk, 32);
 
-    /* Seal INTRODUCE1 to service's onion key -- intro point is blind */
-    uint8_t intro_sealed[84 + MOOR_SEAL_OVERHEAD];
-    if (moor_crypto_seal(intro_sealed, intro_plaintext, 84,
-                          hs_desc.onion_pk) != 0) {
-        LOG_ERROR("HS: failed to seal INTRODUCE1");
+    /* PQ seal (ML-KEM-768 + ChaCha20-Poly1305) to service's KEM pk.
+     * Intro point is blind: it can neither decrypt nor substitute. */
+    uint8_t intro_sealed[84 + MOOR_PQ_SEAL_OVERHEAD];
+    if (moor_crypto_pq_seal(intro_sealed, intro_plaintext, 84,
+                             hs_desc.kem_pk) != 0) {
+        LOG_ERROR("HS: failed to PQ-seal INTRODUCE1");
         moor_crypto_wipe(eph_sk, 32);
         moor_circuit_free(intro_circ);
         moor_connection_close(intro_conn);
@@ -1874,10 +1902,11 @@ verify_descriptor:
     }
 
     /* Build INTRODUCE1 payload:
-     *   blinded_pk(32) + pow_flag(1) + [nonce(8) if pow] + sealed_box
+     *   blinded_pk(32) + pow_flag(1) + [nonce(8) if pow] + pq_sealed
      * The blinded_pk prefix lets the intro relay route the cell to the
-     * correct ESTABLISH_INTRO circuit when it serves multiple services. */
-    uint8_t intro_payload[32 + 1 + 8 + 84 + MOOR_SEAL_OVERHEAD];
+     * correct ESTABLISH_INTRO circuit when it serves multiple services.
+     * Total ~1229B -- exceeds one cell, sent via moor_fragment_send. */
+    uint8_t intro_payload[32 + 1 + 8 + 84 + MOOR_PQ_SEAL_OVERHEAD];
     size_t intro_payload_len = 0;
 
     memcpy(intro_payload, hs_desc.blinded_pk, 32);
@@ -1908,12 +1937,13 @@ verify_descriptor:
         intro_payload_len = 33 + sizeof(intro_sealed);
     }
 
-    moor_cell_t intro_cell;
-    moor_cell_relay(&intro_cell, intro_circ->circuit_id, RELAY_INTRODUCE1, 0,
-                   intro_payload, (uint16_t)intro_payload_len);
-    if (moor_circuit_encrypt_forward(intro_circ, &intro_cell) != 0 ||
-        moor_connection_send_cell(intro_circ->conn, &intro_cell) != 0) {
-        LOG_ERROR("HS: failed to send INTRODUCE1");
+    /* Send INTRODUCE1 via fragmentation (single cell if it fits,
+     * otherwise RELAY_FRAGMENT/RELAY_FRAGMENT_END with inner_cmd=INTRODUCE1). */
+    if (moor_fragment_send(intro_circ->circuit_id, RELAY_INTRODUCE1, 0,
+                            intro_payload, intro_payload_len,
+                            moor_fragment_gen_id(),
+                            hs_client_intro_send_cb, intro_circ) != 0) {
+        LOG_ERROR("HS: failed to send INTRODUCE1 (fragmented)");
         moor_crypto_wipe(eph_sk, 32);
         moor_circuit_destroy(intro_circ);
         moor_connection_close(intro_conn);

@@ -3101,11 +3101,31 @@ static void hs_intro_read_cb(int fd, int events, void *arg) {
         moor_relay_unpack(&relay, cell.payload);
 
         if (relay.recognized == 0 && relay.relay_command == RELAY_INTRODUCE2) {
-            LOG_INFO("HS: received INTRODUCE2 (%u bytes)", relay.data_length);
+            LOG_INFO("HS: received INTRODUCE2 (%u bytes, single cell)", relay.data_length);
             moor_hs_handle_introduce(ctx->config, circ,
                                       relay.data, relay.data_length);
             /* Always register -- slot reuse won't change num_rp_circuits */
             hs_register_rp_circuits(ctx->config, 0);
+        } else if (relay.recognized == 0 &&
+                   (relay.relay_command == RELAY_FRAGMENT ||
+                    relay.relay_command == RELAY_FRAGMENT_END)) {
+            /* PQ INTRODUCE2 arrives fragmented (~1104B sealed blob). */
+            uint8_t inner_cmd;
+            uint8_t reassembled[MOOR_MAX_REASSEMBLY];
+            size_t reassembled_len;
+            int fret = moor_fragment_receive(
+                &circ->reassembly, relay.data, relay.data_length,
+                relay.stream_id, relay.relay_command,
+                &inner_cmd, reassembled, &reassembled_len);
+            if (fret == 1 && inner_cmd == RELAY_INTRODUCE2) {
+                LOG_INFO("HS: received INTRODUCE2 (%zu bytes, reassembled)",
+                         reassembled_len);
+                moor_hs_handle_introduce(ctx->config, circ,
+                                          reassembled, reassembled_len);
+                hs_register_rp_circuits(ctx->config, 0);
+            } else if (fret < 0) {
+                LOG_WARN("HS: INTRODUCE2 fragment reassembly failed");
+            }
         }
     }
     if (ret < 0) {

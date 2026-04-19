@@ -1626,6 +1626,133 @@ int moor_relay_handle_create_pq(moor_connection_t *conn,
     return 0;
 }
 
+/* Fragment send callback: encrypt each fragment through the HS-facing
+ * (backward) leg of the intro circuit and ship it to the HS.  ctx must be
+ * the HS-facing intro_circ. */
+static int relay_intro2_frag_send_cb(uint32_t circuit_id, uint8_t relay_cmd,
+                                      uint16_t stream_id,
+                                      const uint8_t *data, uint16_t data_len,
+                                      void *ctx) {
+    moor_circuit_t *intro_circ = (moor_circuit_t *)ctx;
+    if (!intro_circ->prev_conn ||
+        intro_circ->prev_conn->state != CONN_STATE_OPEN)
+        return -1;
+    moor_cell_t cell;
+    moor_cell_relay(&cell, circuit_id, relay_cmd, stream_id, data, data_len);
+    moor_relay_set_digest(cell.payload, intro_circ->relay_backward_digest);
+    moor_circuit_relay_encrypt(intro_circ, &cell);
+    if (moor_connection_send_cell(intro_circ->prev_conn, &cell) != 0) {
+        LOG_DEBUG("INTRODUCE2 fragment: send_cell failed");
+        return -1;
+    }
+    return 0;
+}
+
+/* Shared INTRODUCE1 processing: verify PoW, locate intro circuit by
+ * blinded_pk, forward sealed body to HS as INTRODUCE2 (fragmented).
+ * Called from both the single-cell RELAY_INTRODUCE1 path and from the
+ * RELAY_FRAGMENT reassembly path (inner_cmd == RELAY_INTRODUCE1). */
+static int relay_handle_introduce1(moor_circuit_t *circ,
+                                    moor_connection_t *conn,
+                                    const uint8_t *data, size_t data_len) {
+    if (data_len < 33) {
+        LOG_WARN("INTRODUCE1: payload too short (%zu)", data_len);
+        return -1;
+    }
+    const uint8_t *intro1_blinded_pk = data;
+    const uint8_t *intro1_body = data + 32;
+    size_t intro1_body_len = data_len - 32;
+
+    /* Rate limit INTRODUCE1 per peer */
+    struct sockaddr_storage isa;
+    socklen_t islen = sizeof(isa);
+    if (conn && getpeername(conn->fd, (struct sockaddr *)&isa, &islen) == 0) {
+        char iip[INET6_ADDRSTRLEN];
+        if (isa.ss_family == AF_INET6)
+            inet_ntop(AF_INET6,
+                      &((struct sockaddr_in6 *)&isa)->sin6_addr,
+                      iip, sizeof(iip));
+        else
+            inet_ntop(AF_INET,
+                      &((struct sockaddr_in *)&isa)->sin_addr,
+                      iip, sizeof(iip));
+        if (!moor_ratelimit_check(iip, MOOR_RL_INTRO)) {
+            LOG_WARN("rate limit: INTRODUCE1 rejected");
+            return -1;
+        }
+    }
+
+    moor_circuit_t *intro_circ =
+        moor_circuit_find_by_intro_pk(circ, intro1_blinded_pk);
+    if (!intro_circ) {
+        LOG_WARN("INTRODUCE1: no ESTABLISH_INTRO circuit for pk=%02x%02x...",
+                 intro1_blinded_pk[0], intro1_blinded_pk[1]);
+        return -1;
+    }
+
+    /* PoW verification (H2) */
+    if (intro_circ->intro_pow_difficulty > 0) {
+        if (intro1_body_len < 9) {
+            LOG_WARN("INTRODUCE1: PoW required but body too short (%zu bytes)",
+                     intro1_body_len);
+            return -1;
+        }
+        uint8_t pow_flag = intro1_body[0];
+        if (pow_flag == 0x01 && intro1_body_len >= 9) {
+            uint64_t pow_nonce = 0;
+            for (int b = 0; b < 8; b++)
+                pow_nonce = (pow_nonce << 8) | intro1_body[1 + b];
+            if (moor_pow_verify_hs(intro_circ->intro_pow_seed,
+                                    intro_circ->intro_service_pk,
+                                    pow_nonce,
+                                    intro_circ->intro_pow_difficulty,
+                                    0) != 0) {
+                LOG_WARN("INTRODUCE1: PoW verification failed");
+                return -1;
+            }
+            LOG_DEBUG("INTRODUCE1: PoW verified");
+        } else if (pow_flag != 0x01) {
+            LOG_WARN("INTRODUCE1: PoW required but not provided");
+            return -1;
+        }
+    }
+
+    /* Strip blinded_pk + PoW prefix to get the sealed box for INTRODUCE2 */
+    if (intro1_body_len < 1) {
+        LOG_WARN("INTRODUCE1: empty body after blinded_pk");
+        return -1;
+    }
+    const uint8_t *sealed;
+    size_t sealed_len;
+    if (intro1_body[0] == 0x01 && intro1_body_len > 9) {
+        sealed = intro1_body + 9;
+        sealed_len = intro1_body_len - 9;
+    } else if (intro1_body[0] != 0x01 && intro1_body_len > 1) {
+        sealed = intro1_body + 1;
+        sealed_len = intro1_body_len - 1;
+    } else {
+        LOG_WARN("INTRODUCE1: body too short for sealed box");
+        return -1;
+    }
+    if (!intro_circ->prev_conn ||
+        intro_circ->prev_conn->state != CONN_STATE_OPEN) {
+        LOG_WARN("INTRODUCE1: intro circuit prev_conn gone");
+        return -1;
+    }
+
+    /* Forward sealed body to HS as RELAY_INTRODUCE2 (fragmented if large) */
+    if (moor_fragment_send(intro_circ->prev_circuit_id, RELAY_INTRODUCE2, 0,
+                            sealed, sealed_len,
+                            moor_fragment_gen_id(),
+                            relay_intro2_frag_send_cb, intro_circ) != 0) {
+        LOG_WARN("INTRODUCE1: failed to forward as INTRODUCE2");
+        return -1;
+    }
+    LOG_INFO("INTRODUCE1: forwarded as INTRODUCE2 to HS (pk=%02x%02x..., %zuB sealed)",
+             intro1_blinded_pk[0], intro1_blinded_pk[1], sealed_len);
+    return 0;
+}
+
 int moor_relay_handle_relay(moor_connection_t *conn,
                             const moor_cell_t *cell) {
     moor_circuit_t *circ = moor_circuit_find(cell->circuit_id, conn);
@@ -2426,105 +2553,11 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                 return 0;
             }
             case RELAY_INTRODUCE1: {
-                /* INTRODUCE1 payload:
-                 *   blinded_pk(32) + pow_flag(1) + [nonce(8) if PoW] + sealed_box
-                 * The blinded_pk lets us route to the correct ESTABLISH_INTRO circuit. */
-                if (relay.data_length < 33) {
-                    LOG_WARN("INTRODUCE1: payload too short (%u)", relay.data_length);
-                    return -1;
-                }
-                const uint8_t *intro1_blinded_pk = relay.data;
-                const uint8_t *intro1_body = relay.data + 32;
-                uint16_t intro1_body_len = relay.data_length - 32;
-
-                /* Rate limit INTRODUCE1 per peer */
-                struct sockaddr_storage isa;
-                socklen_t islen = sizeof(isa);
-                if (getpeername(conn->fd, (struct sockaddr *)&isa, &islen) == 0) {
-                    char iip[INET6_ADDRSTRLEN];
-                    if (isa.ss_family == AF_INET6)
-                        inet_ntop(AF_INET6,
-                                  &((struct sockaddr_in6 *)&isa)->sin6_addr,
-                                  iip, sizeof(iip));
-                    else
-                        inet_ntop(AF_INET,
-                                  &((struct sockaddr_in *)&isa)->sin_addr,
-                                  iip, sizeof(iip));
-                    if (!moor_ratelimit_check(iip, MOOR_RL_INTRO)) {
-                        LOG_WARN("rate limit: INTRODUCE1 rejected");
-                        return -1;
-                    }
-                }
-                /* Find the matching ESTABLISH_INTRO circuit by blinded_pk */
-                moor_circuit_t *intro_circ =
-                    moor_circuit_find_by_intro_pk(circ, intro1_blinded_pk);
-                if (!intro_circ) {
-                    LOG_WARN("INTRODUCE1: no ESTABLISH_INTRO circuit for pk=%02x%02x...",
-                             intro1_blinded_pk[0], intro1_blinded_pk[1]);
-                    return -1;
-                }
-                /* H2: PoW verification -- use matched circuit's pow params */
-                if (intro_circ->intro_pow_difficulty > 0) {
-                    if (intro1_body_len < 9) {
-                        LOG_WARN("INTRODUCE1: PoW required but body too short (%u bytes)",
-                                 intro1_body_len);
-                        return -1;
-                    }
-                    uint8_t pow_flag = intro1_body[0];
-                    if (pow_flag == 0x01 && intro1_body_len >= 9) {
-                        uint64_t pow_nonce = 0;
-                        for (int b = 0; b < 8; b++)
-                            pow_nonce = (pow_nonce << 8) | intro1_body[1 + b];
-                        if (moor_pow_verify_hs(intro_circ->intro_pow_seed,
-                                                intro_circ->intro_service_pk,
-                                                pow_nonce,
-                                                intro_circ->intro_pow_difficulty,
-                                                0) != 0) {
-                            LOG_WARN("INTRODUCE1: PoW verification failed");
-                            return -1;
-                        }
-                        LOG_DEBUG("INTRODUCE1: PoW verified");
-                    } else if (pow_flag != 0x01) {
-                        LOG_WARN("INTRODUCE1: PoW required but not provided");
-                        return -1;
-                    }
-                }
-                /* Strip blinded_pk + PoW prefix to get the sealed box for INTRODUCE2 */
-                {
-                    if (intro1_body_len < 1) {
-                        LOG_WARN("INTRODUCE1: empty body after blinded_pk");
-                        return -1;
-                    }
-                    const uint8_t *sealed;
-                    uint16_t sealed_len;
-                    if (intro1_body[0] == 0x01 && intro1_body_len > 9) {
-                        sealed = intro1_body + 9;
-                        sealed_len = intro1_body_len - 9;
-                    } else if (intro1_body[0] != 0x01 && intro1_body_len > 1) {
-                        sealed = intro1_body + 1;
-                        sealed_len = intro1_body_len - 1;
-                    } else {
-                        LOG_WARN("INTRODUCE1: body too short for sealed box");
-                        return -1;
-                    }
-                    if (!intro_circ->prev_conn ||
-                        intro_circ->prev_conn->state != CONN_STATE_OPEN) {
-                        LOG_WARN("INTRODUCE1: intro circuit prev_conn gone");
-                        return -1;
-                    }
-                    moor_cell_t intro2;
-                    moor_cell_relay(&intro2, intro_circ->prev_circuit_id,
-                                   RELAY_INTRODUCE2, 0,
-                                   sealed, sealed_len);
-                    moor_relay_set_digest(intro2.payload,
-                                          intro_circ->relay_backward_digest);
-                    moor_circuit_relay_encrypt(intro_circ, &intro2);
-                    if (moor_connection_send_cell(intro_circ->prev_conn, &intro2) != 0)
-                        LOG_DEBUG("send_cell failed (line %d)", __LINE__);
-                    LOG_INFO("INTRODUCE1: forwarded as INTRODUCE2 to HS (pk=%02x%02x...)",
-                             intro1_blinded_pk[0], intro1_blinded_pk[1]);
-                }
-                return 0;
+                /* Single-cell INTRODUCE1 path. Post-PQ migration most
+                 * INTRODUCE1 payloads arrive as RELAY_FRAGMENT/FRAGMENT_END
+                 * (sealed box grew to 1188B), but accept single-cell too. */
+                return relay_handle_introduce1(circ, conn,
+                                                relay.data, relay.data_length);
             }
             case RELAY_ESTABLISH_RENDEZVOUS: {
                 if (relay.data_length < MOOR_RENDEZVOUS_COOKIE_LEN) {
@@ -2647,6 +2680,12 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                     /* Complete reassembly -- process the inner command */
                     LOG_INFO("fragment reassembled: cmd=%d len=%zu",
                              inner_cmd, reassembled_len);
+                    if (inner_cmd == RELAY_INTRODUCE1) {
+                        /* PQ-sealed INTRODUCE1 arrives fragmented (~1229B). */
+                        return relay_handle_introduce1(circ, conn,
+                                                        reassembled,
+                                                        reassembled_len);
+                    }
                     if (inner_cmd == RELAY_EXTEND_PQ) {
                         /* Concurrency cap for blocking EXTEND_PQ (#R1-B3) */
                         if (g_extend_pq_inflight >= MOOR_MAX_PQ_EXTEND_INFLIGHT) {
