@@ -3686,11 +3686,14 @@ int moor_relay_register(const moor_relay_config_t *config) {
                             config->advertise_addr : config->bind_addr;
 
     moor_node_descriptor_t desc;
+    const uint8_t *falcon_pk = config->falcon_ready ? config->falcon_pk : NULL;
+    const uint8_t *falcon_sk = config->falcon_ready ? config->falcon_sk : NULL;
     if (moor_node_create_descriptor(&desc, config->identity_pk,
                                      config->identity_sk, config->onion_pk,
                                      advertise, config->or_port,
                                      config->dir_port, config->flags,
-                                     config->bandwidth) != 0) {
+                                     config->bandwidth,
+                                     falcon_pk, falcon_sk) != 0) {
         return -1;
     }
 
@@ -3748,11 +3751,12 @@ int moor_relay_register(const moor_relay_config_t *config) {
     desc.onion_key_version = config->onion_key_version;
     desc.onion_key_published = config->onion_key_published;
 
-    /* Re-sign after all post-creation field modifications */
-    if (moor_node_sign_descriptor(&desc, config->identity_sk) != 0)
+    /* Re-sign after all post-creation field modifications (dual Ed25519+Falcon
+     * if the relay has a Falcon identity). */
+    if (moor_node_sign_descriptor(&desc, config->identity_sk, falcon_sk) != 0)
         return -1;
 
-    uint8_t wire[2048]; /* Enlarged for V3 descriptors with family data */
+    uint8_t wire[4096]; /* Enlarged for V8 descriptors with Falcon pk+sig (~1650B) */
     int wire_len = moor_node_descriptor_serialize(wire, sizeof(wire), &desc);
     if (wire_len < 0) return -1;
 

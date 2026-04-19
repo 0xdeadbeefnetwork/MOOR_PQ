@@ -97,6 +97,7 @@ extern const char moor_build_id[MOOR_BUILD_ID_LEN];
 #define NODE_FEATURE_CONTACT    (1u << 3)  /* Has operator contact info (V5) */
 #define NODE_FEATURE_CELL_KEM   (1u << 4)  /* KEM CT via CELL_KEM_CT (v0.8+) */
 #define NODE_FEATURE_BUILD_ID   (1u << 5)  /* Descriptor carries 16-byte build_id (v0.8.2) */
+#define NODE_FEATURE_FALCON     (1u << 6)  /* Descriptor carries Falcon-512 pk + sig (PQ identity) */
 
 /* Minimum required feature set for DA to accept a relay descriptor.
  * Old nodes without CELL_KEM cause wire framing desync on the network.

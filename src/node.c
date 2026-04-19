@@ -103,7 +103,9 @@ int moor_node_create_descriptor(moor_node_descriptor_t *desc,
                                 const uint8_t onion_pk[32],
                                 const char *address, uint16_t or_port,
                                 uint16_t dir_port, uint32_t flags,
-                                uint64_t bandwidth) {
+                                uint64_t bandwidth,
+                                const uint8_t *falcon_pk,
+                                const uint8_t *falcon_sk) {
     memset(desc, 0, sizeof(*desc));
     memcpy(desc->identity_pk, identity_pk, 32);
     memcpy(desc->onion_pk, onion_pk, 32);
@@ -114,25 +116,47 @@ int moor_node_create_descriptor(moor_node_descriptor_t *desc,
     desc->flags = flags;
     desc->bandwidth = bandwidth;
     desc->published = (uint64_t)time(NULL);
+    if (falcon_pk) {
+        memcpy(desc->falcon_pk, falcon_pk, MOOR_FALCON_PK_LEN);
+        desc->features |= NODE_FEATURE_FALCON;
+    }
 
-    /* Sign all fields including V3/V4 via shared serializer (#207) */
-    uint8_t *buf = malloc(2048);
+    /* Sign all fields including V3/V4/V8 via shared serializer.
+     * Buffer must hold signable bytes; enlarged to 4096 to cover
+     * V8's 897-byte Falcon pk. */
+    uint8_t *buf = malloc(4096);
     if (!buf) return -1;
     size_t off = desc_sign_serialize(buf, desc);
     int ret = moor_crypto_sign(desc->signature, buf, off, identity_sk);
+    if (ret == 0 && falcon_sk && falcon_pk) {
+        size_t sig_len = 0;
+        ret = moor_falcon_sign(desc->falcon_signature, &sig_len,
+                               buf, off, falcon_sk);
+        if (ret == 0) desc->falcon_sig_len = (uint16_t)sig_len;
+    }
     free(buf);
     return ret;
 }
 
-/* Compute wire features: auto-set FAMILY/NICKNAME/BUILD_ID bits to match serialization */
+/* Detect whether the descriptor has a populated Falcon identity pk
+ * (non-zero). A sentinel test is safe: Falcon pks are pseudo-random. */
+static int desc_has_falcon(const moor_node_descriptor_t *desc) {
+    for (size_t i = 0; i < MOOR_FALCON_PK_LEN; i++)
+        if (desc->falcon_pk[i]) return 1;
+    return 0;
+}
+
+/* Compute wire features: auto-set FAMILY/NICKNAME/BUILD_ID/FALCON bits to match serialization */
 static uint32_t desc_wire_features(const moor_node_descriptor_t *desc) {
     uint32_t f = desc->features;
     int is_v3 = (desc->num_family_members > 0);
     int has_v4 = (desc->nickname[0] != '\0' || desc->onion_key_version > 0);
     int has_v7 = (desc->build_id[0] != '\0');
+    int has_v8 = desc_has_falcon(desc);
     if (is_v3 || has_v4) f |= NODE_FEATURE_FAMILY;
     if (has_v4)           f |= NODE_FEATURE_NICKNAME;
     if (has_v7)           f |= NODE_FEATURE_BUILD_ID;
+    if (has_v8)           f |= NODE_FEATURE_FALCON;
     return f;
 }
 
@@ -175,29 +199,54 @@ static size_t desc_sign_serialize(uint8_t *buf, const moor_node_descriptor_t *de
     for (int i = 7; i >= 0; i--) buf[off++] = (uint8_t)(desc->onion_key_published >> (i * 8));
     /* V7: build_id must be signed so a MITM can't strip it and bypass DA gating */
     memcpy(buf + off, desc->build_id, 16); off += 16;
+    /* V8: Falcon identity pk — only included if descriptor has Falcon.
+     * Gating on the pk content (rather than the feature bit) matches
+     * desc_wire_features which sets the bit iff falcon_pk is non-zero,
+     * and keeps pre-Falcon descriptors wire-compatible. */
+    if (desc_has_falcon(desc)) {
+        memcpy(buf + off, desc->falcon_pk, MOOR_FALCON_PK_LEN);
+        off += MOOR_FALCON_PK_LEN;
+    }
     return off;
 }
 
 int moor_node_sign_descriptor(moor_node_descriptor_t *desc,
-                              const uint8_t identity_sk[64]) {
+                              const uint8_t identity_sk[64],
+                              const uint8_t *falcon_sk) {
     /* Ensure features match what serialization will produce */
     desc->features = desc_wire_features(desc);
 
-    uint8_t *buf = malloc(2048);
+    uint8_t *buf = malloc(4096);
     if (!buf) return -1;
     size_t off = desc_sign_serialize(buf, desc);
 
     int ret = moor_crypto_sign(desc->signature, buf, off, identity_sk);
+    if (ret == 0 && falcon_sk && (desc->features & NODE_FEATURE_FALCON)) {
+        size_t sig_len = 0;
+        ret = moor_falcon_sign(desc->falcon_signature, &sig_len,
+                               buf, off, falcon_sk);
+        if (ret == 0) desc->falcon_sig_len = (uint16_t)sig_len;
+    }
     free(buf);
     return ret;
 }
 
 int moor_node_verify_descriptor(const moor_node_descriptor_t *desc) {
-    uint8_t *buf = malloc(2048);
+    uint8_t *buf = malloc(4096);
     if (!buf) return -1;
     size_t off = desc_sign_serialize(buf, desc);
 
     int ret = moor_crypto_sign_verify(desc->signature, buf, off, desc->identity_pk);
+    if (ret == 0 && (desc->features & NODE_FEATURE_FALCON)) {
+        if (desc->falcon_sig_len == 0 ||
+            desc->falcon_sig_len > MOOR_FALCON_SIG_MAX_LEN) {
+            ret = -1;
+        } else {
+            ret = moor_falcon_verify(desc->falcon_signature,
+                                      desc->falcon_sig_len,
+                                      buf, off, desc->falcon_pk);
+        }
+    }
     free(buf);
     return ret;
 }
@@ -241,6 +290,8 @@ size_t moor_node_descriptor_signable_serialize(uint8_t *buf,
 #define DESC_V4_EXTRA     140
 #define DESC_V5_EXTRA     128   /* contact_info(128) */
 #define DESC_V7_EXTRA     16    /* build_id(16) */
+/* V8: falcon_pk(897) + falcon_sig_len(2) + falcon_signature(≤752) */
+#define DESC_V8_EXTRA_MAX (MOOR_FALCON_PK_LEN + 2 + MOOR_FALCON_SIG_MAX_LEN)
 
 int moor_node_descriptor_serialize(uint8_t *out, size_t out_len,
                                    const moor_node_descriptor_t *desc) {
@@ -249,6 +300,7 @@ int moor_node_descriptor_serialize(uint8_t *out, size_t out_len,
     int has_v4 = (desc->nickname[0] != '\0' || desc->onion_key_version > 0);
     int has_v5 = (desc->contact_info[0] != '\0');
     int has_v7 = (desc->build_id[0] != '\0');
+    int has_v8 = (desc->features & NODE_FEATURE_FALCON) && desc_has_falcon(desc);
     size_t needed = is_v2 ? DESC_V2_WIRE_SIZE : DESC_WIRE_SIZE;
     if (is_v3)
         needed += 1 + (size_t)desc->num_family_members * 32 + 32;
@@ -266,6 +318,8 @@ int moor_node_descriptor_serialize(uint8_t *out, size_t out_len,
         needed += 2; /* V6: protocol_version */
     if (has_v7)
         needed += DESC_V7_EXTRA;
+    if (has_v8)
+        needed += MOOR_FALCON_PK_LEN + 2 + desc->falcon_sig_len;
     if (out_len < needed) return -1;
 
     size_t off = 0;
@@ -285,12 +339,13 @@ int moor_node_descriptor_serialize(uint8_t *out, size_t out_len,
     memcpy(out + off, desc->signature, 64); off += 64;
 
     if (is_v2) {
-        /* Auto-set feature flags so deserializer can detect V3/V4/V5/V7 */
+        /* Auto-set feature flags so deserializer can detect V3/V4/V5/V7/V8 */
         uint32_t wire_features = desc->features;
         if (is_v3 || has_v4) wire_features |= NODE_FEATURE_FAMILY;
         if (has_v4)          wire_features |= NODE_FEATURE_NICKNAME;
         if (has_v5)          wire_features |= NODE_FEATURE_CONTACT;
         if (has_v7)          wire_features |= NODE_FEATURE_BUILD_ID;
+        if (has_v8)          wire_features |= NODE_FEATURE_FALCON;
         out[off++] = (uint8_t)(wire_features >> 24);
         out[off++] = (uint8_t)(wire_features >> 16);
         out[off++] = (uint8_t)(wire_features >> 8);
@@ -344,6 +399,16 @@ int moor_node_descriptor_serialize(uint8_t *out, size_t out_len,
     /* V7: build_id (16 bytes, fixed) — only written if non-empty */
     if (has_v7) {
         memcpy(out + off, desc->build_id, 16); off += 16;
+    }
+
+    /* V8: Falcon identity pk + variable-length signature */
+    if (has_v8) {
+        memcpy(out + off, desc->falcon_pk, MOOR_FALCON_PK_LEN);
+        off += MOOR_FALCON_PK_LEN;
+        out[off++] = (uint8_t)(desc->falcon_sig_len >> 8);
+        out[off++] = (uint8_t)(desc->falcon_sig_len);
+        memcpy(out + off, desc->falcon_signature, desc->falcon_sig_len);
+        off += desc->falcon_sig_len;
     }
 
     return (int)off;
@@ -464,6 +529,26 @@ int moor_node_descriptor_deserialize(moor_node_descriptor_t *desc,
                 if (ch == 0) break;
                 if (ch < 0x20 || ch >= 0x7F) desc->build_id[c] = '_';
             }
+        }
+
+        /* V8 extension: Falcon identity pk + sig (gated by NODE_FEATURE_FALCON) */
+        if ((desc->features & NODE_FEATURE_FALCON) &&
+            off + MOOR_FALCON_PK_LEN + 2 <= data_len) {
+            memcpy(desc->falcon_pk, data + off, MOOR_FALCON_PK_LEN);
+            off += MOOR_FALCON_PK_LEN;
+            uint16_t sig_len = ((uint16_t)data[off] << 8) | data[off + 1];
+            off += 2;
+            if (sig_len == 0 || sig_len > MOOR_FALCON_SIG_MAX_LEN ||
+                off + sig_len > data_len) {
+                /* Malformed Falcon extension — clear fields and drop bit */
+                memset(desc->falcon_pk, 0, MOOR_FALCON_PK_LEN);
+                desc->falcon_sig_len = 0;
+                desc->features &= ~NODE_FEATURE_FALCON;
+                return -1;
+            }
+            desc->falcon_sig_len = sig_len;
+            memcpy(desc->falcon_signature, data + off, sig_len);
+            off += sig_len;
         }
     }
 

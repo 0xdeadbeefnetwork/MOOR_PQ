@@ -35,6 +35,12 @@ typedef struct {
     uint16_t protocol_version;      /* MOOR_PROTOCOL_VERSION at build time */
     /* V7 fields (build identifier) */
     char     build_id[16];          /* Git commit short hash; DAs enforce strict equality */
+    /* V8 fields (Phase 3 PQ identity — Falcon-512).
+     * Populated when NODE_FEATURE_FALCON set in features. The Ed25519
+     * signature covers falcon_pk (so it can't be substituted). */
+    uint8_t  falcon_pk[MOOR_FALCON_PK_LEN];              /* 897 bytes */
+    uint8_t  falcon_signature[MOOR_FALCON_SIG_MAX_LEN];  /* ≤752 bytes */
+    uint16_t falcon_sig_len;                             /* actual sig length */
     /* Local-only (not serialized on wire, not signed) */
     uint64_t first_seen;            /* DA-local: when relay first appeared */
     uint64_t last_registered;       /* DA-local: last PUBLISH from this relay (for stale reaper) */
@@ -81,20 +87,28 @@ int  moor_consensus_init(moor_consensus_t *cons, uint32_t capacity);
 void moor_consensus_cleanup(moor_consensus_t *cons);
 int  moor_consensus_copy(moor_consensus_t *dst, const moor_consensus_t *src);
 
-/* Create and sign a node descriptor */
+/* Create and sign a node descriptor.
+ * falcon_pk / falcon_sk may both be NULL for legacy (Ed25519-only) nodes.
+ * If non-NULL, falcon_pk is embedded and descriptor is dual-signed
+ * (Ed25519 covers the bytes including falcon_pk; Falcon signs the same bytes). */
 int moor_node_create_descriptor(moor_node_descriptor_t *desc,
                                 const uint8_t identity_pk[32],
                                 const uint8_t identity_sk[64],
                                 const uint8_t onion_pk[32],
                                 const char *address, uint16_t or_port,
                                 uint16_t dir_port, uint32_t flags,
-                                uint64_t bandwidth);
+                                uint64_t bandwidth,
+                                const uint8_t *falcon_pk,
+                                const uint8_t *falcon_sk);
 
-/* Re-sign a descriptor after modifying fields post-creation */
+/* Re-sign a descriptor after modifying fields post-creation.
+ * If falcon_sk is non-NULL AND desc->falcon_pk is set, co-signs with Falcon. */
 int moor_node_sign_descriptor(moor_node_descriptor_t *desc,
-                              const uint8_t identity_sk[64]);
+                              const uint8_t identity_sk[64],
+                              const uint8_t *falcon_sk);
 
-/* Verify a descriptor's signature */
+/* Verify a descriptor's signature(s). If NODE_FEATURE_FALCON is set in the
+ * descriptor, BOTH the Ed25519 and Falcon signatures must verify. */
 int moor_node_verify_descriptor(const moor_node_descriptor_t *desc);
 
 /* Serialize descriptor to wire format. Returns bytes written. */

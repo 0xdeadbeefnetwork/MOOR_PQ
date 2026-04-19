@@ -39,6 +39,11 @@ typedef struct {
     /* Kyber768 KEM keypair for PQ circuit crypto */
     uint8_t  kem_pk[MOOR_KEM_PK_LEN];
     uint8_t  kem_sk[MOOR_KEM_SK_LEN];
+    /* Falcon-512 identity keypair for PQ descriptor signing (Phase 3).
+     * falcon_ready==0 means the relay has no Falcon identity (legacy boot). */
+    uint8_t  falcon_pk[MOOR_FALCON_PK_LEN];
+    uint8_t  falcon_sk[MOOR_FALCON_SK_LEN];
+    int      falcon_ready;
     /* Bridge mode: relay serves as unlisted bridge, never in consensus */
     int      is_bridge;
     /* Operator contact info */

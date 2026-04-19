@@ -1782,6 +1782,11 @@ static int run_relay(void) {
     memcpy(g_relay_cfg.identity_sk, g_identity_sk, 64);
     memcpy(g_relay_cfg.onion_pk, g_onion_pk, 32);
     memcpy(g_relay_cfg.onion_sk, g_onion_sk, 32);
+    if (g_falcon_identity_ready) {
+        memcpy(g_relay_cfg.falcon_pk, g_falcon_identity_pk, MOOR_FALCON_PK_LEN);
+        memcpy(g_relay_cfg.falcon_sk, g_falcon_identity_sk, MOOR_FALCON_SK_LEN);
+        g_relay_cfg.falcon_ready = 1;
+    }
     g_relay_cfg.or_port = g_or_port;
     g_relay_cfg.dir_port = 0;
     g_relay_cfg.flags = g_relay_flags;

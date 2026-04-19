@@ -1843,9 +1843,11 @@ static int da_dispatch_request(int client_fd, moor_da_config_t *config,
         if (cmd_len >= 11 && memcmp(cmd_data, "SYNC_RELAYS", 11) == 0) {
             da_lock(config);
             /* Build response: count(4) + [len(2) + descriptor]... */
+            /* Per-relay wire budget: V2+V3+V4+V5+V6+V7 ≈ 1800 bytes,
+             * V8 adds ~1650 (Falcon pk + sig). Round to 4096 per relay. */
             size_t resp_sz = 4;
             for (uint32_t i = 0; i < config->consensus.num_relays; i++)
-                resp_sz += 2 + 2048; /* overestimate per relay */
+                resp_sz += 2 + 4096; /* overestimate per relay, covers V8 Falcon */
             uint8_t *resp = malloc(resp_sz);
             if (resp) {
                 uint32_t count = config->consensus.num_relays;
@@ -2684,7 +2686,7 @@ static int da_dispatch_request(int client_fd, moor_da_config_t *config,
         count_buf[3] = (uint8_t)(count);
         send(client_fd, (char *)count_buf, 4, MSG_NOSIGNAL);
 
-        uint8_t desc_wire[2048];
+        uint8_t desc_wire[4096]; /* V8 descriptors with Falcon pk+sig ≈ 3500B max */
         for (uint32_t i = 0; i < count; i++) {
             int dlen = moor_node_descriptor_serialize(desc_wire + 2,
                 sizeof(desc_wire) - 2, &config->consensus.relays[i]);
@@ -2926,7 +2928,7 @@ int moor_da_sync_relays(moor_da_config_t *config) {
                         }
                     }
                     if (diag_match >= 0) {
-                        uint8_t buf_local[2048], buf_peer[2048];
+                        uint8_t buf_local[4096], buf_peer[4096]; /* V8 adds 897B Falcon pk to signable */
                         size_t len_local = moor_node_descriptor_signable_serialize(
                             buf_local, &config->consensus.relays[diag_match]);
                         size_t len_peer = moor_node_descriptor_signable_serialize(
