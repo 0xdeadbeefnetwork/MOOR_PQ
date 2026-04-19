@@ -1548,8 +1548,8 @@ void moor_connection_close(moor_connection_t *conn) {
     /* Guard against double-close on already-freed (poisoned) connections */
     if (conn->fd < 0 && conn->state == CONN_STATE_NONE && conn->generation > 0)
         return;
-    LOG_WARN("connection_close: conn=%p fd=%d state=%d gen=%u",
-             (void*)conn, conn->fd, conn->state, conn->generation);
+    LOG_DEBUG("connection_close: conn=%p fd=%d state=%d gen=%u",
+              (void*)conn, conn->fd, conn->state, conn->generation);
     /* Purge any pending mix pool entries for this connection */
     moor_mix_purge_conn(conn);
     /* Nullify all circuit pointers to this connection before freeing */

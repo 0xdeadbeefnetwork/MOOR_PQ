@@ -688,8 +688,8 @@ int moor_circuit_conn_in_use(moor_connection_t *conn) {
 
 void moor_circuit_teardown_for_conn(moor_connection_t *conn) {
     MOOR_ASSERT_MSG(conn != NULL, "teardown_for_conn: NULL conn");
-    LOG_WARN("teardown_for_conn: conn=%p fd=%d state=%d gen=%u",
-             (void*)conn, conn->fd, conn->state, conn->generation);
+    LOG_DEBUG("teardown_for_conn: conn=%p fd=%d state=%d gen=%u",
+              (void*)conn, conn->fd, conn->state, conn->generation);
 
     /* Tor-aligned: mark ALL circuits on this dying connection for close.
      * No inline free, no cascade, no UAF.  DESTROY cells and cleanup
