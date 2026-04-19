@@ -392,7 +392,8 @@ int moor_hs_load_keys(moor_hs_config_t *config) {
     fclose(f);
 
     /* Load KEM keypair if it exists (PQ hybrid e2e) — before computing
-     * address so the KEM pk hash is included in the .moor address. */
+     * address so the KEM pk hash is included in the .moor address.
+     * If missing, generate + persist fresh ML-KEM-768 keys. */
     snprintf(path, sizeof(path), "%s/kem_sk", config->hs_dir);
     f = nofollow_fopen(path);
     if (f) {
@@ -412,6 +413,38 @@ int moor_hs_load_keys(moor_hs_config_t *config) {
         }
     }
 
+    if (!config->kem_generated) {
+        if (moor_kem_keygen(config->kem_pk, config->kem_sk) != 0) {
+            LOG_ERROR("HS: failed to generate ML-KEM keypair");
+            return -1;
+        }
+        config->kem_generated = 1;
+        LOG_INFO("HS: generated fresh ML-KEM-768 keypair (no prior kem_sk on disk)");
+
+        snprintf(path, sizeof(path), "%s/kem_sk", config->hs_dir);
+        f = fopen(path, "wb");
+        if (!f) { LOG_ERROR("HS: failed to open %s", path); return -1; }
+        if (fwrite(config->kem_sk, 1, sizeof(config->kem_sk), f) !=
+            sizeof(config->kem_sk)) {
+            LOG_ERROR("HS: short write on %s", path);
+            fclose(f);
+            return -1;
+        }
+        fclose(f);
+        chmod(path, 0600);
+
+        snprintf(path, sizeof(path), "%s/kem_pk", config->hs_dir);
+        f = fopen(path, "wb");
+        if (!f) { LOG_ERROR("HS: failed to open %s", path); return -1; }
+        if (fwrite(config->kem_pk, 1, sizeof(config->kem_pk), f) !=
+            sizeof(config->kem_pk)) {
+            LOG_ERROR("HS: short write on %s", path);
+            fclose(f);
+            return -1;
+        }
+        fclose(f);
+    }
+
     /* Compute PQ-committed .moor address (includes KEM pk hash if available) */
     moor_hs_compute_address(config->moor_address, sizeof(config->moor_address),
                             config->identity_pk,
@@ -423,6 +456,16 @@ int moor_hs_load_keys(moor_hs_config_t *config) {
     moor_crypto_blind_keypair(config->blinded_pk, config->blinded_sk,
                               config->identity_pk, config->identity_sk,
                               config->current_time_period);
+
+    /* Ensure hostname file exists (may be missing after a kem key regen) */
+    snprintf(path, sizeof(path), "%s/hostname", config->hs_dir);
+    if (access(path, F_OK) != 0) {
+        f = fopen(path, "w");
+        if (f) {
+            fprintf(f, "%s\n", config->moor_address);
+            fclose(f);
+        }
+    }
 
     LOG_INFO("HS keys loaded (PQ-committed address)");
     return 0;
