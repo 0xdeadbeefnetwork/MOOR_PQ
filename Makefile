@@ -18,7 +18,8 @@ EXTRA_LDFLAGS ?=
 
 CFLAGS = -Wall -Wextra -O2 -g3 -fno-strict-aliasing -fstack-protector-strong \
          -fno-omit-frame-pointer \
-         -D_FORTIFY_SOURCE=2 -Iinclude -Isrc/kyber -Isrc/dilithium \
+         -D_FORTIFY_SOURCE=2 -Iinclude \
+         -Isrc/pqclean -Isrc/pqclean/common \
          -fPIE -Wformat -Wformat-security \
          -DMOOR_SYSCONFDIR='"$(SYSCONFDIR)/moor"' \
          $(SODIUM_CFLAGS) $(LIBEVENT_CFLAGS) $(ZLIB_CFLAGS) $(EXTRA_CFLAGS)
@@ -78,6 +79,7 @@ SOURCES = $(SRCDIR)/log.c \
           $(SRCDIR)/transport_nether.c \
           $(SRCDIR)/dht.c \
           $(SRCDIR)/sig.c \
+          $(SRCDIR)/falcon.c \
           $(SRCDIR)/mix.c \
           $(SRCDIR)/wfpad.c \
           $(SRCDIR)/sandbox.c \
@@ -85,16 +87,17 @@ SOURCES = $(SRCDIR)/log.c \
           $(SRCDIR)/dns_server.c \
           $(SRCDIR)/exit_notice.c
 
-KYBER_SOURCES = $(wildcard $(SRCDIR)/kyber/*.c)
-DILITHIUM_SOURCES = $(wildcard $(SRCDIR)/dilithium/*.c)
+PQCLEAN_SOURCES = $(wildcard $(SRCDIR)/pqclean/common/*.c) \
+                  $(wildcard $(SRCDIR)/pqclean/ml_kem_768/*.c) \
+                  $(wildcard $(SRCDIR)/pqclean/falcon_512/*.c) \
+                  $(wildcard $(SRCDIR)/pqclean/ml_dsa_65/*.c)
 
 MAIN_SRC = $(SRCDIR)/main.c
 OBJECTS = $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.o,$(SOURCES))
-KYBER_OBJECTS = $(patsubst $(SRCDIR)/kyber/%.c,$(OBJDIR)/kyber/%.o,$(KYBER_SOURCES))
-DILITHIUM_OBJECTS = $(patsubst $(SRCDIR)/dilithium/%.c,$(OBJDIR)/dilithium/%.o,$(DILITHIUM_SOURCES))
+PQCLEAN_OBJECTS = $(patsubst $(SRCDIR)/pqclean/%.c,$(OBJDIR)/pqclean/%.o,$(PQCLEAN_SOURCES))
 MAIN_OBJ = $(OBJDIR)/main.o
 
-ALL_OBJECTS = $(OBJECTS) $(KYBER_OBJECTS) $(DILITHIUM_OBJECTS)
+ALL_OBJECTS = $(OBJECTS) $(PQCLEAN_OBJECTS)
 
 TARGET = $(BUILDDIR)/moor
 
@@ -176,16 +179,13 @@ TEST_MLDSA_KAT_TARGET = $(BUILDDIR)/test_mldsa_kat
 
 .PHONY: all clean tests tools test check install uninstall distclean static-analysis asan-test tsan-test fuzz-build fuzz fuzz-clean coverage infer kat dudect cbmc build-moor-top
 
-all: $(OBJDIR) $(OBJDIR)/kyber $(OBJDIR)/dilithium $(TARGET)
+all: $(OBJDIR) $(OBJDIR)/pqclean $(TARGET)
 
 $(OBJDIR):
 	mkdir -p $(OBJDIR)
 
-$(OBJDIR)/kyber:
-	mkdir -p $(OBJDIR)/kyber
-
-$(OBJDIR)/dilithium:
-	mkdir -p $(OBJDIR)/dilithium
+$(OBJDIR)/pqclean:
+	mkdir -p $(OBJDIR)/pqclean/common $(OBJDIR)/pqclean/ml_kem_768 $(OBJDIR)/pqclean/falcon_512 $(OBJDIR)/pqclean/ml_dsa_65
 
 $(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -198,10 +198,8 @@ MOOR_BUILD_ID ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || cat BUILD_
 $(OBJDIR)/build_id.o: $(SRCDIR)/build_id.c | $(OBJDIR)
 	$(CC) $(CFLAGS) -DMOOR_BUILD_ID="\"$(MOOR_BUILD_ID)\"" -c $< -o $@
 
-$(OBJDIR)/kyber/%.o: $(SRCDIR)/kyber/%.c | $(OBJDIR)/kyber
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(OBJDIR)/dilithium/%.o: $(SRCDIR)/dilithium/%.c | $(OBJDIR)/dilithium
+$(OBJDIR)/pqclean/%.o: $(SRCDIR)/pqclean/%.c | $(OBJDIR)/pqclean
+	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(MAIN_OBJ): $(MAIN_SRC) | $(OBJDIR)
