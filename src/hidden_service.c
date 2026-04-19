@@ -2379,7 +2379,7 @@ int moor_hs_decode_address(uint8_t identity_pk[32], const char *address) {
     if (alen < 6) return -1;
     if (strcmp(address + alen - 5, ".moor") != 0) return -1;
 
-    char b32[64];
+    char b32[128];
     size_t b32_len = alen - 5;
     if (b32_len >= sizeof(b32)) return -1;
     memcpy(b32, address, b32_len);
@@ -2388,30 +2388,29 @@ int moor_hs_decode_address(uint8_t identity_pk[32], const char *address) {
     uint8_t decoded[64];
     int decoded_len = moor_base32_decode(decoded, sizeof(decoded), b32, b32_len);
 
-    if (decoded_len == 35) {
-        /* V2 format with checksum */
+    if (decoded_len == 48 || decoded_len == 32) {
+        /* v3: 32 identity_pk + 16 BLAKE2b_16(kem_pk||falcon_pk)
+         * v1: 32 identity_pk (legacy, no PQ commit)
+         * PQ commit verification happens in moor_hs_client_connect_start
+         * against the fetched descriptor; this decoder only extracts the pk. */
         memcpy(identity_pk, decoded, 32);
-
-        /* Verify checksum */
+        return 0;
+    } else if (decoded_len == 35) {
+        /* v2 format with checksum (pre-PQ commit) */
+        memcpy(identity_pk, decoded, 32);
         uint8_t cksum_input[14 + 32 + 1];
         memcpy(cksum_input, ".moor checksum", 14);
         memcpy(cksum_input + 14, identity_pk, 32);
-        cksum_input[46] = decoded[34]; /* version */
+        cksum_input[46] = decoded[34];
 
         uint8_t full_hash[32];
         moor_crypto_hash(full_hash, cksum_input, 47);
-
         if (full_hash[0] != decoded[32] || full_hash[1] != decoded[33]) {
             LOG_WARN("HS address checksum mismatch");
             return -1;
         }
         return 0;
-    } else if (decoded_len == 32) {
-        /* Legacy format (no checksum) */
-        memcpy(identity_pk, decoded, 32);
-        return 0;
     }
-
     return -1;
 }
 

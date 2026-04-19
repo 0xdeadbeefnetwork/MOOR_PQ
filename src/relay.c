@@ -1208,8 +1208,9 @@ static void relay_conn_read_cb(int fd, int events, void *arg) {
         count++;
     }
     if (ret < 0) {
-        LOG_WARN("next-hop connection lost (fd=%d conn=%p state=%d)",
-                 conn->fd, (void*)conn, conn->state);
+        /* Peer closed or read error — normal end-of-life for a relay conn. */
+        LOG_DEBUG("next-hop connection lost (fd=%d conn=%p state=%d)",
+                  conn->fd, (void*)conn, conn->state);
         moor_event_remove(conn->fd);
         moor_circuit_teardown_for_conn(conn);
         moor_connection_close(conn);
@@ -1757,7 +1758,8 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                             const moor_cell_t *cell) {
     moor_circuit_t *circ = moor_circuit_find(cell->circuit_id, conn);
     if (!circ) {
-        LOG_WARN("RELAY cell for unknown circuit %u", cell->circuit_id);
+        /* Normal race: cell arrived after circuit was torn down. */
+        LOG_DEBUG("RELAY cell for unknown circuit %u", cell->circuit_id);
         return -1;
     }
 

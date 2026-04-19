@@ -4448,6 +4448,54 @@ int main(int argc, char **argv) {
             LOG_INFO("SOCKS5 proxy on %s:%u", g_bind_addr, g_socks_port);
         else if (g_mode == MOOR_MODE_RELAY && g_config.nickname[0])
             LOG_INFO("Relay nickname: %s", g_config.nickname);
+
+        /* Verbose client summary: show what the client is actually doing
+         * (listeners, bridges, isolation, PQ features) so operators can
+         * sanity-check config before traffic starts flowing. */
+        if (g_verbose && g_mode == MOOR_MODE_CLIENT) {
+            fprintf(stderr, "\033[36m--- client config (-v) ---\033[0m\n");
+            fprintf(stderr, "  SOCKS5:          %s:%u\n",
+                    g_bind_addr, g_socks_port);
+            if (g_config.trans_port)
+                fprintf(stderr, "  TransPort:       %s:%u (transparent TCP)\n",
+                        g_config.trans_addr[0] ? g_config.trans_addr : "127.0.0.1",
+                        g_config.trans_port);
+            if (g_config.dns_port)
+                fprintf(stderr, "  DNSPort:         %s:%u (UDP resolver)\n",
+                        g_config.dns_addr[0] ? g_config.dns_addr : "127.0.0.1",
+                        g_config.dns_port);
+            if (g_config.control_port)
+                fprintf(stderr, "  ControlPort:     127.0.0.1:%u%s\n",
+                        g_config.control_port,
+                        g_config.control_password[0] ? " (password)" : " (cookie)");
+            fprintf(stderr, "  Guards:          %s\n",
+                    g_config.entry_node[0] ? g_config.entry_node : "auto-selected");
+            fprintf(stderr, "  Bridges:         %s (%d configured)\n",
+                    g_config.use_bridges ? "enabled" : "disabled",
+                    g_config.num_bridges);
+            fprintf(stderr, "  IPv6:            %s%s\n",
+                    g_config.client_use_ipv6 ? "allow" : "v4-only",
+                    g_config.prefer_ipv6 ? ", preferred" : "");
+            fprintf(stderr, "  AutomapHosts:    %s\n",
+                    g_config.automap_hosts ? "on (.moor -> virt IP)" : "off");
+            fprintf(stderr, "  Microdesc:       %s\n",
+                    g_config.use_microdescriptors ? "yes" : "full consensus");
+            fprintf(stderr, "  PIR lookups:     %s\n",
+                    g_config.pir
+                        ? (g_config.pir_dpf ? "DPF-PIR" : "XOR-bitmask")
+                        : "off");
+            fprintf(stderr, "  Conflux:         %s\n",
+                    g_config.conflux ? "on" : "off");
+            fprintf(stderr, "  Crypto:          ML-KEM-768 + X25519 hybrid, "
+                                               "Falcon-512 HS identity\n");
+            if (g_config.enclave_file[0])
+                fprintf(stderr, "  Enclave:         %s (overrides DA list)\n",
+                        g_config.enclave_file);
+            else
+                fprintf(stderr, "  DAs:             %d configured\n",
+                        g_config.num_das);
+            fprintf(stderr, "\033[36m---------------------------\033[0m\n\n");
+        }
     }
 
     /* Register transports */

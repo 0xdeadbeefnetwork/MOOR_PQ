@@ -517,12 +517,21 @@ int moor_dht_handle_store(moor_circuit_t *circ,
                 (uint64_t)time(NULL) / MOOR_TIME_PERIOD_SECS;
             g_dht_store.entries[slot].stored_at = (uint64_t)time(NULL);
         } else {
-            /* Continuation chunk: verify total_data_len matches stored entry */
+            /* Continuation chunk: if total_data_len differs, this is a
+             * republished descriptor (size changed — e.g. auth-client list
+             * grew).  Reset the slot so the new descriptor overwrites the
+             * stale partial. */
             if (total_data_len != g_dht_store.entries[slot].data_len) {
-                LOG_WARN("DHT STORE: total_data_len mismatch (got %u, have %u)",
-                         total_data_len,
-                         (unsigned)g_dht_store.entries[slot].data_len);
-                return -1;
+                LOG_DEBUG("DHT STORE: descriptor resized (%u -> %u), resetting slot",
+                          (unsigned)g_dht_store.entries[slot].data_len,
+                          total_data_len);
+                memset(g_dht_store.entries[slot].data, 0,
+                       sizeof(g_dht_store.entries[slot].data));
+                g_dht_store.entries[slot].data_len = total_data_len;
+                g_dht_store.entries[slot].received_bytes = 0;
+                g_dht_store.entries[slot].epoch =
+                    (uint64_t)time(NULL) / MOOR_TIME_PERIOD_SECS;
+                g_dht_store.entries[slot].stored_at = (uint64_t)time(NULL);
             }
         }
 
