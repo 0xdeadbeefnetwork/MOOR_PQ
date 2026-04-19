@@ -160,25 +160,40 @@ void moor_hs_intro_clear_failures_for(const uint8_t service_pk[32]) {
 
 int moor_hs_compute_address(char *out, size_t out_len,
                             const uint8_t identity_pk[32],
-                            const uint8_t *kem_pk, size_t kem_pk_len) {
-    /* PQ-committed address format (v2):
-     *   base32(Ed25519_pk(32) + BLAKE2b_16(Kyber768_pk)(16)) + ".moor"
+                            const uint8_t *kem_pk, size_t kem_pk_len,
+                            const uint8_t *falcon_pk, size_t falcon_pk_len) {
+    /* PQ-committed address format (v3):
+     *   base32(Ed25519_pk(32) + BLAKE2b_16(kem_pk || falcon_pk)(16)) + ".moor"
      *
-     * The 16-byte hash of the Kyber768 pk is baked into the address.
-     * Breaking Ed25519 lets you decrypt the descriptor (public info anyway)
-     * but you CANNOT forge the service: you'd need a Kyber768 pk that
-     * hashes to the committed value, which requires breaking BLAKE2b.
+     * The 16-byte commit over (ML-KEM pk || Falcon-512 pk) binds the address
+     * to BOTH post-quantum keys. An adversary that breaks Ed25519 still
+     * cannot substitute a different KEM or Falcon pk — that would require
+     * BLAKE2b preimage resistance. Falcon binding future-proofs HS identity
+     * once Ed25519 is broken: clients can reject descriptors whose Falcon pk
+     * doesn't match the address commit.
      *
-     * If kem_pk is NULL, fall back to v1 (Ed25519-only, 32 bytes). */
+     * Backwards compat:
+     *   - Both NULL  -> v1 address (32-byte Ed25519 only).
+     *   - Only kem_pk -> v2 address (old format, KEM-only commit).
+     *   - Both set  -> v3 address (kem_pk || falcon_pk commit). */
     uint8_t addr_data[48]; /* 32 (Ed25519) + 16 (PQ hash) */
     size_t addr_data_len;
 
     memcpy(addr_data, identity_pk, 32);
 
     if (kem_pk && kem_pk_len > 0) {
-        /* BLAKE2b-16: truncated hash of KEM public key */
+        uint8_t commit_buf[1184 + MOOR_FALCON_PK_LEN];
+        size_t commit_len = 0;
+        if (kem_pk_len > sizeof(commit_buf)) return -1;
+        memcpy(commit_buf, kem_pk, kem_pk_len);
+        commit_len = kem_pk_len;
+        if (falcon_pk && falcon_pk_len > 0) {
+            if (commit_len + falcon_pk_len > sizeof(commit_buf)) return -1;
+            memcpy(commit_buf + commit_len, falcon_pk, falcon_pk_len);
+            commit_len += falcon_pk_len;
+        }
         uint8_t full_hash[32];
-        moor_crypto_hash(full_hash, kem_pk, kem_pk_len);
+        moor_crypto_hash(full_hash, commit_buf, commit_len);
         memcpy(addr_data + 32, full_hash, 16);
         addr_data_len = 48;
     } else {
@@ -218,15 +233,22 @@ int moor_hs_keygen(moor_hs_config_t *config) {
     moor_crypto_sign_keygen(config->identity_pk, config->identity_sk);
     moor_crypto_box_keygen(config->onion_pk, config->onion_sk);
 
-    /* Generate Kyber768 keypair for PQ hybrid e2e — BEFORE computing address
-     * so the KEM pk hash is baked into the .moor address. */
+    /* Generate ML-KEM + Falcon-512 keypairs for PQ HS identity — BEFORE
+     * computing address so both PQ pks are baked into the .moor commit. */
     moor_kem_keygen(config->kem_pk, config->kem_sk);
     config->kem_generated = 1;
 
-    /* PQ-committed address: base32(Ed25519_pk + BLAKE2b_16(Kyber768_pk)) */
+    if (moor_falcon_keygen(config->falcon_pk, config->falcon_sk) != 0) {
+        LOG_ERROR("HS: failed to generate Falcon-512 keypair");
+        return -1;
+    }
+    config->falcon_generated = 1;
+
+    /* PQ-committed address: base32(Ed25519_pk + BLAKE2b_16(kem_pk || falcon_pk)) */
     moor_hs_compute_address(config->moor_address, sizeof(config->moor_address),
                             config->identity_pk,
-                            config->kem_pk, sizeof(config->kem_pk));
+                            config->kem_pk, sizeof(config->kem_pk),
+                            config->falcon_pk, sizeof(config->falcon_pk));
 
     /* Derive initial blinded keys for current time period */
     config->current_time_period = current_time_period();
@@ -326,6 +348,42 @@ int moor_hs_save_keys(const moor_hs_config_t *config) {
             fclose(f);
             sodium_memzero((void *)config->kem_sk, sizeof(config->kem_sk));
             unlink(kem_sk_path);
+            return -1;
+        }
+        fflush(f);
+        fclose(f);
+    }
+
+    /* Save Falcon-512 keypair if generated (PQ HS identity) */
+    if (config->falcon_generated) {
+        snprintf(path, sizeof(path), "%s/falcon_sk", config->hs_dir);
+        f = secure_fopen(path, "wb");
+        if (!f) return -1;
+        if (fwrite(config->falcon_sk, 1, sizeof(config->falcon_sk), f) !=
+            sizeof(config->falcon_sk)) {
+            LOG_ERROR("failed to write %s", path);
+            fclose(f);
+            return -1;
+        }
+        fflush(f);
+        fclose(f);
+
+        char falcon_sk_path[512];
+        snprintf(falcon_sk_path, sizeof(falcon_sk_path), "%s/falcon_sk", config->hs_dir);
+
+        snprintf(path, sizeof(path), "%s/falcon_pk", config->hs_dir);
+        f = fopen(path, "wb");
+        if (!f) {
+            sodium_memzero((void *)config->falcon_sk, sizeof(config->falcon_sk));
+            unlink(falcon_sk_path);
+            return -1;
+        }
+        if (fwrite(config->falcon_pk, 1, sizeof(config->falcon_pk), f) !=
+            sizeof(config->falcon_pk)) {
+            LOG_ERROR("failed to write %s", path);
+            fclose(f);
+            sodium_memzero((void *)config->falcon_sk, sizeof(config->falcon_sk));
+            unlink(falcon_sk_path);
             return -1;
         }
         fflush(f);
@@ -445,11 +503,66 @@ int moor_hs_load_keys(moor_hs_config_t *config) {
         fclose(f);
     }
 
-    /* Compute PQ-committed .moor address (includes KEM pk hash if available) */
+    /* Load Falcon-512 keypair if it exists — before computing address so the
+     * Falcon pk hash is included in the v3 .moor commit. Regen-on-missing. */
+    snprintf(path, sizeof(path), "%s/falcon_sk", config->hs_dir);
+    f = nofollow_fopen(path);
+    if (f) {
+        if (fread(config->falcon_sk, 1, sizeof(config->falcon_sk), f) ==
+            sizeof(config->falcon_sk)) {
+            fclose(f);
+            snprintf(path, sizeof(path), "%s/falcon_pk", config->hs_dir);
+            f = nofollow_fopen(path);
+            if (f && fread(config->falcon_pk, 1, sizeof(config->falcon_pk), f) ==
+                sizeof(config->falcon_pk)) {
+                config->falcon_generated = 1;
+                LOG_INFO("HS Falcon-512 keys loaded");
+            }
+            if (f) fclose(f);
+        } else {
+            fclose(f);
+        }
+    }
+
+    if (!config->falcon_generated) {
+        if (moor_falcon_keygen(config->falcon_pk, config->falcon_sk) != 0) {
+            LOG_ERROR("HS: failed to generate Falcon-512 keypair");
+            return -1;
+        }
+        config->falcon_generated = 1;
+        LOG_INFO("HS: generated fresh Falcon-512 keypair (no prior falcon_sk on disk)");
+
+        snprintf(path, sizeof(path), "%s/falcon_sk", config->hs_dir);
+        f = fopen(path, "wb");
+        if (!f) { LOG_ERROR("HS: failed to open %s", path); return -1; }
+        if (fwrite(config->falcon_sk, 1, sizeof(config->falcon_sk), f) !=
+            sizeof(config->falcon_sk)) {
+            LOG_ERROR("HS: short write on %s", path);
+            fclose(f);
+            return -1;
+        }
+        fclose(f);
+        chmod(path, 0600);
+
+        snprintf(path, sizeof(path), "%s/falcon_pk", config->hs_dir);
+        f = fopen(path, "wb");
+        if (!f) { LOG_ERROR("HS: failed to open %s", path); return -1; }
+        if (fwrite(config->falcon_pk, 1, sizeof(config->falcon_pk), f) !=
+            sizeof(config->falcon_pk)) {
+            LOG_ERROR("HS: short write on %s", path);
+            fclose(f);
+            return -1;
+        }
+        fclose(f);
+    }
+
+    /* Compute PQ-committed .moor address (binds ML-KEM + Falcon pks). */
     moor_hs_compute_address(config->moor_address, sizeof(config->moor_address),
                             config->identity_pk,
                             config->kem_generated ? config->kem_pk : NULL,
-                            config->kem_generated ? sizeof(config->kem_pk) : 0);
+                            config->kem_generated ? sizeof(config->kem_pk) : 0,
+                            config->falcon_generated ? config->falcon_pk : NULL,
+                            config->falcon_generated ? sizeof(config->falcon_pk) : 0);
 
     /* Derive blinded keys for current time period */
     config->current_time_period = current_time_period();
@@ -876,6 +989,14 @@ int moor_hs_publish_descriptor(moor_hs_config_t *config) {
     if (config->kem_generated) {
         memcpy(desc.kem_pk, config->kem_pk, 1184);
         desc.kem_available = 1;
+    }
+
+    /* PQ HS identity: publish Falcon-512 pk so clients can verify the
+     * .moor address commits to this pk (and, in future revisions, verify
+     * Falcon signatures over the descriptor body). */
+    if (config->falcon_generated) {
+        memcpy(desc.falcon_pk, config->falcon_pk, sizeof(config->falcon_pk));
+        desc.falcon_available = 1;
     }
 
     /* Fix #182: Sign address_hash + service_pk + BLAKE2b(critical fields).
@@ -1661,17 +1782,38 @@ verify_descriptor:
         LOG_DEBUG("HS: descriptor signature verified");
     }
 
-    /* Verify PQ commitment: if the .moor address contains a KEM pk hash,
-     * check that the descriptor's Kyber768 pk matches the commitment.
-     * This prevents service impersonation even if Ed25519 is broken. */
+    /* Verify PQ commitment: the .moor address binds H(kem_pk || falcon_pk).
+     * Recompute from descriptor pks and reject any mismatch. Prevents
+     * service impersonation even if Ed25519 is broken (v3 binds Falcon pk
+     * too; v2 addresses produced by older services only commit to kem_pk). */
     if (has_pq_commitment && hs_desc.kem_available) {
-        uint8_t kem_hash[32];
-        moor_crypto_hash(kem_hash, hs_desc.kem_pk, sizeof(hs_desc.kem_pk));
-        if (sodium_memcmp(kem_hash, pq_commitment, 16) != 0) {
+        uint8_t commit_buf[1184 + MOOR_FALCON_PK_LEN];
+        size_t commit_len = 0;
+        memcpy(commit_buf, hs_desc.kem_pk, sizeof(hs_desc.kem_pk));
+        commit_len = sizeof(hs_desc.kem_pk);
+        if (hs_desc.falcon_available) {
+            memcpy(commit_buf + commit_len, hs_desc.falcon_pk,
+                   sizeof(hs_desc.falcon_pk));
+            commit_len += sizeof(hs_desc.falcon_pk);
+        }
+        uint8_t full_hash[32];
+        moor_crypto_hash(full_hash, commit_buf, commit_len);
+        if (sodium_memcmp(full_hash, pq_commitment, 16) == 0) {
+            LOG_DEBUG("HS: PQ commitment verified (%s)",
+                      hs_desc.falcon_available ? "v3 kem||falcon" : "v2 kem-only");
+        } else if (hs_desc.falcon_available) {
+            /* Try v2 fallback (kem-only) in case the service still publishes
+             * a v2 address while also including falcon_pk for forward-compat. */
+            moor_crypto_hash(full_hash, hs_desc.kem_pk, sizeof(hs_desc.kem_pk));
+            if (sodium_memcmp(full_hash, pq_commitment, 16) != 0) {
+                LOG_ERROR("HS: PQ commitment mismatch — descriptor pks don't match address");
+                return -1;
+            }
+            LOG_DEBUG("HS: PQ commitment verified (v2 kem-only, service advertises Falcon)");
+        } else {
             LOG_ERROR("HS: PQ commitment mismatch — KEM pk doesn't match address");
             return -1;
         }
-        LOG_DEBUG("HS: PQ commitment verified (KEM pk matches address)");
     } else if (has_pq_commitment && !hs_desc.kem_available) {
         LOG_WARN("HS: address has PQ commitment but descriptor has no KEM pk");
     }

@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "moor/config.h"  /* moor_da_entry_t */
+#include "moor/falcon.h"  /* MOOR_FALCON_*_LEN */
 
 #define MOOR_MAX_AUTH_CLIENTS 16
 
@@ -60,6 +61,10 @@ typedef struct {
     uint8_t  kem_pk[1184];          /* MOOR_KEM_PK_LEN */
     uint8_t  kem_sk[2400];          /* MOOR_KEM_SK_LEN */
     int      kem_generated;
+    /* Falcon-512 keypair for PQ HS identity: binds into .moor address. */
+    uint8_t  falcon_pk[MOOR_FALCON_PK_LEN];
+    uint8_t  falcon_sk[MOOR_FALCON_SK_LEN];
+    int      falcon_generated;
 } moor_hs_config_t;
 
 /* Generate or load hidden service keys */
@@ -71,12 +76,15 @@ int moor_hs_load_keys(moor_hs_config_t *config);
 /* Save keys to hs_dir */
 int moor_hs_save_keys(const moor_hs_config_t *config);
 
-/* Compute .moor address from Ed25519 pk + Kyber768 pk (PQ-committed).
- * Format: base32(Ed25519_pk(32) + BLAKE2b_16(Kyber768_pk)(16)) + ".moor"
- * If kem_pk is NULL, produces a classical-only address (v1 compat). */
+/* Compute .moor address from Ed25519 pk + ML-KEM pk + Falcon-512 pk
+ * (PQ-committed).
+ *   Format: base32(Ed25519_pk(32) + BLAKE2b_16(kem_pk || falcon_pk)(16)) + ".moor"
+ * If both kem_pk and falcon_pk are NULL, produces a classical-only v1 address.
+ * If only kem_pk is set, produces the v2 (KEM-only) address for legacy compat. */
 int moor_hs_compute_address(char *out, size_t out_len,
                             const uint8_t identity_pk[32],
-                            const uint8_t *kem_pk, size_t kem_pk_len);
+                            const uint8_t *kem_pk, size_t kem_pk_len,
+                            const uint8_t *falcon_pk, size_t falcon_pk_len);
 
 /* Initialize hidden service: build intro circuits, publish descriptor */
 int moor_hs_init(moor_hs_config_t *config,

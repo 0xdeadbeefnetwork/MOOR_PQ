@@ -32,6 +32,11 @@ typedef struct {
     /* PQ hybrid e2e: Kyber768 public key for post-handshake KEM */
     uint8_t  kem_pk[1184];          /* MOOR_KEM_PK_LEN */
     int      kem_available;         /* 1 if kem_pk is set */
+    /* PQ HS identity: Falcon-512 pk (897 bytes). Bound into .moor address
+     * via H(kem_pk || falcon_pk). Clients recompute the commit from the
+     * descriptor and verify it matches the .moor URL they dialed. */
+    uint8_t  falcon_pk[897];        /* MOOR_FALCON_PK_LEN */
+    int      falcon_available;      /* 1 if falcon_pk is set */
 } moor_hs_descriptor_t;
 
 /* Opaque HS entry stored at DA (DA cannot decrypt) */

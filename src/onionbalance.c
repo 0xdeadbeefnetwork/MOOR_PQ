@@ -50,7 +50,7 @@ int moor_ob_init(moor_ob_config_t *config) {
 
         moor_hs_compute_address(config->moor_address,
                                  sizeof(config->moor_address),
-                                 config->identity_pk, NULL, 0);
+                                 config->identity_pk, NULL, 0, NULL, 0);
         LOG_INFO("OB: loaded master keys");
     } else {
         /* Generate new keys */
@@ -58,7 +58,7 @@ int moor_ob_init(moor_ob_config_t *config) {
         moor_crypto_box_keygen(config->onion_pk, config->onion_sk);
         moor_hs_compute_address(config->moor_address,
                                  sizeof(config->moor_address),
-                                 config->identity_pk, NULL, 0);
+                                 config->identity_pk, NULL, 0, NULL, 0);
 
         /* Save keys */
         moor_hs_config_t tmp;

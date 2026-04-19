@@ -3508,7 +3508,8 @@ int moor_hs_descriptor_serialize(uint8_t *out, size_t out_len,
                    + 8 /* revision counter */
                    + 1 /* auth_type */
                    + 32 + 1 /* pow_seed + pow_difficulty */
-                   + 1 + (desc->kem_available ? 1184 : 0) /* PQ KEM pk */;
+                   + 1 + (desc->kem_available ? 1184 : 0) /* PQ KEM pk */
+                   + 1 + (desc->falcon_available ? 897 : 0) /* Falcon-512 pk */;
     if (desc->auth_type == 1 && desc->num_auth_entries > 0)
         needed += 1 + (size_t)desc->num_auth_entries * 80;
     if (out_len < needed) return -1;
@@ -3570,6 +3571,13 @@ int moor_hs_descriptor_serialize(uint8_t *out, size_t out_len,
     if (desc->kem_available) {
         memcpy(out + off, desc->kem_pk, 1184);
         off += 1184;
+    }
+
+    /* PQ HS identity: flag(1) + [falcon_pk(897)] */
+    out[off++] = (uint8_t)desc->falcon_available;
+    if (desc->falcon_available) {
+        memcpy(out + off, desc->falcon_pk, 897);
+        off += 897;
     }
 
     return (int)off;
@@ -3670,6 +3678,17 @@ int moor_hs_descriptor_deserialize(moor_hs_descriptor_t *desc,
             off += 1184;
         } else if (desc->kem_available) {
             desc->kem_available = 0; /* truncated */
+        }
+    }
+
+    /* PQ HS identity Falcon-512 pk (optional): flag(1) + [falcon_pk(897)] */
+    if (off < data_len) {
+        desc->falcon_available = data[off++];
+        if (desc->falcon_available && off + 897 <= data_len) {
+            memcpy(desc->falcon_pk, data + off, 897);
+            off += 897;
+        } else if (desc->falcon_available) {
+            desc->falcon_available = 0; /* truncated */
         }
     }
 
