@@ -146,6 +146,13 @@ int moor_pq_keys_save(const char *data_dir,
 int moor_pq_keys_load(const char *data_dir,
                       uint8_t *pq_pk, uint8_t *pq_sk);
 
+/* Falcon-512 identity key persistence (Phase 3: post-quantum node ID).
+ * pk is MOOR_FALCON_PK_LEN (897), sk is MOOR_FALCON_SK_LEN (1281). */
+int moor_falcon_keys_save(const char *data_dir,
+                          const uint8_t *falcon_pk, const uint8_t *falcon_sk);
+int moor_falcon_keys_load(const char *data_dir,
+                          uint8_t *falcon_pk, uint8_t *falcon_sk);
+
 /* Base32 encode/decode for .moor addresses */
 int moor_base32_encode(char *out, size_t out_len,
                        const uint8_t *data, size_t data_len);

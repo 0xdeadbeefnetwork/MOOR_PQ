@@ -176,6 +176,7 @@ typedef enum {
 #include "log.h"
 #include "crypto.h"
 #include "sig.h"
+#include "falcon.h"
 #include "cell.h"
 #include "node.h"
 #include "kem.h"

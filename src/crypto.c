@@ -813,3 +813,38 @@ int moor_pq_keys_load(const char *data_dir,
 
     return 0;
 }
+
+int moor_falcon_keys_save(const char *data_dir,
+                          const uint8_t *falcon_pk, const uint8_t *falcon_sk) {
+    char keys_dir[512];
+    int n = snprintf(keys_dir, sizeof(keys_dir), "%s/keys", data_dir);
+    if (n < 0 || (size_t)n >= sizeof(keys_dir)) return -1;
+    mkdir(keys_dir, 0700);
+
+    char path[576];
+    n = snprintf(path, sizeof(path), "%s/falcon_identity_pk", keys_dir);
+    if (n < 0 || (size_t)n >= sizeof(path)) return -1;
+    if (write_key_file(path, falcon_pk, MOOR_FALCON_PK_LEN, 0) != 0) return -1;
+
+    n = snprintf(path, sizeof(path), "%s/falcon_identity_sk", keys_dir);
+    if (n < 0 || (size_t)n >= sizeof(path)) return -1;
+    if (write_key_file(path, falcon_sk, MOOR_FALCON_SK_LEN, 1) != 0) return -1;
+
+    return 0;
+}
+
+int moor_falcon_keys_load(const char *data_dir,
+                          uint8_t *falcon_pk, uint8_t *falcon_sk) {
+    char path[576];
+    int n;
+
+    n = snprintf(path, sizeof(path), "%s/keys/falcon_identity_pk", data_dir);
+    if (n < 0 || (size_t)n >= sizeof(path)) return -1;
+    if (read_key_file(path, falcon_pk, MOOR_FALCON_PK_LEN) != 0) return -1;
+
+    n = snprintf(path, sizeof(path), "%s/keys/falcon_identity_sk", data_dir);
+    if (n < 0 || (size_t)n >= sizeof(path)) return -1;
+    if (read_key_file(path, falcon_sk, MOOR_FALCON_SK_LEN) != 0) return -1;
+
+    return 0;
+}

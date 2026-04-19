@@ -94,6 +94,13 @@ static uint8_t g_onion_sk[32] = {0};
 static uint8_t g_pq_identity_pk[MOOR_MLDSA_PK_LEN] = {0};
 static uint8_t g_pq_identity_sk[MOOR_MLDSA_SK_LEN] = {0};
 
+/* Falcon-512 identity keys (Phase 3: PQ node ID).
+ * Generated/persisted for relay + DA nodes. Not yet wire-consumed;
+ * descriptor signing with Falcon lands in a later increment. */
+static uint8_t g_falcon_identity_pk[MOOR_FALCON_PK_LEN] = {0};
+static uint8_t g_falcon_identity_sk[MOOR_FALCON_SK_LEN] = {0};
+static int     g_falcon_identity_ready = 0;
+
 /* Forward declarations */
 static void bw_event_timer_cb(void *arg);
 static void relay_dir_accept_cb(int fd, int events, void *arg);
@@ -3743,6 +3750,7 @@ static void emergency_wipe_keys(void) {
     sodium_memzero(&g_config.control_password,
                    sizeof(g_config.control_password));
     sodium_memzero(g_pq_identity_sk, sizeof(g_pq_identity_sk));
+    sodium_memzero(g_falcon_identity_sk, sizeof(g_falcon_identity_sk));
     /* Then wipe larger structs containing embedded key material */
     sodium_memzero(&g_da_config, sizeof(g_da_config));
     sodium_memzero(&g_relay_cfg, sizeof(g_relay_cfg));
@@ -4093,6 +4101,10 @@ static int keygen_enclave(const char *data_dir, const char *address,
     uint8_t pq_pk[MOOR_MLDSA_PK_LEN], pq_sk[MOOR_MLDSA_SK_LEN];
     int has_pq = (moor_mldsa_keygen(pq_pk, pq_sk) == 0);
 
+    /* Generate Falcon-512 PQ identity keypair (Phase 3) */
+    uint8_t fal_pk[MOOR_FALCON_PK_LEN], fal_sk[MOOR_FALCON_SK_LEN];
+    int has_falcon = (moor_falcon_keygen(fal_pk, fal_sk) == 0);
+
     /* Save keys — identity (Ed25519) and onion (Curve25519) are distinct */
     if (moor_keys_save(data_dir, pk, sk, onion_pk, onion_sk) != 0) {
         fprintf(stderr, "ERROR: failed to save keys to %s\n", data_dir);
@@ -4100,6 +4112,9 @@ static int keygen_enclave(const char *data_dir, const char *address,
     }
     if (has_pq && moor_pq_keys_save(data_dir, pq_pk, pq_sk) != 0) {
         fprintf(stderr, "WARNING: failed to save PQ keys\n");
+    }
+    if (has_falcon && moor_falcon_keys_save(data_dir, fal_pk, fal_sk) != 0) {
+        fprintf(stderr, "WARNING: failed to save Falcon keys\n");
     }
 
     /* Print hex public key */
@@ -4137,6 +4152,7 @@ static int keygen_enclave(const char *data_dir, const char *address,
     sodium_memzero(sk, sizeof(sk));
     sodium_memzero(onion_sk, sizeof(onion_sk));
     sodium_memzero(pq_sk, sizeof(pq_sk));
+    sodium_memzero(fal_sk, sizeof(fal_sk));
     return 0;
 }
 
@@ -4309,6 +4325,28 @@ int main(int argc, char **argv) {
                 } else {
                     LOG_WARN("ML-DSA-65 keygen failed, DA will use Ed25519-only");
                 }
+            }
+        }
+
+        /* Falcon-512 identity (Phase 3: PQ node ID for relays + DAs).
+         * Persist alongside Ed25519; not yet consumed by descriptor signing. */
+        if (moor_falcon_keys_load(g_data_dir, g_falcon_identity_pk,
+                                  g_falcon_identity_sk) == 0) {
+            g_falcon_identity_ready = 1;
+            LOG_INFO("loaded persistent Falcon-512 identity from %s", g_data_dir);
+        } else {
+            if (moor_falcon_keygen(g_falcon_identity_pk,
+                                   g_falcon_identity_sk) == 0) {
+                if (moor_falcon_keys_save(g_data_dir, g_falcon_identity_pk,
+                                          g_falcon_identity_sk) == 0) {
+                    g_falcon_identity_ready = 1;
+                    LOG_INFO("generated and saved Falcon-512 identity to %s",
+                             g_data_dir);
+                } else {
+                    LOG_WARN("generated Falcon-512 identity but failed to save");
+                }
+            } else {
+                LOG_WARN("Falcon-512 keygen failed; node will have no PQ identity");
             }
         }
     } else {
