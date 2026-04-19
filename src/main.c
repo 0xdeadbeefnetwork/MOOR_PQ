@@ -3489,7 +3489,7 @@ static int run_hs(void) {
     /* R10-CC3: Register periodic timers for HS maintenance */
     if (moor_event_add_timer(10 * 60 * 1000, hs_consensus_refresh_cb, NULL) < 0 ||
         moor_event_add_timer(5 * 60 * 1000, hs_blinded_key_rotation_cb, NULL) < 0 ||
-        moor_event_add_timer(30 * 1000, hs_intro_rotation_cb, NULL) < 0 ||
+        moor_event_add_timer(10 * 1000, hs_intro_rotation_cb, NULL) < 0 ||
         moor_event_add_timer(45 * 1000, hs_intro_padding_cb, NULL) < 0 ||
         moor_event_add_timer(5 * 60 * 1000, hs_pow_seed_rotation_cb, NULL) < 0 ||
         moor_event_add_timer(5 * 60 * 1000, hs_desc_republish_cb, NULL) < 0) {

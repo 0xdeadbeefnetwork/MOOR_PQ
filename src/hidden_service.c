@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
+#include <pthread.h>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -60,6 +61,101 @@ static int hs_wait_for_readable(int fd, int timeout_ms)
     struct pollfd pfd = { fd, POLLIN, 0 };
     return poll(&pfd, 1, timeout_ms);
 #endif
+}
+
+/* ================================================================
+ * Client-side intro point failure cache
+ *
+ * Tor-style reachability cache.  When an INTRODUCE1 → RENDEZVOUS2 round trip
+ * fails (timeout), we cache (service_pk, node_id) here so subsequent connect
+ * attempts pick a different intro.  Entries expire after INTRO_FAIL_TTL_SEC
+ * so a service whose intros all briefly failed can recover after it
+ * republishes.  Concurrent access: mark from main thread (RV2 timeout),
+ * is_failed from worker thread (intro selection).
+ * ================================================================ */
+#define MOOR_HS_INTRO_FAIL_CACHE 64
+#define MOOR_HS_INTRO_FAIL_TTL_SEC 300  /* 5 min; slightly > intro rotation */
+
+typedef struct {
+    uint8_t  service_pk[32];
+    uint8_t  node_id[32];
+    uint64_t expires_at;   /* 0 = slot empty */
+} hs_intro_fail_t;
+
+static hs_intro_fail_t g_intro_fail[MOOR_HS_INTRO_FAIL_CACHE];
+static pthread_mutex_t g_intro_fail_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void intro_fail_purge_expired_locked(uint64_t now) {
+    for (int i = 0; i < MOOR_HS_INTRO_FAIL_CACHE; i++) {
+        if (g_intro_fail[i].expires_at != 0 &&
+            g_intro_fail[i].expires_at <= now) {
+            memset(&g_intro_fail[i], 0, sizeof(g_intro_fail[i]));
+        }
+    }
+}
+
+void moor_hs_intro_mark_failed(const uint8_t service_pk[32],
+                                const uint8_t node_id[32]) {
+    if (!service_pk || !node_id) return;
+    uint64_t now = (uint64_t)time(NULL);
+    uint64_t expires = now + MOOR_HS_INTRO_FAIL_TTL_SEC;
+    pthread_mutex_lock(&g_intro_fail_mutex);
+    intro_fail_purge_expired_locked(now);
+    /* Replace existing entry (refresh TTL) or find empty slot. */
+    int empty_slot = -1, oldest_slot = 0;
+    uint64_t oldest_exp = UINT64_MAX;
+    for (int i = 0; i < MOOR_HS_INTRO_FAIL_CACHE; i++) {
+        if (g_intro_fail[i].expires_at == 0) {
+            if (empty_slot < 0) empty_slot = i;
+            continue;
+        }
+        if (memcmp(g_intro_fail[i].service_pk, service_pk, 32) == 0 &&
+            memcmp(g_intro_fail[i].node_id, node_id, 32) == 0) {
+            g_intro_fail[i].expires_at = expires;
+            pthread_mutex_unlock(&g_intro_fail_mutex);
+            return;
+        }
+        if (g_intro_fail[i].expires_at < oldest_exp) {
+            oldest_exp = g_intro_fail[i].expires_at;
+            oldest_slot = i;
+        }
+    }
+    int slot = empty_slot >= 0 ? empty_slot : oldest_slot;
+    memcpy(g_intro_fail[slot].service_pk, service_pk, 32);
+    memcpy(g_intro_fail[slot].node_id, node_id, 32);
+    g_intro_fail[slot].expires_at = expires;
+    pthread_mutex_unlock(&g_intro_fail_mutex);
+}
+
+int moor_hs_intro_is_failed(const uint8_t service_pk[32],
+                             const uint8_t node_id[32]) {
+    if (!service_pk || !node_id) return 0;
+    uint64_t now = (uint64_t)time(NULL);
+    pthread_mutex_lock(&g_intro_fail_mutex);
+    intro_fail_purge_expired_locked(now);
+    int found = 0;
+    for (int i = 0; i < MOOR_HS_INTRO_FAIL_CACHE; i++) {
+        if (g_intro_fail[i].expires_at == 0) continue;
+        if (memcmp(g_intro_fail[i].service_pk, service_pk, 32) == 0 &&
+            memcmp(g_intro_fail[i].node_id, node_id, 32) == 0) {
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_intro_fail_mutex);
+    return found;
+}
+
+void moor_hs_intro_clear_failures_for(const uint8_t service_pk[32]) {
+    if (!service_pk) return;
+    pthread_mutex_lock(&g_intro_fail_mutex);
+    for (int i = 0; i < MOOR_HS_INTRO_FAIL_CACHE; i++) {
+        if (g_intro_fail[i].expires_at == 0) continue;
+        if (memcmp(g_intro_fail[i].service_pk, service_pk, 32) == 0) {
+            memset(&g_intro_fail[i], 0, sizeof(g_intro_fail[i]));
+        }
+    }
+    pthread_mutex_unlock(&g_intro_fail_mutex);
 }
 
 int moor_hs_compute_address(char *out, size_t out_len,
@@ -1271,8 +1367,10 @@ int moor_hs_client_connect_start(const char *moor_address,
                                   const uint8_t our_pk[32],
                                   const uint8_t our_sk[64],
                                   uint8_t *hs_kem_pk_out,
-                                  int *hs_kem_available_out) {
+                                  int *hs_kem_available_out,
+                                  uint8_t *intro_node_id_out) {
     if (hs_kem_available_out) *hs_kem_available_out = 0;
+    if (intro_node_id_out) memset(intro_node_id_out, 0, 32);
     LOG_DEBUG("connecting to hidden service");
 
     /* Decode .moor address to extract identity_pk and optional PQ commitment.
@@ -1659,14 +1757,54 @@ verify_descriptor:
         return -1;
     }
 
-    /* Try each intro point until one succeeds */
+    /* Build a candidate list: shuffle all intro indices, then filter out
+     * ones in the failure cache.  If every intro is blacklisted (they've all
+     * recently failed), clear this service's cache entries and try them all
+     * anyway — descriptor might be freshly rotated and the old failures stale.
+     *
+     * Randomization matters: before this we always tried index 0 first, so if
+     * intro 0 went silently stale every client hammered it forever while 1
+     * and 2 sat idle. */
+    uint32_t num_intros = hs_desc.num_intro_points;
+    uint32_t order[MOOR_MAX_INTRO_POINTS];
+    for (uint32_t i = 0; i < num_intros; i++) order[i] = i;
+    /* Fisher-Yates shuffle */
+    for (uint32_t i = num_intros; i > 1; i--) {
+        uint32_t j = randombytes_uniform(i);
+        uint32_t t = order[i - 1]; order[i - 1] = order[j]; order[j] = t;
+    }
+
+    uint32_t candidates[MOOR_MAX_INTRO_POINTS];
+    uint32_t num_candidates = 0;
+    for (uint32_t i = 0; i < num_intros; i++) {
+        uint32_t ip = order[i];
+        if (moor_hs_intro_is_failed(service_pk,
+                                     hs_desc.intro_points[ip].node_id)) {
+            LOG_DEBUG("HS: skipping intro %u (in failure cache)", ip);
+            continue;
+        }
+        candidates[num_candidates++] = ip;
+    }
+    if (num_candidates == 0) {
+        LOG_WARN("HS: all %u intro points blacklisted — clearing cache for retry",
+                 num_intros);
+        moor_hs_intro_clear_failures_for(service_pk);
+        for (uint32_t i = 0; i < num_intros; i++)
+            candidates[num_candidates++] = order[i];
+    }
+
+    /* Try candidates in shuffled order until one builds. */
     int intro_built = 0;
-    for (uint32_t ip = 0; ip < hs_desc.num_intro_points && !intro_built; ip++) {
+    uint32_t picked_ip = 0;
+    for (uint32_t ci = 0; ci < num_candidates && !intro_built; ci++) {
+        uint32_t ip = candidates[ci];
         if (moor_hs_build_circuit_to_rp(intro_circ, intro_conn, consensus,
                                           NULL, our_pk, our_sk,
                                           hs_desc.intro_points[ip].node_id) == 0) {
             intro_built = 1;
-            LOG_INFO("HS: intro circuit built to intro point %u", ip);
+            picked_ip = ip;
+            LOG_INFO("HS: intro circuit built to intro point %u (%u candidates)",
+                     ip, num_candidates);
         } else {
             LOG_WARN("HS: failed to build circuit to intro point %u, trying next",
                      ip);
@@ -1678,13 +1816,17 @@ verify_descriptor:
             moor_connection_free(intro_conn);
             intro_conn = NULL;
             /* Re-allocate for next attempt */
-            if (ip + 1 < hs_desc.num_intro_points) {
+            if (ci + 1 < num_candidates) {
                 intro_circ = moor_circuit_alloc();
                 if (!intro_circ) break;
                 intro_conn = moor_connection_alloc();
                 if (!intro_conn) { moor_circuit_free(intro_circ); intro_circ = NULL; break; }
             }
         }
+    }
+    if (intro_built && intro_node_id_out) {
+        memcpy(intro_node_id_out,
+               hs_desc.intro_points[picked_ip].node_id, 32);
     }
     if (!intro_built) {
         LOG_ERROR("HS: failed to build circuit to any intro point");
@@ -1802,7 +1944,7 @@ int moor_hs_client_connect(const char *moor_address,
     moor_circuit_t *rp_circ = NULL;
     if (moor_hs_client_connect_start(moor_address, &rp_circ,
                                       consensus, da_address, da_port,
-                                      our_pk, our_sk, NULL, NULL) != 0)
+                                      our_pk, our_sk, NULL, NULL, NULL) != 0)
         return -1;
 
     /* Wait for RENDEZVOUS2 on the RP circuit (up to 60 seconds) */

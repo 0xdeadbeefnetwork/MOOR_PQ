@@ -59,8 +59,16 @@
 #define MOOR_CONFLUX_MAX_LEGS   4       /* Max circuits per conflux set */
 #define MOOR_CONFLUX_REORDER_BUF 32     /* Reorder buffer slots */
 
-/* HS intro point rotation */
-#define MOOR_HS_INTRO_MAX_LIFETIME_SEC  (18 * 3600) /* 18 hours */
+/* HS intro point rotation.
+ *
+ * Intro circuits silently rot from the HS's POV: if the intro-point relay
+ * restarts or forgets our ESTABLISH_INTRO, our TCP link through hop1/hop2
+ * still looks OPEN and we have no way to detect the loss.  Clients keep
+ * picking the dead intro because its circuit-build succeeds, but their
+ * INTRODUCE1 vanishes at hop-3.  Dropping lifetime to 1h caps the worst-case
+ * downtime between rotations.  With rotation_cb ticking every 10s (see
+ * main.c), replacement intros spin up well before clients notice. */
+#define MOOR_HS_INTRO_MAX_LIFETIME_SEC  3600  /* 1 hour — was 18h, silent stale-out */
 #define MOOR_HS_INTRO_MAX_INTRODUCTIONS 16384
 #define MOOR_HS_INTRO_NUM_EXTRA         2     /* build 2 extra for rotation */
 

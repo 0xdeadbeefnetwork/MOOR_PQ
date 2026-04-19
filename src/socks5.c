@@ -55,6 +55,11 @@ typedef struct {
     /* PQ e2e: HS's KEM pk from descriptor (if available) */
     uint8_t hs_kem_pk[1184];
     int     hs_kem_available;
+    /* Which intro point was used for this attempt — on RV2 timeout we feed
+     * (service_pk, intro_node_id) to moor_hs_intro_mark_failed so future
+     * attempts route around a silently-stale intro. */
+    uint8_t service_pk[32];     /* decoded from .moor address */
+    uint8_t intro_node_id[32];  /* relay whose INTRO1 we sent through */
 } hs_pending_connect_t;
 
 static hs_pending_connect_t g_hs_pending[MAX_HS_PENDING];
@@ -88,6 +93,7 @@ typedef struct {
     moor_circuit_t *rp_circ;
     uint8_t  hs_kem_pk[1184];
     int      hs_kem_available;
+    uint8_t  intro_node_id[32];       /* intro relay used (for fail cache on RV2 timeout) */
 } hs_connect_result_t;
 
 #define HS_CONNECT_QUEUE 8
@@ -160,7 +166,8 @@ static void *hs_connect_worker(void *arg) {
                                           &w->cons,
                                           w->da_address, w->da_port,
                                           w->identity_pk, w->identity_sk,
-                                          hs_kem_pk, &hs_kem_avail) == 0) {
+                                          hs_kem_pk, &hs_kem_avail,
+                                          r->intro_node_id) == 0) {
             r->result = 0;
             r->rp_circ = rp_circ;
             r->hs_kem_available = hs_kem_avail;
@@ -235,6 +242,10 @@ static void hs_connect_complete_cb(int fd, int events, void *arg) {
             g_hs_pending[slot].hs_kem_available = r->hs_kem_available;
             if (r->hs_kem_available)
                 memcpy(g_hs_pending[slot].hs_kem_pk, r->hs_kem_pk, 1184);
+            memcpy(g_hs_pending[slot].intro_node_id, r->intro_node_id, 32);
+            /* Decode service_pk from .moor address for the failure-cache key. */
+            memset(g_hs_pending[slot].service_pk, 0, 32);
+            (void)moor_hs_decode_address(g_hs_pending[slot].service_pk, r->address);
 
             /* Adopt worker's circuit into main thread tracking.
              * Worker skipped circ_array_add so nullify_conn couldn't
@@ -851,6 +862,16 @@ static void hs_check_timeouts(void) {
             (now - g_hs_pending[i].started) >= HS_CONNECT_TIMEOUT) {
             LOG_WARN("HS: timeout waiting for RENDEZVOUS2 for %s",
                      g_hs_pending[i].address);
+            /* Blame the intro point we routed through.  Next connect attempt
+             * for this service will skip this intro (up to TTL) and pick
+             * another one, so a single silently-stale intro doesn't wedge
+             * the service for 5+ minutes. */
+            uint8_t zero[32] = {0};
+            if (memcmp(g_hs_pending[i].service_pk, zero, 32) != 0 &&
+                memcmp(g_hs_pending[i].intro_node_id, zero, 32) != 0) {
+                moor_hs_intro_mark_failed(g_hs_pending[i].service_pk,
+                                          g_hs_pending[i].intro_node_id);
+            }
             hs_pending_fail(&g_hs_pending[i]);
         }
     }

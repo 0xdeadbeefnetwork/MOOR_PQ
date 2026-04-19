@@ -121,7 +121,11 @@ int moor_hs_client_connect(const char *moor_address,
  * Does NOT wait for RENDEZVOUS2 -- caller must watch rp_circuit->conn->fd
  * for incoming RENDEZVOUS2 cell.
  * If hs_kem_pk_out is non-NULL and the HS descriptor has a KEM pk,
- * copies it there and sets *hs_kem_available_out = 1. */
+ * copies it there and sets *hs_kem_available_out = 1.
+ * If intro_node_id_out is non-NULL, receives the 32-byte relay node_id of
+ * the intro point that was used.  On RV2 timeout the caller can feed this
+ * to moor_hs_intro_mark_failed() so subsequent attempts skip the stale
+ * intro point. */
 int moor_hs_client_connect_start(const char *moor_address,
                                   moor_circuit_t **rp_circuit_out,
                                   const moor_consensus_t *consensus,
@@ -129,7 +133,26 @@ int moor_hs_client_connect_start(const char *moor_address,
                                   const uint8_t our_pk[32],
                                   const uint8_t our_sk[64],
                                   uint8_t *hs_kem_pk_out,
-                                  int *hs_kem_available_out);
+                                  int *hs_kem_available_out,
+                                  uint8_t *intro_node_id_out);
+
+/* Client-side intro point failure cache.
+ *
+ * When the HS side of an intro point silently loses its ESTABLISH_INTRO state
+ * (e.g. relay restart, stale circuit), the intro-build from a client's side
+ * still succeeds — the link is fine, the service is just not registered.
+ * INTRODUCE1 gets dropped on the floor and RENDEZVOUS2 never comes back.
+ *
+ * To keep clients from hammering the same dead intro, mark_failed() records
+ * (service_pk, node_id) with a TTL.  is_failed() returns 1 while the entry is
+ * live; intro selection in connect_start skips these.  If ALL intros for a
+ * service are in the cache, selection clears the per-service entries and
+ * tries fresh (desperation fallback — descriptor may have rotated). */
+void moor_hs_intro_mark_failed(const uint8_t service_pk[32],
+                                const uint8_t node_id[32]);
+int  moor_hs_intro_is_failed(const uint8_t service_pk[32],
+                              const uint8_t node_id[32]);
+void moor_hs_intro_clear_failures_for(const uint8_t service_pk[32]);
 
 /* Compute .moor address with checksum: base32(pk(32)+checksum(2)+version(1)) + ".moor" */
 int moor_hs_compute_address_v2(char *out, size_t out_len,
