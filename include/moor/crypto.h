@@ -112,17 +112,18 @@ int moor_crypto_sign_blinded(uint8_t sig[64], const uint8_t *msg, size_t msg_len
                              const uint8_t blinded_sk[64],
                              const uint8_t blinded_pk[32]);
 
-/* Post-quantum hybrid key derivation: combine classical DH + KEM shared secrets */
-int moor_crypto_kx_hybrid(uint8_t send_key[32], uint8_t recv_key[32],
-                           const uint8_t curve_shared[32],
-                           const uint8_t kem_shared[32],
-                           int is_client);
+/* PQ symmetric-key derivation (link layer): derive bidir keys from
+ * ML-KEM shared secret. Name retained as _hybrid for ABI continuity with
+ * pre-PQ callers; internals are KEM-only post Phase 1a. */
+int moor_crypto_kx_pq(uint8_t send_key[32], uint8_t recv_key[32],
+                       const uint8_t kem_shared[32],
+                       int is_client);
 
-/* PQ circuit-level hybrid key derivation: combine DH + KEM for circuit hop keys */
-int moor_crypto_circuit_kx_hybrid(uint8_t fwd_key[32], uint8_t bwd_key[32],
-                                   uint8_t fwd_digest[32], uint8_t bwd_digest[32],
-                                   const uint8_t dh_shared[32],
-                                   const uint8_t kem_shared[32]);
+/* PQ symmetric-key derivation (circuit layer): derive forward/backward
+ * keys + running digests from ML-KEM shared secret. */
+int moor_crypto_circuit_kx_pq(uint8_t fwd_key[32], uint8_t bwd_key[32],
+                               uint8_t fwd_digest[32], uint8_t bwd_digest[32],
+                               const uint8_t kem_shared[32]);
 
 /* HKDF-BLAKE2b for Noise protocol and CKE handshake.
  * Derives two 32-byte keys from chaining_key + input_key_material.

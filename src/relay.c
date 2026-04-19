@@ -3518,10 +3518,10 @@ int moor_relay_process_cell(moor_connection_t *conn,
                 moor_relay_handle_destroy(conn, cell);
                 return -1;
             }
-            moor_crypto_circuit_kx_hybrid(
+            moor_crypto_circuit_kx_pq(
                 circ->relay_forward_key, circ->relay_backward_key,
                 circ->relay_forward_digest, circ->relay_backward_digest,
-                circ->pq_key_seed, kem_ss);
+                kem_ss);
             circ->relay_forward_nonce = 0;
             circ->relay_backward_nonce = 0;
             moor_crypto_wipe(kem_ss, MOOR_KEM_SS_LEN);

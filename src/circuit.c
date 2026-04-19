@@ -1005,7 +1005,8 @@ int moor_circuit_create(moor_circuit_t *circ,
  * PQ hybrid CREATE: X25519 CKE + Kyber768 KEM.
  * After classical CREATE_PQ/CREATED_PQ, sends KEM ciphertext (1088 bytes)
  * over the link. Relay decapsulates with its kem_sk. Both sides combine
- * DH key_seed + KEM shared_secret via moor_crypto_circuit_kx_hybrid().
+ * KEM shared_secret via moor_crypto_circuit_kx_pq() (X25519 auth_tag still
+ * verifies relay identity; will move to Falcon in Phase 3).
  */
 int moor_circuit_create_pq(moor_circuit_t *circ,
                            const uint8_t relay_identity_pk[32],
@@ -1129,10 +1130,10 @@ int moor_circuit_create_pq(moor_circuit_t *circ,
         return -1;
     }
 
-    moor_crypto_circuit_kx_hybrid(
+    moor_crypto_circuit_kx_pq(
         circ->hops[hop].forward_key, circ->hops[hop].backward_key,
         circ->hops[hop].forward_digest, circ->hops[hop].backward_digest,
-        key_seed, kem_ss);
+        kem_ss);
 
     circ->hops[hop].forward_nonce = 0;
     circ->hops[hop].backward_nonce = 0;
@@ -1144,7 +1145,7 @@ int moor_circuit_create_pq(moor_circuit_t *circ,
     moor_crypto_wipe(key_seed, 32);
     moor_crypto_wipe(kem_ss, MOOR_KEM_SS_LEN);
 
-    LOG_INFO("circuit %u: hop %d established (PQ hybrid CKE)", circ->circuit_id, hop);
+    LOG_INFO("circuit %u: hop %d established (PQ)", circ->circuit_id, hop);
     return 0;
 }
 
@@ -1517,10 +1518,10 @@ int moor_circuit_extend_pq(moor_circuit_t *circ,
         moor_crypto_wipe(kem_ss, MOOR_KEM_SS_LEN);
         return -1;
     }
-    moor_crypto_circuit_kx_hybrid(
+    moor_crypto_circuit_kx_pq(
         circ->hops[hop].forward_key, circ->hops[hop].backward_key,
         circ->hops[hop].forward_digest, circ->hops[hop].backward_digest,
-        key_seed, kem_ss);
+        kem_ss);
 
     circ->hops[hop].forward_nonce = 0;
     circ->hops[hop].backward_nonce = 0;
@@ -4133,11 +4134,11 @@ int moor_circuit_build_handle_created(moor_circuit_t *circ,
             }
             ct_off += chunk;
         }
-        /* Derive hybrid keys */
-        moor_crypto_circuit_kx_hybrid(
+        /* Derive PQ keys */
+        moor_crypto_circuit_kx_pq(
             circ->hops[0].forward_key, circ->hops[0].backward_key,
             circ->hops[0].forward_digest, circ->hops[0].backward_digest,
-            key_seed, ctx->kem_ss);
+            ctx->kem_ss);
         moor_crypto_wipe(ctx->kem_ss, 32);
     } else {
         /* Classical key derivation */
@@ -4355,10 +4356,10 @@ int moor_circuit_build_handle_extended(moor_circuit_t *circ,
 
     /* Derive hop keys */
     if (ctx->pq_hop && relay_cmd == RELAY_EXTENDED_PQ) {
-        moor_crypto_circuit_kx_hybrid(
+        moor_crypto_circuit_kx_pq(
             circ->hops[hop].forward_key, circ->hops[hop].backward_key,
             circ->hops[hop].forward_digest, circ->hops[hop].backward_digest,
-            key_seed, ctx->kem_ss);
+            ctx->kem_ss);
         moor_crypto_wipe(ctx->kem_ss, 32);
     } else {
         moor_crypto_kdf(circ->hops[hop].forward_key, 32, key_seed, 1, "moorFWD!");
