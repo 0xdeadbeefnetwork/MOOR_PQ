@@ -218,6 +218,62 @@ int moor_crypto_seal_open(uint8_t *pt, const uint8_t *ct, size_t ct_len,
     return crypto_box_seal_open(pt, ct, ct_len, recipient_pk, recipient_sk);
 }
 
+/* Post-quantum anonymous seal (ML-KEM-768 + ChaCha20-Poly1305).
+ *
+ * PQ-secure replacement for crypto_box_seal. The sender performs an ML-KEM
+ * encapsulation against the recipient's KEM pk, derives an AEAD key from the
+ * shared secret via KDF, and authenticates+encrypts the plaintext. The
+ * recipient decapsulates with the KEM sk, derives the same AEAD key, and
+ * verifies+decrypts.
+ *
+ * Wire layout: kem_ct(1088) || aead_ct(pt_len) || aead_tag(16)
+ * Anonymous: no sender key material involved (the ML-KEM encaps step
+ * generates a fresh randomness internally that isn't exposed). */
+int moor_crypto_pq_seal(uint8_t *ct, const uint8_t *pt, size_t pt_len,
+                        const uint8_t *recipient_kem_pk) {
+    uint8_t kem_ss[MOOR_KEM_SS_LEN];
+    if (moor_kem_encapsulate(ct, kem_ss, recipient_kem_pk) != 0) return -1;
+
+    uint8_t aead_key[32];
+    if (moor_crypto_kdf(aead_key, 32, kem_ss, 0, "moorSEAL") != 0) {
+        moor_crypto_wipe(kem_ss, sizeof(kem_ss));
+        return -1;
+    }
+    moor_crypto_wipe(kem_ss, sizeof(kem_ss));
+
+    size_t aead_ct_len = 0;
+    int ret = moor_crypto_aead_encrypt(ct + MOOR_KEM_CT_LEN, &aead_ct_len,
+                                        pt, pt_len,
+                                        NULL, 0, aead_key, 0);
+    moor_crypto_wipe(aead_key, sizeof(aead_key));
+    if (ret != 0) return -1;
+    if (aead_ct_len != pt_len + MOOR_PQ_SEAL_AEAD_TAG) return -1;
+    return 0;
+}
+
+int moor_crypto_pq_seal_open(uint8_t *pt, const uint8_t *ct, size_t ct_len,
+                             const uint8_t *recipient_kem_sk) {
+    if (ct_len < MOOR_KEM_CT_LEN + MOOR_PQ_SEAL_AEAD_TAG) return -1;
+    size_t aead_ct_len = ct_len - MOOR_KEM_CT_LEN;
+
+    uint8_t kem_ss[MOOR_KEM_SS_LEN];
+    if (moor_kem_decapsulate(kem_ss, ct, recipient_kem_sk) != 0) return -1;
+
+    uint8_t aead_key[32];
+    if (moor_crypto_kdf(aead_key, 32, kem_ss, 0, "moorSEAL") != 0) {
+        moor_crypto_wipe(kem_ss, sizeof(kem_ss));
+        return -1;
+    }
+    moor_crypto_wipe(kem_ss, sizeof(kem_ss));
+
+    size_t pt_len = 0;
+    int ret = moor_crypto_aead_decrypt(pt, &pt_len,
+                                        ct + MOOR_KEM_CT_LEN, aead_ct_len,
+                                        NULL, 0, aead_key, 0);
+    moor_crypto_wipe(aead_key, sizeof(aead_key));
+    return ret;
+}
+
 /*
  * HS key blinding -- Ed25519 scalar multiplication (Tor-compatible approach).
  *

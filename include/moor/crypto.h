@@ -89,6 +89,17 @@ int moor_crypto_seal_open(uint8_t *pt, const uint8_t *ct, size_t ct_len,
                           const uint8_t recipient_pk[32],
                           const uint8_t recipient_sk[32]);
 
+/* Post-quantum anonymous sealing via ML-KEM-768 + ChaCha20-Poly1305.
+ * Layout of ct: kem_ct(MOOR_KEM_CT_LEN=1088) || aead_ct(pt_len) || aead_tag(16)
+ * Total ciphertext length: MOOR_KEM_CT_LEN + pt_len + MOOR_PQ_SEAL_AEAD_TAG.
+ * Anonymous (no client key used); suitable for HS INTRODUCE1 payload. */
+#define MOOR_PQ_SEAL_AEAD_TAG 16
+#define MOOR_PQ_SEAL_OVERHEAD (MOOR_KEM_CT_LEN + MOOR_PQ_SEAL_AEAD_TAG)
+int moor_crypto_pq_seal(uint8_t *ct, const uint8_t *pt, size_t pt_len,
+                        const uint8_t *recipient_kem_pk /* MOOR_KEM_PK_LEN */);
+int moor_crypto_pq_seal_open(uint8_t *pt, const uint8_t *ct, size_t ct_len,
+                             const uint8_t *recipient_kem_sk /* MOOR_KEM_SK_LEN */);
+
 /* HS key blinding: derive time-period-specific keypair using Ed25519
  * scalar multiplication (Tor-compatible approach).
  * Service calls with identity_pk + identity_sk to get blinded_pk + blinded_sk.
