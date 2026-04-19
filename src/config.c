@@ -463,15 +463,17 @@ int moor_config_set(moor_config_t *cfg, const char *key, const char *value) {
         hs->local_port = (uint16_t)lport; /* legacy fallback = last port */
     }
     else if (strcmp(key, "HiddenServiceAuthorizedClient") == 0) {
-        /* value = base32-encoded Curve25519 public key */
+        /* value = path to a file holding 1184 raw bytes (ML-KEM-768 pk).
+         * PQ-migrated from the old base32-encoded Curve25519 format. */
         if (cfg->num_hidden_services <= 0) return -1;
         int idx = cfg->num_hidden_services - 1;
         moor_hs_entry_t *hs = &cfg->hidden_services[idx];
         if (hs->num_auth_clients >= 16) return -1;
-        uint8_t pk[32];
-        int dlen = moor_base32_decode(pk, 32, value, strlen(value));
-        if (dlen != 32) return -1;
-        memcpy(hs->auth_client_pks[hs->num_auth_clients], pk, 32);
+        FILE *kf = fopen(value, "rb");
+        if (!kf) return -1;
+        size_t got = fread(hs->auth_client_pks[hs->num_auth_clients], 1, 1184, kf);
+        fclose(kf);
+        if (got != 1184) return -1;
         hs->num_auth_clients++;
     }
     else if (strcmp(key, "Bridge") == 0) {

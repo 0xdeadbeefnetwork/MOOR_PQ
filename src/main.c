@@ -3438,11 +3438,11 @@ static int run_hs(void) {
                 hs_config.port_map[pm].local_port =
                     g_config.hidden_services[h].port_map[pm].local_port;
             }
-            /* Propagate authorized clients */
+            /* Propagate authorized clients (ML-KEM public keys) */
             hs_config.num_auth_clients = g_config.hidden_services[h].num_auth_clients;
             for (int ac = 0; ac < hs_config.num_auth_clients; ac++) {
-                memcpy(hs_config.auth_clients[ac].client_pk,
-                       g_config.hidden_services[h].auth_client_pks[ac], 32);
+                memcpy(hs_config.auth_clients[ac].kem_pk,
+                       g_config.hidden_services[h].auth_client_pks[ac], 1184);
             }
         } else {
             snprintf(hs_config.hs_dir, sizeof(hs_config.hs_dir), "%s", g_hs_dir);

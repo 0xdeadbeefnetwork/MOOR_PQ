@@ -8,7 +8,7 @@
 #define MOOR_DHT_REPLICAS          3      /* k=3 closest relays store descriptor */
 #define MOOR_DHT_MAX_STORED        256    /* max entries per relay */
 #define MOOR_DHT_SMALL_NET_THRESH  6      /* below this, full replication */
-#define MOOR_DHT_MAX_DESC_DATA     4096   /* max descriptor data size (4KB for padded descriptors) */
+#define MOOR_DHT_MAX_DESC_DATA     32768  /* max descriptor data size (32KB, accommodates PQ client-auth with 16 ML-KEM-sealed entries) */
 #define MOOR_DHT_EPOCH_TTL         (2 * 86400)  /* entries expire after 2 days */
 
 /* DHT entry stored at a relay */

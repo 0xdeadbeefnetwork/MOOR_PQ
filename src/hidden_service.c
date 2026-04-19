@@ -1081,19 +1081,28 @@ int moor_hs_publish_descriptor(moor_hs_config_t *config) {
         uint8_t inner_key[32];
         moor_crypto_random(inner_key, 32);
 
-        /* Seal inner_key to each authorized client (crypto_box_seal: 48 bytes each) */
-        uint8_t super_buf[2 + MOOR_MAX_AUTH_CLIENTS * 48 + 8 + sizeof(plaintext) + 16];
+        /* PQ-seal inner_key to each authorized client.
+         * Each sealed entry is MOOR_KEM_CT_LEN(1088) + 32(payload) + 16(AEAD tag)
+         * = 1136 bytes (vs 48 bytes for the old Curve25519 sealed box). */
+        #define PQ_AUTH_ENTRY_LEN (MOOR_KEM_CT_LEN + 32 + MOOR_PQ_SEAL_AEAD_TAG)
+        uint8_t super_buf[2 + MOOR_MAX_AUTH_CLIENTS * PQ_AUTH_ENTRY_LEN + 8 + sizeof(plaintext) + 16];
         size_t spos = 0;
         int num_ac = config->num_auth_clients;
         if (num_ac > MOOR_MAX_AUTH_CLIENTS) num_ac = MOOR_MAX_AUTH_CLIENTS;
         if (num_ac < 0) num_ac = 0;
-        super_buf[spos++] = 2; /* auth_type 2 = superencrypted descriptor */
+        super_buf[spos++] = 3; /* auth_type 3 = PQ-sealed superencrypted descriptor */
         super_buf[spos++] = (uint8_t)num_ac;
         for (int i = 0; i < num_ac; i++) {
-            moor_crypto_seal(super_buf + spos,
-                             inner_key, 32,
-                             config->auth_clients[i].client_pk);
-            spos += 48;
+            if (moor_crypto_pq_seal(super_buf + spos,
+                                    inner_key, 32,
+                                    config->auth_clients[i].kem_pk) != 0) {
+                moor_crypto_wipe(inner_key, 32);
+                sodium_memzero(&desc, sizeof(desc));
+                sodium_memzero(super_buf, sizeof(super_buf));
+                LOG_ERROR("HS: PQ-seal failed for auth client %d", i);
+                return -1;
+            }
+            spos += PQ_AUTH_ENTRY_LEN;
         }
 
         /* Inner AEAD: encrypt full descriptor with inner_key */
@@ -1651,18 +1660,21 @@ int moor_hs_client_connect_start(const char *moor_address,
     }
 
     /* Decrypt superencrypted descriptor if client auth is required.
-     * auth_type 2 = full superencryption (entire descriptor body encrypted).
-     * auth_type 1 = legacy (only onion_pk sealed per client). */
-    if (outer_pt_len > 0 && outer_pt[0] == 2) {
-        /* Superencrypted format: auth_type(1) + num_entries(1) +
-         * sealed_inner_key[N](N*48) + inner_nonce(8) + inner_ct */
+     * auth_type 3 = PQ-sealed superencryption (ML-KEM-768 per client).
+     * auth_type 1 = legacy (only onion_pk sealed per client, Curve25519). */
+    if (outer_pt_len > 0 && outer_pt[0] == 3) {
+        /* PQ-sealed format: auth_type(1) + num_entries(1) +
+         * pq_sealed_inner_key[N](N*PQ_AUTH_ENTRY_LEN) + inner_nonce(8) + inner_ct */
+        #ifndef PQ_AUTH_ENTRY_LEN
+        #define PQ_AUTH_ENTRY_LEN (MOOR_KEM_CT_LEN + 32 + MOOR_PQ_SEAL_AEAD_TAG)
+        #endif
         if (outer_pt_len < 2) { return -1; }
         uint8_t num_entries = outer_pt[1];
-        if ((size_t)num_entries * 48 + 2 > outer_pt_len) {
+        if ((size_t)num_entries * PQ_AUTH_ENTRY_LEN + 2 > outer_pt_len) {
             LOG_ERROR("HS auth: num_entries %u exceeds descriptor length", num_entries);
             return -1;
         }
-        size_t header_len = 2 + (size_t)num_entries * 48 + 8;
+        size_t header_len = 2 + (size_t)num_entries * PQ_AUTH_ENTRY_LEN + 8;
         if (outer_pt_len < header_len + 16) {
             LOG_ERROR("HS auth: superencrypted descriptor too short");
             return -1;
@@ -1677,22 +1689,25 @@ int moor_hs_client_connect_start(const char *moor_address,
                      g_config.client_auth_dir, (int)(addr_len - 5), moor_address);
             FILE *af = fopen(auth_path, "rb");
             if (af) {
-                uint8_t client_sk[32], client_pk[32];
-                if (fread(client_sk, 1, 32, af) == 32) {
-                    if (fread(client_pk, 1, 32, af) != 32)
-                        crypto_scalarmult_base(client_pk, client_sk);
-                    /* Try each sealed inner_key entry */
-                    for (int i = 0; i < num_entries; i++) {
-                        if (moor_crypto_seal_open(inner_key,
-                                                    outer_pt + 2 + i * 48, 48,
-                                                    client_pk, client_sk) == 0) {
-                            auth_ok = 1;
-                            LOG_INFO("HS auth: decrypted inner key (entry %d)", i);
-                            break;
+                /* PQ .auth_private format: kem_sk(MOOR_KEM_SK_LEN=2400) */
+                uint8_t *client_kem_sk = malloc(MOOR_KEM_SK_LEN);
+                if (client_kem_sk) {
+                    if (fread(client_kem_sk, 1, MOOR_KEM_SK_LEN, af) == MOOR_KEM_SK_LEN) {
+                        for (int i = 0; i < num_entries; i++) {
+                            if (moor_crypto_pq_seal_open(
+                                    inner_key,
+                                    outer_pt + 2 + (size_t)i * PQ_AUTH_ENTRY_LEN,
+                                    PQ_AUTH_ENTRY_LEN,
+                                    client_kem_sk) == 0) {
+                                auth_ok = 1;
+                                LOG_INFO("HS auth: decrypted inner key (entry %d)", i);
+                                break;
+                            }
                         }
                     }
+                    sodium_memzero(client_kem_sk, MOOR_KEM_SK_LEN);
+                    free(client_kem_sk);
                 }
-                moor_crypto_wipe(client_sk, 32);
                 fclose(af);
             }
         }
@@ -1702,7 +1717,7 @@ int moor_hs_client_connect_start(const char *moor_address,
         }
 
         /* Decrypt inner layer with recovered inner_key */
-        size_t nonce_off = 2 + (size_t)num_entries * 48;
+        size_t nonce_off = 2 + (size_t)num_entries * PQ_AUTH_ENTRY_LEN;
         uint64_t inner_nonce = 0;
         for (int i = 7; i >= 0; i--)
             inner_nonce |= (uint64_t)outer_pt[nonce_off + (7 - i)] << (i * 8);
@@ -2409,10 +2424,11 @@ int moor_hs_save_auth_clients(const moor_hs_config_t *config) {
 
     for (int i = 0; i < config->num_auth_clients; i++) {
         char path[576];
-        snprintf(path, sizeof(path), "%s/client_%d.pk", dir, i);
+        snprintf(path, sizeof(path), "%s/client_%d.kem_pk", dir, i);
         FILE *f = fopen(path, "wb");
         if (!f) continue;
-        fwrite(config->auth_clients[i].client_pk, 1, 32, f);
+        fwrite(config->auth_clients[i].kem_pk, 1,
+               sizeof(config->auth_clients[i].kem_pk), f);
         fclose(f);
     }
 
@@ -2425,7 +2441,7 @@ int moor_hs_save_auth_clients(const moor_hs_config_t *config) {
         fclose(f);
     }
 
-    LOG_INFO("HS: saved %d auth clients", config->num_auth_clients);
+    LOG_INFO("HS: saved %d auth clients (ML-KEM pks)", config->num_auth_clients);
     return 0;
 }
 
@@ -2443,17 +2459,18 @@ int moor_hs_load_auth_clients(moor_hs_config_t *config) {
 
     config->num_auth_clients = 0;
     for (int i = 0; i < count; i++) {
-        snprintf(path, sizeof(path), "%s/clients/client_%d.pk",
+        snprintf(path, sizeof(path), "%s/clients/client_%d.kem_pk",
                  config->hs_dir, i);
         f = fopen(path, "rb");
         if (!f) continue;
-        if (fread(config->auth_clients[config->num_auth_clients].client_pk,
-                  1, 32, f) == 32)
+        uint8_t *slot = config->auth_clients[config->num_auth_clients].kem_pk;
+        size_t want = sizeof(config->auth_clients[0].kem_pk);
+        if (fread(slot, 1, want, f) == want)
             config->num_auth_clients++;
         fclose(f);
     }
 
-    LOG_INFO("HS: loaded %d auth clients", config->num_auth_clients);
+    LOG_INFO("HS: loaded %d auth clients (ML-KEM pks)", config->num_auth_clients);
     return 0;
 }
 

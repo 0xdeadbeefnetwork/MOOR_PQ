@@ -7,9 +7,12 @@
 
 #define MOOR_MAX_AUTH_CLIENTS 16
 
-/* Authorized client entry: Curve25519 public key */
+/* Authorized client entry: ML-KEM-768 public key (PQ sealed).
+ * Previously Curve25519 (32-byte) — migrated post-CRQC hardening.
+ * Each client holds the matching kem_sk; HS seals an inner AES key to
+ * the client's kem_pk via moor_crypto_pq_seal in publish_descriptor. */
 typedef struct {
-    uint8_t client_pk[32];
+    uint8_t kem_pk[1184];  /* MOOR_KEM_PK_LEN */
 } moor_hs_auth_client_t;
 
 typedef struct {
