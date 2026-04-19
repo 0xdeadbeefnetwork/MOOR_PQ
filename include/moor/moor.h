@@ -101,8 +101,9 @@ extern const char moor_build_id[MOOR_BUILD_ID_LEN];
 
 /* Minimum required feature set for DA to accept a relay descriptor.
  * Old nodes without CELL_KEM cause wire framing desync on the network.
- * BUILD_ID is required so we can enforce strict fleet-wide commit equality. */
-#define NODE_FEATURES_REQUIRED  (NODE_FEATURE_CELL_KEM | NODE_FEATURE_BUILD_ID)
+ * BUILD_ID is required so we can enforce strict fleet-wide commit equality.
+ * FALCON is required so the network has PQ-authenticated descriptors end-to-end. */
+#define NODE_FEATURES_REQUIRED  (NODE_FEATURE_CELL_KEM | NODE_FEATURE_BUILD_ID | NODE_FEATURE_FALCON)
 
 /* Node flags */
 #define NODE_FLAG_GUARD         (1u << 0)
