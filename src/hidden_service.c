@@ -1322,14 +1322,6 @@ int moor_hs_handle_introduce(moor_hs_config_t *config,
      *   rp_node_id(32) + rendezvous_cookie(20) + client_eph_pk(32)
      * The introduction point cannot read this payload.
      */
-    /* Increment intro_count for the matching introduction point */
-    for (int i = 0; i < config->num_intro_circuits; i++) {
-        if (config->intro_circuits[i] == intro_circ) {
-            config->intro_count[i]++;
-            break;
-        }
-    }
-
     if (len < 84 + MOOR_PQ_SEAL_OVERHEAD) {
         LOG_ERROR("INTRODUCE2 payload too short for PQ sealed box (%zu)", len);
         return -1;
@@ -1340,6 +1332,17 @@ int moor_hs_handle_introduce(moor_hs_config_t *config,
                                   config->kem_sk) != 0) {
         LOG_ERROR("INTRODUCE2: PQ sealed box decryption failed");
         return -1;
+    }
+
+    /* Count only decrypt-validated introductions. Otherwise an attacker who
+     * can reach the intro point (e.g. a hostile middle relay on the intro
+     * circuit) could pump garbage cells to inflate the counter and force
+     * premature intro-point rotation. */
+    for (int i = 0; i < config->num_intro_circuits; i++) {
+        if (config->intro_circuits[i] == intro_circ) {
+            config->intro_count[i]++;
+            break;
+        }
     }
 
     uint8_t rp_node_id[32];
