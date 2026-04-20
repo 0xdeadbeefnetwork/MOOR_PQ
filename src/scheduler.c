@@ -244,12 +244,9 @@ static int g_skips_timer_id = -1;
 static int g_skips_active = 0;  /* 1 after moor_skips_init() */
 static uint64_t g_skips_interval_us = MOOR_SKIPS_INTERVAL_DEFAULT * 1000; /* current interval in µs */
 
-/* Forward declarations: skips_run disarms/rearms the timer based on
- * pending-list state, but the helpers are defined after it so that
- * timer_cb + init sit together at the bottom. */
-static uint64_t skips_pick_interval_ms(const moor_channel_t *chan);
+/* Forward declaration: moor_skips_init arms the persistent timer via
+ * the helper defined lower in the file alongside skips_timer_cb. */
 static void     skips_arm_timer(uint64_t interval_ms);
-static void     skips_disarm_timer(void);
 
 /* ---- TCP_INFO query ---- */
 static void skips_query_tcp_info(moor_channel_t *chan) {
@@ -505,18 +502,17 @@ void moor_skips_run(void) {
         }
     }
 
-    /* Phase 4: RTT-driven re-arm.
+    /* Phase 4: RTT-adaptive interval.
      *
-     * Event-driven firing: if no channels are pending after this tick, we
-     * DISARM the timer entirely — the scheduler sleeps until a new cell
-     * queues (moor_skips_channel_has_cells re-arms).  This eliminates the
-     * fixed-cadence wakes that Tor's KIST pays even on an idle relay.
+     * The timer stays armed for the lifetime of the process — disarming on
+     * idle is tempting but causes visible stalls under burst (prebuilt-pool
+     * churn after a CELL_DESTROY storm piles 8+ CREATE_PQ onto one channel
+     * before we've re-armed at the paced RTT/4, so extends time out at CBT).
      *
-     * When pending != 0, the next wake is paced at min_rtt/4 so we fire
-     * ~4 times per RTT — enough to keep the pipe full without spinning. */
-    if (g_pending_count == 0) {
-        skips_disarm_timer();
-    } else if (min_rtt_us > 0 && min_rtt_us < UINT32_MAX &&
+     * Instead, we keep the timer persistent and only ADJUST the interval
+     * toward min_rtt/4 — wakes are paced to actual link RTT rather than
+     * to a fixed 10 ms tick, but we never pay a reschedule-miss stall. */
+    if (min_rtt_us > 0 && min_rtt_us < UINT32_MAX &&
                g_skips_timer_id >= 0) {
         uint64_t target_us = min_rtt_us / 4;
         uint64_t min_us = MOOR_SKIPS_INTERVAL_MIN * 1000;
@@ -543,22 +539,6 @@ static void skips_timer_cb(void *arg) {
     moor_skips_run();
 }
 
-/* Pace at RTT/4 if we have one, otherwise fall back to the default tick.
- * Clamped to [INTERVAL_MIN, INTERVAL_MAX]. */
-static uint64_t skips_pick_interval_ms(const moor_channel_t *chan) {
-    uint64_t ms = MOOR_SKIPS_INTERVAL_DEFAULT;
-    if (chan && chan->skips_rtt_us > 0) {
-        uint64_t t_us = (uint64_t)chan->skips_rtt_us / 4;
-        if (t_us < (uint64_t)MOOR_SKIPS_INTERVAL_MIN * 1000)
-            t_us = (uint64_t)MOOR_SKIPS_INTERVAL_MIN * 1000;
-        if (t_us > (uint64_t)MOOR_SKIPS_INTERVAL_MAX * 1000)
-            t_us = (uint64_t)MOOR_SKIPS_INTERVAL_MAX * 1000;
-        ms = t_us / 1000;
-    }
-    if (ms < MOOR_SKIPS_INTERVAL_MIN) ms = MOOR_SKIPS_INTERVAL_MIN;
-    return ms;
-}
-
 static void skips_arm_timer(uint64_t interval_ms) {
     if (g_skips_timer_id >= 0) {
         moor_event_set_timer_interval(g_skips_timer_id, interval_ms);
@@ -572,21 +552,17 @@ static void skips_arm_timer(uint64_t interval_ms) {
     g_skips_interval_us = interval_ms * 1000;
 }
 
-static void skips_disarm_timer(void) {
-    if (g_skips_timer_id >= 0) {
-        moor_event_remove_timer(g_skips_timer_id);
-        g_skips_timer_id = -1;
-    }
-}
-
 void moor_skips_init(void) {
     g_pending_count = 0;
     g_skips_active = 1;
-    /* Timer is armed lazily — we stay quiet until a channel reports cells.
-     * See moor_skips_channel_has_cells. */
-    g_skips_timer_id = -1;
     g_skips_interval_us = MOOR_SKIPS_INTERVAL_DEFAULT * 1000;
-    LOG_INFO("SKIPS: scheduler initialized (RTT-driven, idle-suspended)");
+    /* Arm the scheduler tick once, for the process lifetime.  Early
+     * attempts at idle-disarm stalled bursts (CELL_DESTROY storms would
+     * queue 8+ CREATE_PQ in the window before re-arm).  Cheap to leave
+     * running: Phase 1 early-returns on empty pending. */
+    skips_arm_timer(MOOR_SKIPS_INTERVAL_DEFAULT);
+    LOG_INFO("SKIPS: scheduler initialized (RTT-adaptive, default %d ms)",
+             MOOR_SKIPS_INTERVAL_DEFAULT);
 }
 
 void moor_skips_channel_has_cells(moor_channel_t *chan) {
@@ -597,13 +573,6 @@ void moor_skips_channel_has_cells(moor_channel_t *chan) {
     chan->sched_state = SCHED_CHAN_PENDING;
     if (g_pending_count < MOOR_MAX_CHANNELS)
         g_pending[g_pending_count++] = chan;
-
-    /* Idle → busy transition: arm the timer paced at this channel's RTT.
-     * If we already have pending work, the existing timer fires on its
-     * own schedule and end-of-run adjusts the interval. */
-    if (g_pending_count == 1 || g_skips_timer_id < 0) {
-        skips_arm_timer(skips_pick_interval_ms(chan));
-    }
 }
 
 void moor_skips_remove_channel(moor_channel_t *chan) {
@@ -615,8 +584,6 @@ void moor_skips_remove_channel(moor_channel_t *chan) {
             break;
         }
     }
-    if (g_pending_count == 0)
-        skips_disarm_timer();
 }
 
 int moor_skips_pending_count(void) {
