@@ -11,6 +11,7 @@
 #include <stddef.h>
 #include <errno.h>
 #include <string.h>
+#include <stdlib.h>
 
 /*
  * Tor-aligned seccomp-bpf sandbox using raw BPF (no libseccomp dependency).
@@ -224,6 +225,10 @@ static int install_seccomp_filter(void) {
 
 void moor_sandbox_apply(void)
 {
+    if (getenv("MOOR_NO_SANDBOX")) {
+        LOG_WARN("sandbox: disabled via MOOR_NO_SANDBOX");
+        return;
+    }
     /*
      * 1. PR_SET_NO_NEW_PRIVS -- prerequisite for unprivileged seccomp.
      */

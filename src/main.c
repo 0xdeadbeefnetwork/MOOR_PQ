@@ -4291,20 +4291,24 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Platform hardening: lock memory, prevent core dumps */
+    /* Platform hardening: lock memory, prevent core dumps.
+     * MCL_CURRENT only -- MCL_FUTURE caps every subsequent mmap to
+     * RLIMIT_MEMLOCK, which breaks pthread_create (8 MB stack mmap fails
+     * with EAGAIN once the memlock budget is exhausted). */
 #if !defined(_WIN32) && defined(__linux__)
-    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+    if (mlockall(MCL_CURRENT) != 0) {
         /* Non-root can't mlockall -- try raising soft memlock limit */
         struct rlimit rl;
         if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
             rl.rlim_cur = rl.rlim_max;
             setrlimit(RLIMIT_MEMLOCK, &rl);
-            mlockall(MCL_CURRENT | MCL_FUTURE); /* best-effort retry */
+            mlockall(MCL_CURRENT); /* best-effort retry */
         }
         /* Not a warning -- running as non-root is correct */
         LOG_DEBUG("mlockall unavailable (not root) -- using madvise for key pages");
     }
-    prctl(PR_SET_DUMPABLE, 0); /* prevent ptrace/core dumps */
+    if (!getenv("MOOR_NO_SANDBOX"))
+        prctl(PR_SET_DUMPABLE, 0); /* prevent ptrace/core dumps */
 #endif
 
     /* Load persistent keys for relay/DA, or generate ephemeral */

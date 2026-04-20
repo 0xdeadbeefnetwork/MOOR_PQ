@@ -878,9 +878,33 @@ static void hs_check_timeouts(void) {
 }
 
 int moor_is_moor_address(const char *addr) {
+    if (!addr) return 0;
     size_t len = strlen(addr);
-    if (len > 5 && strcmp(addr + len - 5, ".moor") == 0)
+    /* Trim a trailing dot (FQDN canonical form from some resolvers) */
+    if (len > 0 && addr[len - 1] == '.') len--;
+    /* Case-insensitive ".moor" suffix check */
+    if (len > 5) {
+        const char *s = addr + len - 5;
+        if ((s[0] == '.') &&
+            (s[1] == 'm' || s[1] == 'M') &&
+            (s[2] == 'o' || s[2] == 'O') &&
+            (s[3] == 'o' || s[3] == 'O') &&
+            (s[4] == 'r' || s[4] == 'R'))
+            return 1;
+    }
+    /* Bare v3 base32 without TLD: 77 base32 chars (48 bytes * 8/5 = 76.8 -> 77
+     * with padding). Some clients (browsers with odd TLD handling) strip the
+     * suffix before forwarding through SOCKS5. Accept if the whole string is
+     * 77 lowercase base32 chars [a-z2-7]. */
+    if (len == 77) {
+        for (size_t i = 0; i < 77; i++) {
+            char c = addr[i];
+            int lc = (c >= 'a' && c <= 'z');
+            int b32d = (c >= '2' && c <= '7');
+            if (!lc && !b32d) return 0;
+        }
         return 1;
+    }
     return 0;
 }
 
@@ -1894,6 +1918,28 @@ int moor_socks5_handle_request(moor_socks5_client_t *client,
         memcpy(client->target_addr, data + 5, dlen);
         client->target_addr[dlen] = '\0';
         addr_off += 1 + dlen;
+
+        /* Normalize host: lowercase, strip trailing FQDN dot, and append
+         * ".moor" suffix if the client sent a bare 77-char v3 base32
+         * (some browsers strip unknown TLDs before forwarding to SOCKS5). */
+        char *h = client->target_addr;
+        size_t hlen = strlen(h);
+        for (size_t i = 0; i < hlen; i++)
+            if (h[i] >= 'A' && h[i] <= 'Z') h[i] = (char)(h[i] - 'A' + 'a');
+        if (hlen > 0 && h[hlen - 1] == '.') { h[--hlen] = '\0'; }
+        if (hlen == 77) {
+            int all_b32 = 1;
+            for (size_t i = 0; i < 77; i++) {
+                char c = h[i];
+                if (!((c >= 'a' && c <= 'z') || (c >= '2' && c <= '7'))) {
+                    all_b32 = 0; break;
+                }
+            }
+            if (all_b32 && hlen + 5 < sizeof(client->target_addr)) {
+                memcpy(h + 77, ".moor", 6);
+                LOG_DEBUG("HS: appended .moor suffix to bare base32 address");
+            }
+        }
     } else if (atyp == 0x04) {
         /* IPv6: 16 bytes address */
         if (len < 22) return -1;  /* 4 hdr + 16 addr + 2 port */
@@ -1956,6 +2002,8 @@ int moor_socks5_handle_request(moor_socks5_client_t *client,
     LOG_DEBUG("SOCKS5 CONNECT request (port %u)", client->target_port);
 
     if (moor_is_moor_address(client->target_addr)) {
+        LOG_DEBUG("HS: SOCKS5 CONNECT for %s (port %u)",
+                  client->target_addr, client->target_port);
         /* Hidden service -- check cached circuit first */
         int hs_cached = 0;
         for (int i = 0; i < g_circuit_cache_count; i++) {
@@ -2025,14 +2073,17 @@ int moor_socks5_handle_request(moor_socks5_client_t *client,
                 w->da_port = g_socks5_config.da_port;
                 memset(&w->cons, 0, sizeof(w->cons));
                 if (moor_consensus_copy(&w->cons, &g_client_consensus) != 0) {
+                    LOG_WARN("HS: consensus copy failed for %s", client->target_addr);
                     moor_consensus_cleanup(&w->cons);
                     free(w);
                     uint8_t fail[] = { 0x05, 0x04, 0x00, 0x01, 0,0,0,0, 0,0 };
                     send(client->client_fd, (char *)fail, sizeof(fail), MSG_NOSIGNAL);
                     return -1;
                 }
+                LOG_DEBUG("HS: launching worker (cons=%u relays)", w->cons.num_relays);
                 pthread_t t;
-                if (pthread_create(&t, NULL, hs_connect_worker, w) == 0) {
+                int pt_rc = pthread_create(&t, NULL, hs_connect_worker, w);
+                if (pt_rc == 0) {
                     pthread_detach(t);
                     /* Mark in-flight to prevent duplicate workers */
                     for (int i = 0; i < MAX_HS_INFLIGHT; i++) {
@@ -2046,6 +2097,8 @@ int moor_socks5_handle_request(moor_socks5_client_t *client,
                     }
                     LOG_INFO("HS: async connect launched for %s", client->target_addr);
                 } else {
+                    LOG_WARN("HS: pthread_create failed for %s: rc=%d (%s)",
+                             client->target_addr, pt_rc, strerror(pt_rc));
                     moor_consensus_cleanup(&w->cons);
                     free(w);
                     uint8_t fail[] = { 0x05, 0x04, 0x00, 0x01, 0,0,0,0, 0,0 };
