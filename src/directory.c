@@ -1291,8 +1291,8 @@ int moor_da_load_hs(moor_da_config_t *config) {
     for (uint32_t i = 0; i < n; i++) {
         uint8_t addr[32]; uint32_t dlen;
         if (fread(addr, 32, 1, f) != 1 || fread(&dlen, 4, 1, f) != 1 ||
-            dlen > 4096) break;
-        uint8_t data[4096];
+            dlen > MOOR_DHT_MAX_DESC_DATA) break;
+        uint8_t data[MOOR_DHT_MAX_DESC_DATA];
         if (fread(data, dlen, 1, f) != 1) break;
         if (loaded < 64) {
             memcpy(config->hs_entries[loaded].address_hash, addr, 32);
@@ -2154,7 +2154,7 @@ static int da_dispatch_request(int client_fd, moor_da_config_t *config,
         data += (remaining >= 4) ? 4 : remaining;
         remaining -= (remaining >= 4) ? 4 : remaining;
 
-        if (len > 4096 || len < 32) { send(client_fd, "ERR\n", 4, MSG_NOSIGNAL); return -1; }
+        if (len > MOOR_DHT_MAX_DESC_DATA || len < 32) { send(client_fd, "ERR\n", 4, MSG_NOSIGNAL); return -1; }
 
         uint8_t *hs_buf = malloc(len);
         if (!hs_buf) return -1;
@@ -2642,7 +2642,7 @@ static int da_dispatch_request(int client_fd, moor_da_config_t *config,
         data += (remaining >= 4) ? 4 : remaining;
         remaining -= (remaining >= 4) ? 4 : remaining;
 
-        if (len > 4096 || len < 32) { /* match HS_PUBLISH limit */
+        if (len > MOOR_DHT_MAX_DESC_DATA || len < 32) { /* match HS_PUBLISH limit */
             send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
             return -1;
         }
@@ -3421,7 +3421,9 @@ int moor_client_fetch_hs_descriptor(moor_hs_descriptor_t *desc,
     uint32_t len = ((uint32_t)len_buf[0] << 24) | ((uint32_t)len_buf[1] << 16) |
                    ((uint32_t)len_buf[2] << 8) | len_buf[3];
 
-    if (len > 4096 || len < 48) { close(fd); return -1; }
+    /* Cap matches MOOR_DHT_MAX_DESC_DATA (32 KB) to accept PQ client-auth
+     * descriptors with up to 16 ML-KEM-sealed entries. */
+    if (len > MOOR_DHT_MAX_DESC_DATA || len < 48) { close(fd); return -1; }
 
     uint8_t *buf = malloc(len);
     if (!buf) { close(fd); return -1; }

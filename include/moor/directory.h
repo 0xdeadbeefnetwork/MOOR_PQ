@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include "moor/config.h"  /* moor_da_entry_t */
 #include "moor/geoip.h"
+#include "moor/dht.h"     /* MOOR_DHT_MAX_DESC_DATA */
 
 /* Hidden service descriptor stored at DA */
 typedef struct {
@@ -42,7 +43,7 @@ typedef struct {
 /* Opaque HS entry stored at DA (DA cannot decrypt) */
 typedef struct {
     uint8_t  address_hash[32];   /* Lookup key */
-    uint8_t  data[4096];         /* Raw encrypted wire data (fits 1KB-padded descriptors) */
+    uint8_t  data[MOOR_DHT_MAX_DESC_DATA];  /* Raw encrypted wire data; sized to match DHT storage cap */
     uint32_t data_len;
 } moor_hs_stored_entry_t;
 
