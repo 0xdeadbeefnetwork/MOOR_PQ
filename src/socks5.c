@@ -860,6 +860,10 @@ static void hs_rp_read_cb(int fd, int events, void *arg) {
     }
 }
 
+/* Periodic timer wrapper so wedged HS pending slots time out even when
+ * no new SOCKS accept() is firing (single-tab case). */
+static void hs_timeout_timer_cb(void *arg);
+
 /* Check for timed-out pending HS connects */
 static void hs_check_timeouts(void) {
     time_t now = time(NULL);
@@ -881,6 +885,11 @@ static void hs_check_timeouts(void) {
             hs_pending_fail(&g_hs_pending[i]);
         }
     }
+}
+
+static void hs_timeout_timer_cb(void *arg) {
+    (void)arg;
+    hs_check_timeouts();
 }
 
 int moor_is_moor_address(const char *addr) {
@@ -1834,6 +1843,13 @@ int moor_socks5_start(const moor_socks5_config_t *config) {
         LOG_INFO("prebuilt circuit pool timer started (pool size %d, max %d concurrent)",
                  PREBUILT_POOL_SIZE, MAX_CONCURRENT_BUILDS);
     }
+
+    /* HS pending-connect timeout sweep.  Without this, a tab waiting on
+     * a wedged HS connect (intro silently stale, no RV2 ever arriving)
+     * stays pending forever when no new SOCKS accept() fires to trigger
+     * the inline sweep.  Marking the intro as failed is what lets the
+     * next retry route around a stale intro. */
+    moor_event_add_timer(5000, hs_timeout_timer_cb, NULL);
 
     int listen_fd = moor_listen(config->listen_addr, config->listen_port);
     if (listen_fd < 0) return -1;
