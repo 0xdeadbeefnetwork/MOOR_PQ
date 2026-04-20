@@ -691,7 +691,7 @@ static void relay_read_cb(int fd, int events, void *arg) {
             moor_event_modify(conn->fd, MOOR_EVENT_READ);
             moor_channel_t *flush_chan = moor_channel_find_by_conn(conn);
             if (flush_chan && moor_circuitmux_total_queued(flush_chan) > 0)
-                moor_kist_channel_wants_writes(flush_chan);
+                moor_skips_channel_has_cells(flush_chan);
         }
     }
 
@@ -3391,6 +3391,30 @@ static void hs_desc_republish_cb(void *arg) {
         hs_desc_republish_thread(NULL); /* fallback: inline */
 }
 
+/* Rotate vanguards: L2 set expires every 24h, L3 every 1h. moor_vanguard_init
+ * is idempotent — it drops entries past expires_at and refills from the
+ * current consensus. Runs every 5 min so no L3 lingers far past its hour. */
+static void hs_vanguard_rotation_cb(void *arg) {
+    (void)arg;
+    if (!g_hs_consensus) return;
+    int hs_count = g_config.num_hidden_services;
+    if (hs_count == 0) hs_count = 1;
+    for (int h = 0; h < hs_count; h++) {
+        int before_l2 = g_hs_configs[h].vanguards.num_l2;
+        int before_l3 = g_hs_configs[h].vanguards.num_l3;
+        moor_vanguard_init(&g_hs_configs[h].vanguards, g_hs_consensus,
+                           g_hs_configs[h].identity_pk, 1);
+        if (g_hs_configs[h].vanguards.num_l2 != before_l2 ||
+            g_hs_configs[h].vanguards.num_l3 != before_l3) {
+            LOG_INFO("HS %d: vanguards refreshed (L2 %d→%d, L3 %d→%d)", h,
+                     before_l2, g_hs_configs[h].vanguards.num_l2,
+                     before_l3, g_hs_configs[h].vanguards.num_l3);
+            moor_vanguard_save(&g_hs_configs[h].vanguards,
+                               g_hs_configs[h].hs_dir);
+        }
+    }
+}
+
 static int run_hs(void) {
     /* Heap-allocate consensus (~3.5MB -- must not be on stack) */
     g_hs_consensus = calloc(1, sizeof(moor_consensus_t));
@@ -3530,7 +3554,8 @@ static int run_hs(void) {
         moor_event_add_timer(10 * 1000, hs_intro_rotation_cb, NULL) < 0 ||
         moor_event_add_timer(45 * 1000, hs_intro_padding_cb, NULL) < 0 ||
         moor_event_add_timer(5 * 60 * 1000, hs_pow_seed_rotation_cb, NULL) < 0 ||
-        moor_event_add_timer(5 * 60 * 1000, hs_desc_republish_cb, NULL) < 0) {
+        moor_event_add_timer(5 * 60 * 1000, hs_desc_republish_cb, NULL) < 0 ||
+        moor_event_add_timer(5 * 60 * 1000, hs_vanguard_rotation_cb, NULL) < 0) {
         LOG_ERROR("FATAL: failed to register HS timers");
         return -1;
     }
@@ -4553,7 +4578,7 @@ int main(int argc, char **argv) {
     moor_connection_init_pool();
     moor_circuit_init_pool();
     moor_channel_init();
-    moor_kist_init();
+    moor_skips_init();
 
     /* Load GeoIP databases: try explicit path, then default locations */
     {

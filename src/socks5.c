@@ -1323,6 +1323,83 @@ static int process_circuit_cell(moor_connection_t *conn, moor_cell_t *cell) {
         break;
     }
     case RELAY_DATA: {
+        /* Conflux multi-leg reorder (Prop 329).
+         *
+         * When the primary circuit owns a conflux set, RELAY_DATA payloads
+         * arrive prefixed with an 8-byte Feistel-encrypted sequence number.
+         * Legs deliver out of order, so we route through the reorder buffer
+         * on the primary's conflux_set and drain in-order entries below.
+         *
+         * Note: e2e-decrypt above is intentionally BEFORE conflux in the
+         * stack.  Conflux is only wired for clearnet circuits today — HS
+         * rendezvous circuits never populate primary->conflux — so reaching
+         * this branch with e2e_active is not expected.  The short-circuit
+         * below just keeps the paths mutually exclusive by construction. */
+        if (!circ->e2e_active && primary->conflux && relay.data_length >= 8) {
+            uint64_t enc_seq =
+                ((uint64_t)relay.data[0] << 56) | ((uint64_t)relay.data[1] << 48) |
+                ((uint64_t)relay.data[2] << 40) | ((uint64_t)relay.data[3] << 32) |
+                ((uint64_t)relay.data[4] << 24) | ((uint64_t)relay.data[5] << 16) |
+                ((uint64_t)relay.data[6] << 8)  | ((uint64_t)relay.data[7]);
+            uint16_t payload_len = relay.data_length - 8;
+            int rr = moor_conflux_receive(primary->conflux, circ, enc_seq,
+                                          relay.stream_id,
+                                          relay.data + 8, payload_len);
+            if (rr < 0) {
+                /* Duplicate, stale, or unknown leg — drop silently. */
+                moor_circuit_maybe_send_sendme(circ, relay.stream_id);
+                moor_circuit_maybe_send_sendme(circ, 0);
+                break;
+            }
+            if (rr == 1) {
+                /* In-order: deliver this cell's payload directly. */
+                moor_socks5_client_t *client =
+                    find_client_by_stream(primary, relay.stream_id);
+                if (client && client->client_fd >= 0) {
+                    size_t written;
+                    int fwd = moor_stream_forward_to_target(
+                        client->client_fd, relay.data + 8, payload_len, &written);
+                    if (fwd != STREAM_FWD_OK) {
+                        LOG_WARN("conflux stream %u: send to browser failed "
+                                 "(%zu/%u sent), closing", relay.stream_id,
+                                 written, payload_len);
+                        moor_event_remove(client->client_fd);
+                        close(client->client_fd);
+                        client->client_fd = -1;
+                        client->stream_id = 0;
+                        client->circuit = NULL;
+                        moor_stream_t *s = moor_circuit_find_stream(
+                            circ, relay.stream_id);
+                        if (s) s->stream_id = 0;
+                    }
+                }
+            }
+            /* Drain any now-in-order buffered cells. */
+            for (;;) {
+                uint16_t sid = 0;
+                uint8_t  buf[MOOR_RELAY_DATA];
+                size_t   blen = sizeof(buf);
+                int dr = moor_conflux_deliver(primary->conflux, &sid, buf, &blen);
+                if (dr != 1) break;
+                moor_socks5_client_t *cl = find_client_by_stream(primary, sid);
+                if (cl && cl->client_fd >= 0) {
+                    size_t written;
+                    int fwd = moor_stream_forward_to_target(
+                        cl->client_fd, buf, blen, &written);
+                    if (fwd != STREAM_FWD_OK) {
+                        moor_event_remove(cl->client_fd);
+                        close(cl->client_fd);
+                        cl->client_fd = -1;
+                        cl->stream_id = 0;
+                        cl->circuit = NULL;
+                    }
+                }
+            }
+            moor_circuit_maybe_send_sendme(circ, relay.stream_id);
+            moor_circuit_maybe_send_sendme(circ, 0);
+            break;
+        }
+
         /* E2e decrypt for HS rendezvous circuits (#197) */
         if (circ->e2e_active && relay.data_length > 16) {
             uint8_t dec_buf[MOOR_RELAY_DATA];
@@ -1492,7 +1569,7 @@ static void circuit_read_cb(int fd, int events, void *arg) {
      * Without this, queued cells accumulate until the 256-cell limit
      * and all subsequent sends are dropped. */
     if (events & MOOR_EVENT_WRITE) {
-        /* Flush connection output queue (both KIST and direct cells share it) */
+        /* Flush connection output queue (both SKIPS and direct cells share it) */
         moor_queue_flush(&conn->outq, conn, &conn->write_off);
 
         if (moor_queue_is_empty(&conn->outq)) {
@@ -1500,7 +1577,7 @@ static void circuit_read_cb(int fd, int events, void *arg) {
             /* Re-schedule channel if circuits still have queued cells */
             moor_channel_t *flush_chan = moor_channel_find_by_conn(conn);
             if (flush_chan && moor_circuitmux_total_queued(flush_chan) > 0)
-                moor_kist_channel_wants_writes(flush_chan);
+                moor_skips_channel_has_cells(flush_chan);
         }
 
         /* Resume any SOCKS5 clients that were paused due to backpressure */

@@ -44,7 +44,7 @@ static moor_channel_t *channel_alloc(void) {
             g_channels[i].mux.ewma_scale_factor = MOOR_EWMA_SCALE_FACTOR;
             for (int j = 0; j < MOOR_MUX_MAX; j++)
                 g_channels[i].mux.entries[j].heap_idx = -1;
-            /* Init KIST scheduler state */
+            /* Init SKIPS scheduler state */
             g_channels[i].sched_state = SCHED_CHAN_IDLE;
             g_channels[i].sched_heap_idx = -1;
             g_channels[i].outbuf = NULL;
@@ -280,8 +280,8 @@ void moor_channel_close_all_marked(void) {
         LOG_DEBUG("channel %llu: closing (state=%d, %u circuits)",
                   (unsigned long long)ch->id, ch->state, ch->num_circuits);
 
-        /* Remove from KIST scheduler and free outbuf */
-        moor_kist_remove_channel(ch);
+        /* Remove from SKIPS scheduler and free outbuf */
+        moor_skips_remove_channel(ch);
         moor_channel_outbuf_clear(ch);
 
         /* Close the underlying connection */

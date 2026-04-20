@@ -1188,7 +1188,7 @@ static void relay_conn_read_cb(int fd, int events, void *arg) {
             moor_event_modify(conn->fd, MOOR_EVENT_READ);
             moor_channel_t *flush_chan = moor_channel_find_by_conn(conn);
             if (flush_chan && moor_circuitmux_total_queued(flush_chan) > 0)
-                moor_kist_channel_wants_writes(flush_chan);
+                moor_skips_channel_has_cells(flush_chan);
         }
     }
 
@@ -1332,7 +1332,7 @@ int moor_relay_init(const moor_relay_config_t *config) {
     moor_connection_init_pool();
     moor_circuit_init_pool();
     moor_channel_init();
-    moor_kist_init();
+    moor_skips_init();
     moor_dns_cache_init(&g_dns_cache);
     moor_dht_store_init(&g_dht_store);
     /* Load persisted DHT store so descriptors survive relay restarts */

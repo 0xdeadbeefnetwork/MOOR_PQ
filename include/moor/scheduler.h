@@ -103,9 +103,4 @@ void moor_skips_run(void);
 /* Query scheduler state */
 int moor_skips_pending_count(void);
 
-/* Backward-compat aliases for existing call sites */
-#define moor_kist_init              moor_skips_init
-#define moor_kist_channel_wants_writes  moor_skips_channel_has_cells
-#define moor_kist_remove_channel    moor_skips_remove_channel
-
 #endif /* MOOR_SCHEDULER_H */

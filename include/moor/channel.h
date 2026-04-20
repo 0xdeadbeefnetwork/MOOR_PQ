@@ -97,7 +97,7 @@ typedef struct moor_channel {
     /* Padding */
     uint64_t          padding_next_ms;  /* next padding cell time (0=disabled) */
 
-    /* ---- KIST scheduler state ---- */
+    /* ---- SKIPS scheduler state ---- */
     uint8_t           sched_state;      /* SCHED_CHAN_* */
     int               sched_heap_idx;   /* position in pending list (-1=not pending) */
 
@@ -108,17 +108,17 @@ typedef struct moor_channel {
     size_t            outbuf_cap;       /* allocated capacity */
     size_t            outbuf_flushed;   /* bytes sent to kernel (partial write tracking) */
 
-    /* KIST/SKIPS kernel socket info (refreshed each scheduler tick) */
-    uint32_t          kist_cwnd;
-    uint32_t          kist_unacked;
-    uint32_t          kist_mss;
-    uint32_t          kist_notsent;
-    uint32_t          kist_rtt_us;      /* kernel-measured RTT (microseconds) */
-    uint64_t          kist_limit;       /* max bytes writable this tick */
-    uint64_t          kist_written;     /* bytes written this tick */
+    /* SKIPS kernel socket info (refreshed each scheduler tick) */
+    uint32_t          skips_cwnd;
+    uint32_t          skips_unacked;
+    uint32_t          skips_mss;
+    uint32_t          skips_notsent;
+    uint32_t          skips_rtt_us;     /* kernel-measured RTT (microseconds) */
+    uint64_t          skips_limit;      /* max bytes writable this tick */
+    uint64_t          skips_written;    /* bytes written this tick */
 } moor_channel_t;
 
-/* KIST channel scheduler states */
+/* SKIPS channel scheduler states */
 #define SCHED_CHAN_IDLE               0  /* no circuits have cells */
 #define SCHED_CHAN_WAITING_FOR_CELLS  1  /* writeable, no cells */
 #define SCHED_CHAN_WAITING_TO_WRITE   2  /* has cells, socket full */
@@ -212,7 +212,7 @@ uint32_t moor_ewma_get_tick(void);
  * Marks affected channels for close. Called from moor_connection_free(). */
 void moor_channel_nullify_conn(struct moor_connection *conn);
 
-/* ---- Channel outbuf (KIST batched writes) ---- */
+/* ---- Channel outbuf (SKIPS batched writes) ---- */
 int  moor_channel_outbuf_append(moor_channel_t *chan, const uint8_t *wire, size_t len);
 int  moor_channel_outbuf_flush(moor_channel_t *chan);
 void moor_channel_outbuf_clear(moor_channel_t *chan);

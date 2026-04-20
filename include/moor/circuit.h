@@ -146,7 +146,7 @@ typedef struct moor_circuit {
     uint16_t e2e_kem_ct_len;      /* Bytes received so far */
     int      e2e_kem_pending;     /* 1 = waiting for KEM CT / ACK */
     uint8_t  e2e_dh_shared[32];   /* Saved DH shared secret for hybrid KDF */
-    /* KIST: per-circuit cell queues (pre-AEAD, relay-encrypted) */
+    /* SKIPS: per-circuit cell queues (pre-AEAD, relay-encrypted) */
     moor_circ_cell_queue_t cell_queue_n;  /* cells toward n_chan (forward) */
     moor_circ_cell_queue_t cell_queue_p;  /* cells toward p_chan (backward) */
     /* DoS cell rate limiting (Prop 305) */

@@ -244,6 +244,13 @@ static int g_skips_timer_id = -1;
 static int g_skips_active = 0;  /* 1 after moor_skips_init() */
 static uint64_t g_skips_interval_us = MOOR_SKIPS_INTERVAL_DEFAULT * 1000; /* current interval in µs */
 
+/* Forward declarations: skips_run disarms/rearms the timer based on
+ * pending-list state, but the helpers are defined after it so that
+ * timer_cb + init sit together at the bottom. */
+static uint64_t skips_pick_interval_ms(const moor_channel_t *chan);
+static void     skips_arm_timer(uint64_t interval_ms);
+static void     skips_disarm_timer(void);
+
 /* ---- TCP_INFO query ---- */
 static void skips_query_tcp_info(moor_channel_t *chan) {
     if (!chan->conn || chan->conn->fd < 0) return;
@@ -251,11 +258,11 @@ static void skips_query_tcp_info(moor_channel_t *chan) {
     /* Transport-wrapped connections: can't query kernel TCP state.
      * Use KISTLite fallback: assume we can always write. */
     if (chan->conn->transport && chan->conn->transport_state) {
-        chan->kist_cwnd = 128;
-        chan->kist_unacked = 0;
-        chan->kist_mss = 1460;
-        chan->kist_notsent = 0;
-        chan->kist_rtt_us = 0;
+        chan->skips_cwnd = 128;
+        chan->skips_unacked = 0;
+        chan->skips_mss = 1460;
+        chan->skips_notsent = 0;
+        chan->skips_rtt_us = 0;
         return;
     }
 
@@ -263,30 +270,30 @@ static void skips_query_tcp_info(moor_channel_t *chan) {
     struct tcp_info ti;
     socklen_t ti_len = sizeof(ti);
     if (getsockopt(chan->conn->fd, IPPROTO_TCP, TCP_INFO, &ti, &ti_len) == 0) {
-        chan->kist_cwnd = ti.tcpi_snd_cwnd;
-        chan->kist_unacked = ti.tcpi_unacked;
-        chan->kist_mss = ti.tcpi_snd_mss;
-        if (chan->kist_mss == 0) chan->kist_mss = 1460;
-        chan->kist_rtt_us = ti.tcpi_rtt;  /* smoothed RTT in µs */
+        chan->skips_cwnd = ti.tcpi_snd_cwnd;
+        chan->skips_unacked = ti.tcpi_unacked;
+        chan->skips_mss = ti.tcpi_snd_mss;
+        if (chan->skips_mss == 0) chan->skips_mss = 1460;
+        chan->skips_rtt_us = ti.tcpi_rtt;  /* smoothed RTT in µs */
     } else {
-        chan->kist_cwnd = 128;
-        chan->kist_unacked = 0;
-        chan->kist_mss = 1460;
-        chan->kist_rtt_us = 0;
+        chan->skips_cwnd = 128;
+        chan->skips_unacked = 0;
+        chan->skips_mss = 1460;
+        chan->skips_rtt_us = 0;
     }
 
     int notsent = 0;
     if (ioctl(chan->conn->fd, SIOCOUTQNSD, &notsent) == 0 && notsent > 0)
-        chan->kist_notsent = (uint32_t)notsent;
+        chan->skips_notsent = (uint32_t)notsent;
     else
-        chan->kist_notsent = 0;
+        chan->skips_notsent = 0;
 #else
     /* KISTLite: no kernel info, assume we can always write */
-    chan->kist_cwnd = 128;
-    chan->kist_unacked = 0;
-    chan->kist_mss = 1460;
-    chan->kist_notsent = 0;
-    chan->kist_rtt_us = 0;
+    chan->skips_cwnd = 128;
+    chan->skips_unacked = 0;
+    chan->skips_mss = 1460;
+    chan->skips_notsent = 0;
+    chan->skips_rtt_us = 0;
 #endif
 }
 
@@ -296,14 +303,14 @@ static void skips_query_tcp_info(moor_channel_t *chan) {
  * add less to avoid bufferbloat.  factor = min(interval / rtt, 1.0). */
 static void skips_compute_limit(moor_channel_t *chan) {
     uint64_t cwnd_bytes = 0;
-    if (chan->kist_cwnd > chan->kist_unacked)
-        cwnd_bytes = (uint64_t)(chan->kist_cwnd - chan->kist_unacked) *
-                     chan->kist_mss;
+    if (chan->skips_cwnd > chan->skips_unacked)
+        cwnd_bytes = (uint64_t)(chan->skips_cwnd - chan->skips_unacked) *
+                     chan->skips_mss;
 
     /* RTT-scaled extra buffer */
     double buf_factor = MOOR_SKIPS_SOCK_BUF_FACTOR;
-    if (chan->kist_rtt_us > 0) {
-        double rtt_ms = (double)chan->kist_rtt_us / 1000.0;
+    if (chan->skips_rtt_us > 0) {
+        double rtt_ms = (double)chan->skips_rtt_us / 1000.0;
         double interval_ms = (double)g_skips_interval_us / 1000.0;
         if (rtt_ms > 0.0) {
             buf_factor = interval_ms / rtt_ms;
@@ -314,13 +321,13 @@ static void skips_compute_limit(moor_channel_t *chan) {
     uint64_t extra = (uint64_t)((double)MOOR_SKIPS_EXTRA_SPACE * buf_factor);
 
     uint64_t limit = cwnd_bytes + extra;
-    if (limit > chan->kist_notsent)
-        limit -= chan->kist_notsent;
+    if (limit > chan->skips_notsent)
+        limit -= chan->skips_notsent;
     else
         limit = 0;
 
-    chan->kist_limit = limit;
-    chan->kist_written = 0;
+    chan->skips_limit = limit;
+    chan->skips_written = 0;
 }
 
 /* Determine which queue direction a circuit uses on a given channel */
@@ -417,8 +424,8 @@ void moor_skips_run(void) {
         skips_compute_limit(chan);
 
         /* Track min RTT across all pending channels for interval adaptation */
-        if (chan->kist_rtt_us > 0 && chan->kist_rtt_us < min_rtt_us)
-            min_rtt_us = chan->kist_rtt_us;
+        if (chan->skips_rtt_us > 0 && chan->skips_rtt_us < min_rtt_us)
+            min_rtt_us = chan->skips_rtt_us;
     }
 
     /* Phase 2: Schedule cells from circuits via EWMA priority.
@@ -436,7 +443,7 @@ void moor_skips_run(void) {
             moor_channel_t *chan = g_pending[i];
 
             /* Hit write budget — park until next tick */
-            if (chan->kist_written >= chan->kist_limit) {
+            if (chan->skips_written >= chan->skips_limit) {
                 chan->sched_state = SCHED_CHAN_WAITING_TO_WRITE;
                 pending_remove(i);
                 continue;
@@ -469,7 +476,7 @@ void moor_skips_run(void) {
                 ? &circ->cell_queue_n : &circ->cell_queue_p;
             int sent = 0;
 
-            for (int b = 0; b < burst && chan->kist_written < chan->kist_limit; b++) {
+            for (int b = 0; b < burst && chan->skips_written < chan->skips_limit; b++) {
                 moor_cell_t cell;
                 if (moor_circ_queue_pop(q, &cell) != 0) break;
 
@@ -483,7 +490,7 @@ void moor_skips_run(void) {
                 }
                 moor_crypto_wipe(&cell, sizeof(cell));
 
-                chan->kist_written += MOOR_CELL_WIRE_SIZE;
+                chan->skips_written += MOOR_CELL_WIRE_SIZE;
                 sent++;
                 made_progress = 1;
             }
@@ -493,23 +500,30 @@ void moor_skips_run(void) {
                 moor_circuitmux_notify_xmit(chan, circ, sent);
                 LOG_DEBUG("SKIPS: flushed %d cells on chan %llu (circ %u, limit=%lu written=%lu)",
                           sent, (unsigned long long)chan->id, circ->circuit_id,
-                          (unsigned long)chan->kist_limit, (unsigned long)chan->kist_written);
+                          (unsigned long)chan->skips_limit, (unsigned long)chan->skips_written);
             }
         }
     }
 
-    /* Phase 4: RTT-adaptive interval — adjust scheduler tick rate.
-     * interval = clamp(min_rtt / 4, INTERVAL_MIN, INTERVAL_MAX) ms.
-     * Wake ~4 times per RTT: enough to keep the pipe full without
-     * busy-spinning on high-latency links. */
-    if (min_rtt_us > 0 && min_rtt_us < UINT32_MAX && g_skips_timer_id >= 0) {
+    /* Phase 4: RTT-driven re-arm.
+     *
+     * Event-driven firing: if no channels are pending after this tick, we
+     * DISARM the timer entirely — the scheduler sleeps until a new cell
+     * queues (moor_skips_channel_has_cells re-arms).  This eliminates the
+     * fixed-cadence wakes that Tor's KIST pays even on an idle relay.
+     *
+     * When pending != 0, the next wake is paced at min_rtt/4 so we fire
+     * ~4 times per RTT — enough to keep the pipe full without spinning. */
+    if (g_pending_count == 0) {
+        skips_disarm_timer();
+    } else if (min_rtt_us > 0 && min_rtt_us < UINT32_MAX &&
+               g_skips_timer_id >= 0) {
         uint64_t target_us = min_rtt_us / 4;
         uint64_t min_us = MOOR_SKIPS_INTERVAL_MIN * 1000;
         uint64_t max_us = MOOR_SKIPS_INTERVAL_MAX * 1000;
         if (target_us < min_us) target_us = min_us;
         if (target_us > max_us) target_us = max_us;
 
-        /* Only update if changed by >20% to avoid timer churn */
         uint64_t diff = (target_us > g_skips_interval_us)
             ? target_us - g_skips_interval_us
             : g_skips_interval_us - target_us;
@@ -529,16 +543,50 @@ static void skips_timer_cb(void *arg) {
     moor_skips_run();
 }
 
+/* Pace at RTT/4 if we have one, otherwise fall back to the default tick.
+ * Clamped to [INTERVAL_MIN, INTERVAL_MAX]. */
+static uint64_t skips_pick_interval_ms(const moor_channel_t *chan) {
+    uint64_t ms = MOOR_SKIPS_INTERVAL_DEFAULT;
+    if (chan && chan->skips_rtt_us > 0) {
+        uint64_t t_us = (uint64_t)chan->skips_rtt_us / 4;
+        if (t_us < (uint64_t)MOOR_SKIPS_INTERVAL_MIN * 1000)
+            t_us = (uint64_t)MOOR_SKIPS_INTERVAL_MIN * 1000;
+        if (t_us > (uint64_t)MOOR_SKIPS_INTERVAL_MAX * 1000)
+            t_us = (uint64_t)MOOR_SKIPS_INTERVAL_MAX * 1000;
+        ms = t_us / 1000;
+    }
+    if (ms < MOOR_SKIPS_INTERVAL_MIN) ms = MOOR_SKIPS_INTERVAL_MIN;
+    return ms;
+}
+
+static void skips_arm_timer(uint64_t interval_ms) {
+    if (g_skips_timer_id >= 0) {
+        moor_event_set_timer_interval(g_skips_timer_id, interval_ms);
+    } else {
+        g_skips_timer_id = moor_event_add_timer(interval_ms, skips_timer_cb, NULL);
+        if (g_skips_timer_id < 0) {
+            LOG_ERROR("SKIPS: failed to create scheduler timer");
+            return;
+        }
+    }
+    g_skips_interval_us = interval_ms * 1000;
+}
+
+static void skips_disarm_timer(void) {
+    if (g_skips_timer_id >= 0) {
+        moor_event_remove_timer(g_skips_timer_id);
+        g_skips_timer_id = -1;
+    }
+}
+
 void moor_skips_init(void) {
     g_pending_count = 0;
     g_skips_active = 1;
-    g_skips_timer_id = moor_event_add_timer(MOOR_SKIPS_INTERVAL_DEFAULT,
-                                             skips_timer_cb, NULL);
-    if (g_skips_timer_id < 0)
-        LOG_ERROR("SKIPS: failed to create scheduler timer");
-    else
-        LOG_INFO("SKIPS: scheduler initialized (interval=%dms)",
-                 MOOR_SKIPS_INTERVAL_DEFAULT);
+    /* Timer is armed lazily — we stay quiet until a channel reports cells.
+     * See moor_skips_channel_has_cells. */
+    g_skips_timer_id = -1;
+    g_skips_interval_us = MOOR_SKIPS_INTERVAL_DEFAULT * 1000;
+    LOG_INFO("SKIPS: scheduler initialized (RTT-driven, idle-suspended)");
 }
 
 void moor_skips_channel_has_cells(moor_channel_t *chan) {
@@ -549,6 +597,13 @@ void moor_skips_channel_has_cells(moor_channel_t *chan) {
     chan->sched_state = SCHED_CHAN_PENDING;
     if (g_pending_count < MOOR_MAX_CHANNELS)
         g_pending[g_pending_count++] = chan;
+
+    /* Idle → busy transition: arm the timer paced at this channel's RTT.
+     * If we already have pending work, the existing timer fires on its
+     * own schedule and end-of-run adjusts the interval. */
+    if (g_pending_count == 1 || g_skips_timer_id < 0) {
+        skips_arm_timer(skips_pick_interval_ms(chan));
+    }
 }
 
 void moor_skips_remove_channel(moor_channel_t *chan) {
@@ -557,9 +612,11 @@ void moor_skips_remove_channel(moor_channel_t *chan) {
     for (int i = 0; i < g_pending_count; i++) {
         if (g_pending[i] == chan) {
             pending_remove(i);
-            return;
+            break;
         }
     }
+    if (g_pending_count == 0)
+        skips_disarm_timer();
 }
 
 int moor_skips_pending_count(void) {
