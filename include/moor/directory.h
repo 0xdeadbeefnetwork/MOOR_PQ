@@ -38,6 +38,11 @@ typedef struct {
      * descriptor and verify it matches the .moor URL they dialed. */
     uint8_t  falcon_pk[897];        /* MOOR_FALCON_PK_LEN */
     int      falcon_available;      /* 1 if falcon_pk is set */
+    /* Falcon-512 co-signature over the same message as signature[] above.
+     * Variable length ≤ MOOR_FALCON_SIG_MAX_LEN. Clients MUST verify both
+     * Ed25519 AND Falcon-512 when falcon_available is set. */
+    uint8_t  falcon_signature[752]; /* MOOR_FALCON_SIG_MAX_LEN */
+    uint16_t falcon_sig_len;
 } moor_hs_descriptor_t;
 
 /* Opaque HS entry stored at DA (DA cannot decrypt) */
@@ -191,11 +196,6 @@ int moor_client_fetch_consensus(moor_consensus_t *cons,
 int moor_client_fetch_consensus_multi(moor_consensus_t *cons,
                                        const moor_da_entry_t *da_list,
                                        int num_das);
-
-/* Verify consensus has majority signatures from trusted DA set */
-int moor_consensus_verify(const moor_consensus_t *cons,
-                          const uint8_t *trusted_da_pks,
-                          int num_trusted);
 
 /* Client-side: fetch HS descriptor from DA (decrypts using service pk) */
 int moor_client_fetch_hs_descriptor(moor_hs_descriptor_t *desc,

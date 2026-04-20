@@ -1649,6 +1649,107 @@ static int relay_intro2_frag_send_cb(uint32_t circuit_id, uint8_t relay_cmd,
     return 0;
 }
 
+/* Handle RELAY_ESTABLISH_INTRO v2 (fragmented).
+ * Payload layout:
+ *   [0]        = 0x02                          // version
+ *   [1..33]    = blinded_pk(32)
+ *   [33..65]   = intro_relay_id(32)            // MUST equal our identity
+ *   [65..73]   = time_period(u64 BE)
+ *   [73..137]  = ed25519 sig over bytes [0..73] (by blinded_sk)
+ *   [137..1034]= falcon_pk(897)
+ *   [1034..1036]= falcon_sig_len(u16 BE)
+ *   [1036..1036+sl] = falcon_sig over bytes [0..73] (by falcon_sk)
+ *   [optional: pow_seed(32) + pow_difficulty(1)]
+ *
+ * Binding intro_relay_id + time_period prevents cross-relay / cross-epoch
+ * replay.  Both signatures must verify — classical-only or PQ-only is
+ * rejected. */
+static int relay_handle_establish_intro_v2(moor_circuit_t *circ,
+                                             const uint8_t *data,
+                                             size_t data_len) {
+    const size_t SIGNED_LEN = 73;
+    const size_t MIN_LEN = SIGNED_LEN + 64 + MOOR_FALCON_PK_LEN + 2;
+    if (data_len < MIN_LEN) {
+        LOG_WARN("ESTABLISH_INTRO v2: payload too short (%zu < %zu)",
+                 data_len, MIN_LEN);
+        return -1;
+    }
+    if (data[0] != 0x02) {
+        LOG_WARN("ESTABLISH_INTRO v2: bad version 0x%02x", data[0]);
+        return -1;
+    }
+    const uint8_t *blinded_pk = data + 1;
+    const uint8_t *intro_relay_id = data + 33;
+    uint64_t time_period =
+        ((uint64_t)data[65] << 56) | ((uint64_t)data[66] << 48) |
+        ((uint64_t)data[67] << 40) | ((uint64_t)data[68] << 32) |
+        ((uint64_t)data[69] << 24) | ((uint64_t)data[70] << 16) |
+        ((uint64_t)data[71] << 8)  | ((uint64_t)data[72]);
+
+    /* Binding check: this ESTABLISH_INTRO must be addressed to US. */
+    if (sodium_memcmp(intro_relay_id, g_relay_config.identity_pk, 32) != 0) {
+        LOG_WARN("ESTABLISH_INTRO v2: intro_relay_id mismatch (not for us)");
+        return -1;
+    }
+
+    /* Time-period sanity: reject if > 2 periods out (tolerate boundary
+     * skew).  We don't know the exact period here, but we require a
+     * non-zero value — the HS always sets a current period. */
+    if (time_period == 0) {
+        LOG_WARN("ESTABLISH_INTRO v2: zero time_period");
+        return -1;
+    }
+
+    /* Verify Ed25519 signature by blinded_pk over the 73-byte header */
+    if (moor_crypto_sign_verify(data + 73, data, SIGNED_LEN, blinded_pk) != 0) {
+        LOG_WARN("ESTABLISH_INTRO v2: Ed25519 signature invalid");
+        return -1;
+    }
+
+    /* Verify Falcon signature over the same 73-byte header */
+    const uint8_t *falcon_pk = data + 137;
+    uint16_t fsig_len = ((uint16_t)data[1034] << 8) | data[1035];
+    if (fsig_len == 0 || fsig_len > MOOR_FALCON_SIG_MAX_LEN) {
+        LOG_WARN("ESTABLISH_INTRO v2: bad falcon_sig_len %u", fsig_len);
+        return -1;
+    }
+    size_t pow_offset = 1036 + fsig_len;
+    if (data_len < pow_offset) {
+        LOG_WARN("ESTABLISH_INTRO v2: truncated falcon sig");
+        return -1;
+    }
+    if (moor_falcon_verify(data + 1036, fsig_len,
+                            data, SIGNED_LEN, falcon_pk) != 0) {
+        LOG_WARN("ESTABLISH_INTRO v2: Falcon signature invalid");
+        return -1;
+    }
+
+    memcpy(circ->intro_service_pk, blinded_pk, 32);
+
+    /* Optional PoW params trailer */
+    if (data_len >= pow_offset + 33) {
+        memcpy(circ->intro_pow_seed, data + pow_offset, 32);
+        circ->intro_pow_difficulty = data[pow_offset + 32];
+        LOG_INFO("ESTABLISH_INTRO v2: PoW enabled (difficulty %u)",
+                 circ->intro_pow_difficulty);
+    }
+
+    LOG_INFO("ESTABLISH_INTRO v2: verified (ed25519+falcon), "
+             "blinded_pk=%02x%02x... tp=%llu",
+             blinded_pk[0], blinded_pk[1],
+             (unsigned long long)time_period);
+
+    /* Ack back to HS */
+    moor_cell_t ack;
+    moor_cell_relay(&ack, circ->prev_circuit_id,
+                   RELAY_INTRO_ESTABLISHED, 0, NULL, 0);
+    moor_relay_set_digest(ack.payload, circ->relay_backward_digest);
+    moor_circuit_relay_encrypt(circ, &ack);
+    if (moor_circuit_queue_cell(circ, &ack, 1) != 0)
+        LOG_WARN("ESTABLISH_INTRO v2: failed to send ack");
+    return 0;
+}
+
 /* Shared INTRODUCE1 processing: verify PoW, locate intro circuit by
  * blinded_pk, forward sealed body to HS as INTRODUCE2 (fragmented).
  * Called from both the single-cell RELAY_INTRODUCE1 path and from the
@@ -2508,51 +2609,15 @@ int moor_relay_handle_relay(moor_connection_t *conn,
             }
 
             case RELAY_ESTABLISH_INTRO: {
-                /* ESTABLISH_INTRO payload: blinded_pk(32) + signature(64)
-                 * + optional: pow_seed(32) + pow_difficulty(1) */
-                if (relay.data_length < 96) {
-                    LOG_WARN("ESTABLISH_INTRO: payload too short (%u)", relay.data_length);
-                    return -1;
-                }
-                /* Verify signature: blinded_pk signs itself as proof of key ownership */
-                if (moor_crypto_sign_verify(relay.data + 32, relay.data, 32,
-                                             relay.data) != 0) {
-                    LOG_WARN("ESTABLISH_INTRO: invalid signature");
-                    return -1;
-                }
-                /* Note: no runtime replay cache. The signed material is just
-                 * blinded_pk, so a deterministic Ed25519 sig repeats every
-                 * time the same HS re-establishes (normal: multi-intro
-                 * redundancy + circuit rebuilds). A cache would block these
-                 * legitimate repeats. The proper defense is protocol-level —
-                 * include a circuit nonce in the signed material so each
-                 * ESTABLISH_INTRO produces a unique signature. Deferred. */
-                memcpy(circ->intro_service_pk, relay.data, 32);
-                /* Check for PoW params appended after the sig */
-                if (relay.data_length >= 96 + 33) {
-                    memcpy(circ->intro_pow_seed, relay.data + 96, 32);
-                    circ->intro_pow_difficulty = relay.data[128];
-                    LOG_INFO("ESTABLISH_INTRO: PoW enabled (difficulty %u)",
-                             circ->intro_pow_difficulty);
-                }
-                LOG_INFO("ESTABLISH_INTRO: verified, blinded_pk=%02x%02x...",
-                         relay.data[0], relay.data[1]);
-
-                /* Send RELAY_INTRO_ESTABLISHED acknowledgement back to HS.
-                 * Without this, the HS can't know the relay has registered
-                 * the intro point — it would publish the descriptor before
-                 * the relay is ready, causing INTRODUCE1 to fail. */
-                {
-                    moor_cell_t ack;
-                    moor_cell_relay(&ack, circ->prev_circuit_id,
-                                   RELAY_INTRO_ESTABLISHED, 0, NULL, 0);
-                    moor_relay_set_digest(ack.payload,
-                                          circ->relay_backward_digest);
-                    moor_circuit_relay_encrypt(circ, &ack);
-                    if (moor_circuit_queue_cell(circ, &ack, 1) != 0)
-                        LOG_WARN("ESTABLISH_INTRO: failed to send ack");
-                }
-                return 0;
+                /* v2 ESTABLISH_INTRO is always fragmented (>1.5KB).  A
+                 * single-cell RELAY_ESTABLISH_INTRO is necessarily the
+                 * retired classical v1 payload — reject it.  The build_id
+                 * fleet gate prevents v1-only nodes from joining, so all
+                 * legitimate traffic arrives via RELAY_FRAGMENT_*. */
+                LOG_WARN("ESTABLISH_INTRO: rejecting legacy single-cell payload "
+                         "(len=%u); v2 requires fragmented path",
+                         relay.data_length);
+                return -1;
             }
             case RELAY_INTRODUCE1: {
                 /* Single-cell INTRODUCE1 path. Post-PQ migration most
@@ -2682,6 +2747,12 @@ int moor_relay_handle_relay(moor_connection_t *conn,
                     /* Complete reassembly -- process the inner command */
                     LOG_INFO("fragment reassembled: cmd=%d len=%zu",
                              inner_cmd, reassembled_len);
+                    if (inner_cmd == RELAY_ESTABLISH_INTRO) {
+                        /* PQ-hardened ESTABLISH_INTRO v2 (~1.8KB). */
+                        return relay_handle_establish_intro_v2(circ,
+                                                                reassembled,
+                                                                reassembled_len);
+                    }
                     if (inner_cmd == RELAY_INTRODUCE1) {
                         /* PQ-sealed INTRODUCE1 arrives fragmented (~1229B). */
                         return relay_handle_introduce1(circ, conn,

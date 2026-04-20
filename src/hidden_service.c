@@ -783,6 +783,13 @@ static int moor_hs_build_circuit_to_rp(moor_circuit_t *circ,
     return 0;
 }
 
+/* Forward declaration: fragment send callback that encrypt-forwards each
+ * fragment through the given circuit (defined later in this file). */
+static int hs_client_intro_send_cb(uint32_t circuit_id, uint8_t relay_cmd,
+                                    uint16_t stream_id,
+                                    const uint8_t *data, uint16_t data_len,
+                                    void *ctx);
+
 int moor_hs_establish_intro(moor_hs_config_t *config,
                             const moor_consensus_t *consensus) {
     /* Build circuits to introduction points and establish them.
@@ -840,29 +847,81 @@ int moor_hs_establish_intro(moor_hs_config_t *config,
         if (!built) continue;
         circ->cc_path_type = MOOR_CC_PATH_ONION; /* HS intro circuit */
 
-        /* Send RELAY_ESTABLISH_INTRO with blinded key.
-         * Intro point sees blinded_pk, not identity_pk.
-         * Payload: blinded_pk(32) + signature(64) [+ pow_seed(32) + pow_difficulty(1)]
-         * Signature is made with blinded_sk so intro point can verify. */
-        uint8_t intro_data[96 + 33]; /* max: with PoW params */
-        size_t intro_data_len = 96;
-        memcpy(intro_data, config->blinded_pk, 32);
-        moor_crypto_sign_blinded(intro_data + 32, config->blinded_pk, 32,
+        /* Send RELAY_ESTABLISH_INTRO (v2) — PQ-hardened.
+         * Signed header (73B): version(1) || blinded_pk(32) ||
+         *                      intro_relay_id(32) || time_period(u64 BE)
+         * Then: ed25519_sig(64, by blinded_sk) ||
+         *       falcon_pk(897) || falcon_sig_len(2 BE) || falcon_sig(<=752)
+         *       [+ pow_seed(32) + pow_difficulty(1)]
+         * Binding intro_relay_id + time_period prevents replay across
+         * intro points and epochs. Falcon co-sig provides PQ identity proof. */
+        if (!config->falcon_generated) {
+            LOG_ERROR("HS: Falcon key not generated, cannot establish intro");
+            moor_circuit_destroy(circ);
+            if (conn->fd >= 0)
+                moor_connection_close(conn);
+            else
+                moor_connection_free(conn);
+            continue;
+        }
+        uint8_t intro_data[73 + 64 + MOOR_FALCON_PK_LEN + 2 +
+                            MOOR_FALCON_SIG_MAX_LEN + 33];
+        size_t intro_data_len = 0;
+        const uint8_t *intro_relay_id = circ->hops[circ->num_hops - 1].node_id;
+
+        intro_data[0] = 0x02;  /* version */
+        memcpy(intro_data + 1, config->blinded_pk, 32);
+        memcpy(intro_data + 33, intro_relay_id, 32);
+        uint64_t tp = config->current_time_period;
+        intro_data[65] = (uint8_t)(tp >> 56);
+        intro_data[66] = (uint8_t)(tp >> 48);
+        intro_data[67] = (uint8_t)(tp >> 40);
+        intro_data[68] = (uint8_t)(tp >> 32);
+        intro_data[69] = (uint8_t)(tp >> 24);
+        intro_data[70] = (uint8_t)(tp >> 16);
+        intro_data[71] = (uint8_t)(tp >> 8);
+        intro_data[72] = (uint8_t)(tp);
+
+        /* Ed25519 signature over the 73-byte header */
+        moor_crypto_sign_blinded(intro_data + 73, intro_data, 73,
                                  config->blinded_sk, config->blinded_pk);
+        intro_data_len = 73 + 64;
+
+        /* Falcon public key */
+        memcpy(intro_data + intro_data_len, config->falcon_pk,
+               MOOR_FALCON_PK_LEN);
+        intro_data_len += MOOR_FALCON_PK_LEN;
+
+        /* Falcon signature over the same 73-byte header */
+        size_t fsig_len = MOOR_FALCON_SIG_MAX_LEN;
+        if (moor_falcon_sign(intro_data + intro_data_len + 2, &fsig_len,
+                              intro_data, 73, config->falcon_sk) != 0 ||
+            fsig_len > MOOR_FALCON_SIG_MAX_LEN) {
+            LOG_ERROR("HS: Falcon sign for ESTABLISH_INTRO failed");
+            moor_circuit_destroy(circ);
+            if (conn->fd >= 0)
+                moor_connection_close(conn);
+            else
+                moor_connection_free(conn);
+            continue;
+        }
+        intro_data[intro_data_len]     = (uint8_t)(fsig_len >> 8);
+        intro_data[intro_data_len + 1] = (uint8_t)(fsig_len);
+        intro_data_len += 2 + fsig_len;
 
         /* Append PoW params if enabled */
         if (config->pow_enabled && config->pow_difficulty > 0) {
-            memcpy(intro_data + 96, config->pow_seed, 32);
-            intro_data[128] = (uint8_t)config->pow_difficulty;
-            intro_data_len = 129;
+            memcpy(intro_data + intro_data_len, config->pow_seed, 32);
+            intro_data[intro_data_len + 32] = (uint8_t)config->pow_difficulty;
+            intro_data_len += 33;
         }
 
-        moor_cell_t cell;
-        moor_cell_relay(&cell, circ->circuit_id, RELAY_ESTABLISH_INTRO, 0,
-                       intro_data, (uint16_t)intro_data_len);
-        if (moor_circuit_encrypt_forward(circ, &cell) != 0 ||
-            moor_connection_send_cell(circ->conn, &cell) != 0) {
-            LOG_WARN("HS: failed to send ESTABLISH_INTRO");
+        /* v2 payload is ~1.8KB — always fragmented */
+        if (moor_fragment_send(circ->circuit_id, RELAY_ESTABLISH_INTRO, 0,
+                                intro_data, intro_data_len,
+                                moor_fragment_gen_id(),
+                                hs_client_intro_send_cb, circ) != 0) {
+            LOG_WARN("HS: failed to send ESTABLISH_INTRO (fragmented)");
             moor_circuit_destroy(circ);
             if (conn->fd >= 0)
                 moor_connection_close(conn);
@@ -1044,6 +1103,21 @@ int moor_hs_publish_descriptor(moor_hs_config_t *config) {
         LOG_ERROR("HS: descriptor signing failed");
         sodium_memzero(&desc, sizeof(desc));
         return -1;
+    }
+    /* Falcon-512 co-signature: every HS generated on dev-crypto has a
+     * Falcon keypair, so the descriptor is always dual-signed. Clients
+     * verify both sigs and reject if either fails. */
+    if (config->falcon_generated) {
+        size_t fsig_len = sizeof(desc.falcon_signature);
+        if (moor_falcon_sign(desc.falcon_signature, &fsig_len,
+                              to_sign, sizeof(to_sign),
+                              config->falcon_sk) != 0 ||
+            fsig_len == 0 || fsig_len > sizeof(desc.falcon_signature)) {
+            LOG_ERROR("HS: Falcon co-signature failed");
+            sodium_memzero(&desc, sizeof(desc));
+            return -1;
+        }
+        desc.falcon_sig_len = (uint16_t)fsig_len;
     }
     desc.published = (uint64_t)time(NULL);
 
@@ -1526,20 +1600,23 @@ int moor_hs_rendezvous(moor_hs_config_t *config,
     }
 
     free(heap_cons);
-    /* Derive e2e keys for RP circuit (#197) — HS: send=subkey 1, recv=subkey 0 */
-    moor_crypto_kdf(rp_circ->e2e_send_key, 32, shared, 1, "moore2e!");
-    moor_crypto_kdf(rp_circ->e2e_recv_key, 32, shared, 0, "moore2e!");
-    rp_circ->e2e_send_nonce = 0;
-    rp_circ->e2e_recv_nonce = 0;
-    rp_circ->e2e_active = 1;
-
-    /* Save DH shared for PQ hybrid rekey when client sends KEM CT */
+    /* Derive e2e keys for RP circuit (#197). When KEM is available (normal
+     * path), defer e2e_active until the hybrid rekey completes after KEM CT
+     * receipt -- this eliminates the classical-only window where X25519-only
+     * keys would protect cells if one happened to be sent during the RTT.
+     * Legacy path (no KEM): activate immediately with X25519 keys. */
     if (config->kem_generated) {
         memcpy(rp_circ->e2e_dh_shared, shared, 32);
         rp_circ->e2e_kem_pending = 1;
         rp_circ->e2e_kem_ct_len = 0;
-        LOG_INFO("HS: e2e keys derived, awaiting PQ KEM upgrade");
+        rp_circ->e2e_active = 0;
+        LOG_INFO("HS: awaiting PQ KEM upgrade before e2e activation");
     } else {
+        moor_crypto_kdf(rp_circ->e2e_send_key, 32, shared, 1, "moore2e!");
+        moor_crypto_kdf(rp_circ->e2e_recv_key, 32, shared, 0, "moore2e!");
+        rp_circ->e2e_send_nonce = 0;
+        rp_circ->e2e_recv_nonce = 0;
+        rp_circ->e2e_active = 1;
         LOG_INFO("HS: e2e keys derived for RP circuit (classical only)");
     }
     moor_crypto_wipe(shared, 32);
@@ -1803,10 +1880,28 @@ verify_descriptor:
         memcpy(to_verify + 64, content_hash, 32);
         if (moor_crypto_sign_verify(hs_desc.signature, to_verify, 96,
                                      hs_desc.service_pk) != 0) {
-            LOG_ERROR("HS: descriptor signature verification failed");
+            LOG_ERROR("HS: Ed25519 descriptor signature verification failed");
             return -1;
         }
-        LOG_DEBUG("HS: descriptor signature verified");
+        /* Falcon-512 co-signature: mandatory when descriptor advertises a
+         * Falcon pk. Both Ed25519 AND Falcon must verify -- hybrid-safe
+         * descriptor binding. */
+        if (hs_desc.falcon_available) {
+            if (hs_desc.falcon_sig_len == 0) {
+                LOG_ERROR("HS: descriptor has Falcon pk but no co-signature");
+                return -1;
+            }
+            if (moor_falcon_verify(hs_desc.falcon_signature,
+                                    hs_desc.falcon_sig_len,
+                                    to_verify, 96,
+                                    hs_desc.falcon_pk) != 0) {
+                LOG_ERROR("HS: Falcon descriptor co-signature verification failed");
+                return -1;
+            }
+            LOG_DEBUG("HS: descriptor dual-signed verified (Ed25519 + Falcon)");
+        } else {
+            LOG_DEBUG("HS: descriptor signature verified (Ed25519 only, no Falcon pk)");
+        }
     }
 
     /* Verify PQ commitment: the .moor address binds H(kem_pk || falcon_pk).

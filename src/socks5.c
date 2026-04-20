@@ -757,6 +757,7 @@ static void hs_rp_read_cb(int fd, int events, void *arg) {
     if (relay.relay_command == RELAY_RENDEZVOUS2) {
         LOG_INFO("HS: RENDEZVOUS2 received (%u bytes)", relay.data_length);
         /* Complete e2e DH key exchange (#197) */
+        int e2e_ok = 0;
         if (relay.data_length >= 64) {
             uint8_t *hs_eph_pk = relay.data;
             uint8_t *hs_key_hash = relay.data + 32;
@@ -771,7 +772,73 @@ static void hs_rp_read_cb(int fd, int events, void *arg) {
                 if (sodium_memcmp(expected_hash, hs_key_hash, 32) != 0) {
                     LOG_ERROR("HS: e2e key_hash mismatch");
                     moor_crypto_wipe(shared, 32);
+                } else if (pending->hs_kem_available) {
+                    /* PQ path: derive hybrid keys BEFORE activating e2e so
+                     * no cell is ever encrypted with X25519-only keys. */
+                    uint8_t kem_ct[1088], kem_ss[32];
+                    if (moor_kem_encapsulate(kem_ct, kem_ss,
+                                             pending->hs_kem_pk) != 0) {
+                        LOG_ERROR("HS: KEM encapsulate FAILED -- "
+                                  "refusing silent PQ downgrade");
+                        moor_crypto_wipe(kem_ss, 32);
+                        moor_crypto_wipe(shared, 32);
+                        moor_crypto_wipe(pending->rp_circ->e2e_eph_sk, 32);
+                        hs_pending_fail(pending);
+                        return;
+                    }
+
+                    /* Send KEM CT cells first (circuit-encrypted, not e2e). */
+                    size_t ct_off = 0;
+                    int send_ok = 1;
+                    while (ct_off < 1088) {
+                        size_t chunk = 1088 - ct_off;
+                        if (chunk > MOOR_RELAY_DATA) chunk = MOOR_RELAY_DATA;
+                        moor_cell_t kcell;
+                        moor_cell_relay(&kcell,
+                            pending->rp_circ->circuit_id,
+                            RELAY_E2E_KEM_CT, 0,
+                            kem_ct + ct_off, (uint16_t)chunk);
+                        if (moor_circuit_encrypt_forward(
+                            pending->rp_circ, &kcell) != 0 ||
+                            !pending->rp_circ->conn ||
+                            moor_connection_send_cell(
+                                pending->rp_circ->conn, &kcell) != 0) {
+                            LOG_WARN("HS: failed to send e2e KEM CT");
+                            send_ok = 0;
+                            break;
+                        }
+                        ct_off += chunk;
+                    }
+
+                    if (!send_ok) {
+                        moor_crypto_wipe(kem_ss, 32);
+                        moor_crypto_wipe(shared, 32);
+                        moor_crypto_wipe(pending->rp_circ->e2e_eph_sk, 32);
+                        hs_pending_fail(pending);
+                        return;
+                    }
+
+                    /* Hybrid KDF and activate e2e atomically at nonce=0. */
+                    uint8_t combined[64];
+                    memcpy(combined, shared, 32);
+                    memcpy(combined + 32, kem_ss, 32);
+                    uint8_t hybrid[32];
+                    moor_crypto_hash(hybrid, combined, 64);
+                    moor_crypto_kdf(pending->rp_circ->e2e_send_key,
+                                    32, hybrid, 0, "moore2e!");
+                    moor_crypto_kdf(pending->rp_circ->e2e_recv_key,
+                                    32, hybrid, 1, "moore2e!");
+                    pending->rp_circ->e2e_send_nonce = 0;
+                    pending->rp_circ->e2e_recv_nonce = 0;
+                    pending->rp_circ->e2e_active = 1;
+                    moor_crypto_wipe(kem_ss, 32);
+                    moor_crypto_wipe(combined, 64);
+                    moor_crypto_wipe(hybrid, 32);
+                    LOG_INFO("HS: e2e activated (hybrid X25519 + Kyber768)");
+                    e2e_ok = 1;
+                    moor_crypto_wipe(shared, 32);
                 } else {
+                    /* Legacy path (HS has no KEM pk): X25519-only. */
                     moor_crypto_kdf(pending->rp_circ->e2e_send_key, 32,
                                     shared, 0, "moore2e!");
                     moor_crypto_kdf(pending->rp_circ->e2e_recv_key, 32,
@@ -779,76 +846,15 @@ static void hs_rp_read_cb(int fd, int events, void *arg) {
                     pending->rp_circ->e2e_send_nonce = 0;
                     pending->rp_circ->e2e_recv_nonce = 0;
                     pending->rp_circ->e2e_active = 1;
-                    LOG_INFO("HS: e2e encryption established (X25519)");
-
-                    /* PQ upgrade: if HS published KEM pk, encapsulate and
-                     * send CT to upgrade e2e to hybrid X25519+Kyber768.
-                     * Save DH shared for hybrid KDF after HS ACKs. */
-                    if (pending->hs_kem_available) {
-                        memcpy(pending->rp_circ->e2e_dh_shared, shared, 32);
-                        uint8_t kem_ct[1088], kem_ss[32];
-                        if (moor_kem_encapsulate(kem_ct, kem_ss,
-                                                 pending->hs_kem_pk) != 0) {
-                            /* kem_ct/kem_ss are zeroed on fail; sending them
-                             * would silently degrade PQ hybrid to classical-only
-                             * (both sides would derive H(dh||0)). Tear down
-                             * instead — user gets a visible failure. */
-                            LOG_ERROR("HS: KEM encapsulate FAILED -- "
-                                      "refusing silent PQ downgrade");
-                            moor_crypto_wipe(kem_ss, 32);
-                            moor_crypto_wipe(shared, 32);
-                            moor_crypto_wipe(pending->rp_circ->e2e_eph_sk, 32);
-                            hs_pending_complete(pending);
-                            return;
-                        }
-
-                        /* Send KEM CT as RELAY_E2E_KEM_CT cells (3 cells) */
-                        size_t ct_off = 0;
-                        while (ct_off < 1088) {
-                            size_t chunk = 1088 - ct_off;
-                            if (chunk > MOOR_RELAY_DATA) chunk = MOOR_RELAY_DATA;
-                            moor_cell_t kcell;
-                            moor_cell_relay(&kcell,
-                                pending->rp_circ->circuit_id,
-                                RELAY_E2E_KEM_CT, 0,
-                                kem_ct + ct_off, (uint16_t)chunk);
-                            if (moor_circuit_encrypt_forward(
-                                pending->rp_circ, &kcell) != 0 ||
-                                !pending->rp_circ->conn ||
-                                moor_connection_send_cell(
-                                    pending->rp_circ->conn, &kcell) != 0) {
-                                LOG_WARN("HS: failed to send e2e KEM CT");
-                                break;
-                            }
-                            ct_off += chunk;
-                        }
-
-                        /* Immediately rekey with hybrid secret */
-                        uint8_t combined[64];
-                        memcpy(combined, shared, 32);
-                        memcpy(combined + 32, kem_ss, 32);
-                        uint8_t hybrid[32];
-                        moor_crypto_hash(hybrid, combined, 64);
-                        moor_crypto_kdf(pending->rp_circ->e2e_send_key,
-                                        32, hybrid, 0, "moore2e!");
-                        moor_crypto_kdf(pending->rp_circ->e2e_recv_key,
-                                        32, hybrid, 1, "moore2e!");
-                        /* Do NOT reset nonces -- continue counters.
-                         * Resetting causes desync: client rekeys before
-                         * HS receives KEM CT, cells with new key nonce=0
-                         * arrive while HS still expects old key. */
-                        moor_crypto_wipe(kem_ss, 32);
-                        moor_crypto_wipe(combined, 64);
-                        moor_crypto_wipe(hybrid, 32);
-                        LOG_INFO("HS: e2e upgraded to PQ hybrid "
-                                 "(X25519 + Kyber768)");
-                    }
+                    LOG_INFO("HS: e2e encryption established (X25519-only)");
+                    e2e_ok = 1;
                     moor_crypto_wipe(shared, 32);
                 }
             }
         }
         moor_crypto_wipe(pending->rp_circ->e2e_eph_sk, 32);
-        hs_pending_complete(pending);
+        if (e2e_ok) hs_pending_complete(pending);
+        else hs_pending_fail(pending);
     } else if (relay.relay_command == RELAY_RENDEZVOUS_ESTABLISHED) {
         LOG_DEBUG("HS: RENDEZVOUS_ESTABLISHED");
     }

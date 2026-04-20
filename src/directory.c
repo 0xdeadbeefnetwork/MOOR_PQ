@@ -9,21 +9,26 @@
 #include <fcntl.h>
 #endif
 
-/* Trusted DA public keys for consensus signature verification. */
-static uint8_t g_trusted_da_pks[16 * 32];
-static int g_num_trusted_da_pks = 0;
+/* Trusted DA hybrid keys (Ed25519 + ML-DSA-65) for consensus verification. */
+static moor_trusted_da_key_t g_trusted_da_keys[16];
+static int g_num_trusted_da_keys = 0;
 
 void moor_set_trusted_da_keys(const moor_da_entry_t *da_list, int num_das) {
-    g_num_trusted_da_pks = 0;
+    g_num_trusted_da_keys = 0;
     for (int i = 0; i < num_das && i < 16; i++) {
         int has_pk = 0;
         for (int j = 0; j < 32; j++) {
             if (da_list[i].identity_pk[j] != 0) { has_pk = 1; break; }
         }
-        if (has_pk) {
-            memcpy(g_trusted_da_pks + g_num_trusted_da_pks * 32,
-                   da_list[i].identity_pk, 32);
-            g_num_trusted_da_pks++;
+        if (!has_pk) continue;
+        moor_trusted_da_key_t *k = &g_trusted_da_keys[g_num_trusted_da_keys++];
+        memcpy(k->ed25519_pk, da_list[i].identity_pk, 32);
+        if (da_list[i].has_pq) {
+            memcpy(k->mldsa_pk, da_list[i].pq_identity_pk, MOOR_MLDSA_PK_LEN);
+            k->has_pq = 1;
+        } else {
+            memset(k->mldsa_pk, 0, MOOR_MLDSA_PK_LEN);
+            k->has_pq = 0;
         }
     }
 }
@@ -1092,49 +1097,6 @@ int moor_da_build_microdesc_consensus(moor_microdesc_consensus_t *mc,
 
     LOG_INFO("microdesc consensus built: %u relays", mc->num_relays);
     return 0;
-}
-
-int moor_consensus_verify(const moor_consensus_t *cons,
-                          const uint8_t *trusted_da_pks,
-                          int num_trusted) {
-    if (num_trusted <= 0 || !trusted_da_pks) return -1; /* no trust list = reject */
-
-    uint8_t body_hash[32];
-    if (consensus_body_hash(body_hash, cons) != 0) return -1;
-
-    int verified = 0;
-    /* For 2 DAs: accept 1 valid sig minimum. Strict 2/2 is unreliable
-     * because async vote exchange means the published snapshot often
-     * has only the local DA's sig when clients fetch it. The security
-     * tradeoff: a single compromised DA can forge consensus in a 2-DA
-     * setup, but a 2-DA setup already has no Byzantine fault tolerance.
-     * For 3+ DAs: strict majority (2/3, 3/5, etc). */
-    int majority = (num_trusted <= 2) ? 1 : (num_trusted / 2) + 1;
-
-    for (uint32_t i = 0; i < cons->num_da_sigs; i++) {
-        for (int j = 0; j < num_trusted; j++) {
-            if (sodium_memcmp(cons->da_sigs[i].identity_pk,
-                             trusted_da_pks + j * 32, 32) == 0) {
-                /* Trusted DA -- verify its signature */
-                if (moor_crypto_sign_verify(cons->da_sigs[i].signature,
-                                             body_hash, 32,
-                                             cons->da_sigs[i].identity_pk) == 0) {
-                    verified++;
-                }
-                break;
-            }
-        }
-    }
-
-    if (verified >= majority) {
-        LOG_INFO("consensus verified: %d/%d trusted DAs signed",
-                 verified, num_trusted);
-        return 0;
-    }
-
-    LOG_ERROR("consensus verification failed: %d/%d signatures (need %d)",
-              verified, num_trusted, majority);
-    return -1;
 }
 
 int moor_consensus_verify_hybrid(const moor_consensus_t *cons,
@@ -3237,65 +3199,17 @@ int moor_client_fetch_consensus(moor_consensus_t *cons,
             return -1;
         }
         /* Verify DA signatures against pre-configured trusted DA keys.
-         * If trusted keys are available (set via moor_set_trusted_da_keys),
-         * require majority verification.  Without trusted keys, fall back
-         * to verifying the consensus's own signatures are internally
-         * consistent (weaker but better than nothing). */
-        if (g_num_trusted_da_pks >= 2) {
-            if (moor_consensus_verify(cons, g_trusted_da_pks,
-                                       g_num_trusted_da_pks) != 0) {
-                LOG_ERROR("consensus: signature verification FAILED "
-                          "(trusted DA keys)");
-                return -1;
-            }
-        } else if (g_num_trusted_da_pks == 1) {
-            uint8_t body_hash[32];
-            if (consensus_body_hash(body_hash, cons) != 0) {
-                LOG_ERROR("consensus: body hash computation failed");
-                return -1;
-            }
-            /* Find the signature slot matching the trusted DA key,
-             * not just index 0 which may be a different DA (CWE-290) */
-            int found_trusted = 0;
-            for (uint32_t si = 0; si < cons->num_da_sigs; si++) {
-                if (sodium_memcmp(cons->da_sigs[si].identity_pk,
-                                   g_trusted_da_pks, 32) == 0) {
-                    if (moor_crypto_sign_verify(cons->da_sigs[si].signature,
-                                                 body_hash, 32,
-                                                 g_trusted_da_pks) != 0) {
-                        LOG_ERROR("consensus: single-DA signature FAILED");
-                        return -1;
-                    }
-                    found_trusted = 1;
-                    break;
-                }
-            }
-            if (!found_trusted) {
-                LOG_ERROR("consensus: trusted DA key not found in signatures");
-                return -1;
-            }
-        } else {
-            /* No trusted keys configured -- verify internal consistency
-             * (all signatures in the consensus verify against their own
-             * claimed keys).  This is circular trust but catches corruption. */
-            if (cons->num_da_sigs >= 1) {
-                uint8_t body_hash[32];
-                if (consensus_body_hash(body_hash, cons) == 0) {
-                    int valid = 0;
-                    for (uint32_t i = 0; i < cons->num_da_sigs; i++) {
-                        if (moor_crypto_sign_verify(
-                                cons->da_sigs[i].signature, body_hash, 32,
-                                cons->da_sigs[i].identity_pk) == 0)
-                            valid++;
-                    }
-                    if (valid == 0) {
-                        LOG_ERROR("consensus: no valid signatures");
-                        return -1;
-                    }
-                }
-            }
-            LOG_WARN("consensus: no trusted DA keys configured, "
-                     "verification is weak");
+         * Uses hybrid Ed25519 + ML-DSA-65 verification: a PQ-capable trusted
+         * key REQUIRES both sigs to verify. Without trusted keys, reject --
+         * consensus with no anchoring trust root is not safe to use. */
+        if (g_num_trusted_da_keys == 0) {
+            LOG_ERROR("consensus: no trusted DA keys configured");
+            return -1;
+        }
+        if (moor_consensus_verify_hybrid(cons, g_trusted_da_keys,
+                                          g_num_trusted_da_keys) != 0) {
+            LOG_ERROR("consensus: hybrid signature verification FAILED");
+            return -1;
         }
         /* Reject empty consensus — if all relays were reaped or the DA
          * is broken, an empty signed consensus would make the client
@@ -3533,7 +3447,8 @@ int moor_hs_descriptor_serialize(uint8_t *out, size_t out_len,
                    + 1 /* auth_type */
                    + 32 + 1 /* pow_seed + pow_difficulty */
                    + 1 + (desc->kem_available ? 1184 : 0) /* PQ KEM pk */
-                   + 1 + (desc->falcon_available ? 897 : 0) /* Falcon-512 pk */;
+                   + 1 + (desc->falcon_available ? 897 : 0) /* Falcon-512 pk */
+                   + 2 + (desc->falcon_sig_len ? desc->falcon_sig_len : 0); /* Falcon sig: len(2)+data */
     if (desc->auth_type == 1 && desc->num_auth_entries > 0)
         needed += 1 + (size_t)desc->num_auth_entries * 80;
     if (out_len < needed) return -1;
@@ -3602,6 +3517,15 @@ int moor_hs_descriptor_serialize(uint8_t *out, size_t out_len,
     if (desc->falcon_available) {
         memcpy(out + off, desc->falcon_pk, 897);
         off += 897;
+    }
+
+    /* Falcon-512 co-signature: len(2 BE) + sig bytes. len=0 means absent. */
+    out[off++] = (uint8_t)(desc->falcon_sig_len >> 8);
+    out[off++] = (uint8_t)(desc->falcon_sig_len);
+    if (desc->falcon_sig_len > 0 &&
+        desc->falcon_sig_len <= sizeof(desc->falcon_signature)) {
+        memcpy(out + off, desc->falcon_signature, desc->falcon_sig_len);
+        off += desc->falcon_sig_len;
     }
 
     return (int)off;
@@ -3713,6 +3637,21 @@ int moor_hs_descriptor_deserialize(moor_hs_descriptor_t *desc,
             off += 897;
         } else if (desc->falcon_available) {
             desc->falcon_available = 0; /* truncated */
+        }
+    }
+
+    /* Falcon-512 co-signature (optional): len(2 BE) + sig bytes. */
+    if (off + 2 <= data_len) {
+        uint16_t flen = ((uint16_t)data[off] << 8) | data[off+1];
+        off += 2;
+        if (flen > 0 && flen <= sizeof(desc->falcon_signature) &&
+            off + flen <= data_len) {
+            memcpy(desc->falcon_signature, data + off, flen);
+            desc->falcon_sig_len = flen;
+            off += flen;
+        } else if (flen > 0) {
+            /* Truncated or too large — leave absent rather than accept partial */
+            desc->falcon_sig_len = 0;
         }
     }
 

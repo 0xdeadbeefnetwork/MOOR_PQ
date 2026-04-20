@@ -105,7 +105,8 @@ void moor_config_defaults(moor_config_t *cfg) {
     cfg->da_port = MOOR_DEFAULT_DIR_PORT;
 
     /* Hardcoded default DAs (like Tor's hardcoded directory authorities).
-     * Identity keys are Ed25519 public keys, verified during vote exchange. */
+     * Identity keys: Ed25519 (32B) + ML-DSA-65 (1952B). Both signatures are
+     * verified on every consensus fetch via moor_consensus_verify_hybrid. */
     snprintf(cfg->da_list[0].address, sizeof(cfg->da_list[0].address),
              "107.174.70.38");
     cfg->da_list[0].port = MOOR_DEFAULT_DIR_PORT;
@@ -116,7 +117,12 @@ void moor_config_defaults(moor_config_t *cfg) {
             0x32,0x67,0x66,0xdd,0xc9,0x8a,0xbe,0x21,
             0x93,0x20,0xb3,0xea,0x90,0xdf,0x28,0xb4
         };
+        static const uint8_t da1_pq_pk[MOOR_MLDSA_PK_LEN] = {
+            #include "da1_mldsa_pk.inc"
+        };
         memcpy(cfg->da_list[0].identity_pk, da1_pk, 32);
+        memcpy(cfg->da_list[0].pq_identity_pk, da1_pq_pk, MOOR_MLDSA_PK_LEN);
+        cfg->da_list[0].has_pq = 1;
     }
     snprintf(cfg->da_list[1].address, sizeof(cfg->da_list[1].address),
              "107.174.70.122");
@@ -128,7 +134,12 @@ void moor_config_defaults(moor_config_t *cfg) {
             0xcc,0x8f,0xeb,0xf1,0xf9,0xba,0xe8,0xe3,
             0x12,0x67,0x88,0xef,0x28,0x3d,0x8c,0x06
         };
+        static const uint8_t da2_pq_pk[MOOR_MLDSA_PK_LEN] = {
+            #include "da2_mldsa_pk.inc"
+        };
         memcpy(cfg->da_list[1].identity_pk, da2_pk, 32);
+        memcpy(cfg->da_list[1].pq_identity_pk, da2_pq_pk, MOOR_MLDSA_PK_LEN);
+        cfg->da_list[1].has_pq = 1;
     }
     cfg->num_das = 2;
 

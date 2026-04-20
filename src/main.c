@@ -2928,15 +2928,17 @@ static void hs_rp_read_cb(int fd, int events, void *arg) {
                                 hybrid, 1, "moore2e!");
                 moor_crypto_kdf(circ->e2e_recv_key, 32,
                                 hybrid, 0, "moore2e!");
-                /* Continue nonce counters -- do NOT reset to 0.
-                 * Resetting causes desync with client which rekeyed
-                 * before we received the KEM CT. */
+                /* Start nonces from 0: e2e was deferred until this point,
+                 * so no prior cells were encrypted with X25519-only keys. */
+                circ->e2e_send_nonce = 0;
+                circ->e2e_recv_nonce = 0;
+                circ->e2e_active = 1;
                 circ->e2e_kem_pending = 0;
                 moor_crypto_wipe(kem_ss, 32);
                 moor_crypto_wipe(combined, 64);
                 moor_crypto_wipe(hybrid, 32);
                 moor_crypto_wipe(circ->e2e_dh_shared, 32);
-                LOG_INFO("HS: e2e upgraded to PQ hybrid (X25519 + Kyber768)");
+                LOG_INFO("HS: e2e activated (hybrid X25519 + Kyber768)");
             }
             break;
         }

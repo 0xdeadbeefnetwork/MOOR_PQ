@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "moor/limits.h"
+#include "moor/sig.h"   /* MOOR_MLDSA_PK_LEN */
 
 /* Fallback directory server for bootstrap redundancy */
 typedef struct {
@@ -19,7 +20,9 @@ typedef struct {
 typedef struct {
     char     address[64];
     uint16_t port;
-    uint8_t  identity_pk[32];       /* Ed25519 (zero if unknown at config time) */
+    uint8_t  identity_pk[32];                        /* Ed25519 (zero if unknown at config time) */
+    uint8_t  pq_identity_pk[MOOR_MLDSA_PK_LEN];      /* ML-DSA-65 public key */
+    uint8_t  has_pq;                                 /* 1 if pq_identity_pk is populated */
 } moor_da_entry_t;
 
 /* Exit policy rule: accept or reject traffic to addr:port */
