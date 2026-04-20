@@ -1287,11 +1287,15 @@ static int dht_recv_pir_response_ex(moor_connection_t *conn, moor_circuit_t *cir
                                      uint8_t out[MOOR_DHT_MAX_DESC_DATA],
                                      int expected_cmd) {
     memset(out, 0, MOOR_DHT_MAX_DESC_DATA);
-    uint16_t received = 0;
-    uint16_t total = 0;
+    uint32_t received = 0;
+    uint32_t total = 0;
     int first = 1;
 
-    for (int cells = 0; cells < 16; cells++) { /* safety limit (DPF may need more cells) */
+    /* Server chunks at (498 - 8) = 490 bytes per cell. For MAX_DESC_DATA = 32 KB
+     * we need ~67 cells; cap at 96 for headroom without enabling runaway senders. */
+    #define PIR_RECV_MAX_CELLS 96
+
+    for (int cells = 0; cells < PIR_RECV_MAX_CELLS; cells++) {
         moor_cell_t rc;
         int ret = dht_recv_cell(conn, &rc, 10000);
         if (ret <= 0) {
@@ -1349,7 +1353,7 @@ static int dht_recv_pir_response_ex(moor_connection_t *conn, moor_circuit_t *cir
             return -1;
         }
         memcpy(out + offset, rp.data + 8, chunk);
-        received = offset + chunk;
+        received = (uint32_t)offset + chunk;
 
         if (received >= total)
             break;
