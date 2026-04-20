@@ -580,6 +580,12 @@ int moor_hs_load_keys(moor_hs_config_t *config) {
         }
     }
 
+    /* Restore monotonic state across restarts: without these calls the
+     * revision counter resets to 0 on every restart, and clients with a
+     * warm anti-replay cache reject all fresh descriptors as stale. */
+    moor_hs_load_revision(config);
+    moor_hs_load_pow_seed(config);
+
     LOG_INFO("HS keys loaded (PQ-committed address)");
     return 0;
 }
@@ -941,12 +947,14 @@ int moor_hs_publish_descriptor(moor_hs_config_t *config) {
      * desc_key = BLAKE2b("moor-desc" || identity_pk || time_period)
      */
 
-    /* Increment revision counter (Tor-aligned: monotonic, prevents replays).
-     * Tor uses OPE (order-preserving encryption) so the HSDir can compare
-     * revisions without decrypting. We use a simpler approach: plaintext
-     * counter visible to HSDir, since MOOR's DHT stores encrypted descriptors
-     * and the counter is in the wire header, not the encrypted body. */
-    config->desc_revision++;
+    /* Advance revision counter monotonically. Floor to wall-clock so that a
+     * restart which lost the persisted counter still produces a revision
+     * that beats any warm client anti-replay cache — revision always ≥ now. */
+    uint64_t now_rev = (uint64_t)time(NULL);
+    if (config->desc_revision < now_rev)
+        config->desc_revision = now_rev;
+    else
+        config->desc_revision++;
     moor_hs_save_revision(config);
 
     /* Build plaintext descriptor */
