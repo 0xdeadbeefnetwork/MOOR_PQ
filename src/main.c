@@ -852,8 +852,13 @@ static void relay_accept_cb(int fd, int events, void *arg) {
      * respond as a smart toaster. Real MOOR clients send a Noise_IK
      * handshake (starts with 32 bytes of ephemeral key — high entropy).
      * Scanners send "GET /", "SSH-", "\x00", or other low-entropy probes.
-     * This wastes their time and pollutes their databases. */
-    if (pn > 0) {
+     * This wastes their time and pollutes their databases.
+     *
+     * Bridges DELIBERATELY accept ASCII-looking prefixes (scramble's
+     * "GET / HTTP/1.1", shitstorm/mirage TLS ClientHello, speakeasy
+     * "SSH-2.0") as DPI camouflage — skip honeypot when in bridge mode
+     * so the transport handshake can strip the cover prefix. */
+    if (pn > 0 && !g_is_bridge) {
         /* Only match DEFINITE scanner signatures — ASCII protocol probes
          * that can NEVER be a valid Noise_IK handshake. Noise_IK starts
          * with 32 bytes of X25519 ephemeral key (high entropy). We must

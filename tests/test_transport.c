@@ -25,6 +25,7 @@ int g_num_hs_configs = 0;
 char g_config_path[256] = "";
 void moor_graceful_shutdown(void) {}
 void moor_handle_sighup(void) {}
+void moor_request_consensus_refresh(void) {}
 void moor_hs_event_nullify_conn(moor_connection_t *c) { (void)c; }
 void moor_hs_event_invalidate_circuit(moor_circuit_t *c) { (void)c; }
 
