@@ -156,6 +156,36 @@ int moor_crypto_aead_decrypt(uint8_t *pt, size_t *pt_len,
     return 0;
 }
 
+int moor_crypto_aead_encrypt_n12(uint8_t *ct, size_t *ct_len,
+                                  const uint8_t *pt, size_t pt_len,
+                                  const uint8_t *ad, size_t ad_len,
+                                  const uint8_t key[32],
+                                  const uint8_t nonce[12]) {
+    unsigned long long ct_len_ull;
+    int rc = crypto_aead_chacha20poly1305_ietf_encrypt(
+            ct, &ct_len_ull, pt, pt_len, ad, ad_len, NULL, nonce, key);
+    if (rc != 0) return -1;
+    if (ct_len) *ct_len = (size_t)ct_len_ull;
+    return 0;
+}
+
+int moor_crypto_aead_decrypt_n12(uint8_t *pt, size_t *pt_len,
+                                  const uint8_t *ct, size_t ct_len,
+                                  const uint8_t *ad, size_t ad_len,
+                                  const uint8_t key[32],
+                                  const uint8_t nonce[12]) {
+    unsigned long long pt_len_ull;
+    int rc = crypto_aead_chacha20poly1305_ietf_decrypt(
+            pt, &pt_len_ull, NULL, ct, ct_len, ad, ad_len, nonce, key);
+    if (rc != 0) {
+        sodium_memzero(pt, ct_len > crypto_aead_chacha20poly1305_ietf_ABYTES
+                            ? ct_len - crypto_aead_chacha20poly1305_ietf_ABYTES : 0);
+        return -1;
+    }
+    if (pt_len) *pt_len = (size_t)pt_len_ull;
+    return 0;
+}
+
 int moor_crypto_stream_xor(uint8_t *buf, size_t len,
                            const uint8_t key[32], uint64_t nonce) {
     /* Use ChaCha20 as a stream cipher (XOR keystream with data).
@@ -603,6 +633,32 @@ int __attribute__((noinline)) moor_crypto_hkdf(uint8_t out1[32],
 
     sodium_memzero(temp_key, 32);
     sodium_memzero(input2, 33);
+    return 0;
+}
+
+/* Link-layer rekey: single-block HKDF-Expand over chaining_key with
+ *   info = "moor link rekey" || be64(epoch)
+ * Produces one 32-byte output (T(1) of HKDF-Expand). Since 32 <= HashLen,
+ * a single HMAC call is correct and matches RFC 5869 Expand for L=32. */
+int moor_crypto_link_rekey(uint8_t out_key[32],
+                           const uint8_t chaining_key[32],
+                           uint64_t epoch) {
+    static const char label[] = "moor link rekey"; /* 15 bytes, no NUL */
+    uint8_t info[15 + 8 + 1];
+    memcpy(info, label, 15);
+    /* big-endian epoch */
+    info[15] = (uint8_t)(epoch >> 56);
+    info[16] = (uint8_t)(epoch >> 48);
+    info[17] = (uint8_t)(epoch >> 40);
+    info[18] = (uint8_t)(epoch >> 32);
+    info[19] = (uint8_t)(epoch >> 24);
+    info[20] = (uint8_t)(epoch >> 16);
+    info[21] = (uint8_t)(epoch >> 8);
+    info[22] = (uint8_t)(epoch);
+    /* HKDF-Expand T(1) = HMAC(PRK, info || 0x01) */
+    info[23] = 0x01;
+    hmac_blake2b(out_key, chaining_key, info, sizeof(info));
+    sodium_memzero(info, sizeof(info));
     return 0;
 }
 

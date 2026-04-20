@@ -1549,7 +1549,8 @@ static void da_serve_metrics(int fd, moor_da_config_t *config) {
     /* Relay table */
     APPEND("<div class='section'><h2>Relays</h2>");
     APPEND("<table><tr><th>Nickname</th><th>Address</th><th>Flags</th>"
-           "<th>Bandwidth</th><th>Country</th><th>Contact</th><th>Identity</th><th>Uptime</th></tr>");
+           "<th>Bandwidth</th><th>Country</th><th>Contact</th><th>Identity</th>"
+           "<th>KEM</th><th>Falcon</th><th>Uptime</th></tr>");
     for (uint32_t i = 0; i < nr; i++) {
         moor_node_descriptor_t *r = &cons->relays[i];
         { char esc_nick[128], esc_addr[256];
@@ -1596,6 +1597,28 @@ static void da_serve_metrics(int fd, moor_da_config_t *config) {
         APPEND("<td class='pk'>");
         for (int j = 0; j < 8; j++) APPEND("%02x", r->identity_pk[j]);
         APPEND("...</td>");
+        /* KEM / Falcon key digests — show first 6 bytes of each raw pk
+         * so operators can visually confirm keys rotated on fleet upgrade. */
+        int kem_any = 0, fal_any = 0;
+        for (int j = 0; j < 6 && j < (int)sizeof(r->kem_pk); j++)
+            if (r->kem_pk[j]) { kem_any = 1; break; }
+        for (int j = 0; j < 6 && j < (int)sizeof(r->falcon_pk); j++)
+            if (r->falcon_pk[j]) { fal_any = 1; break; }
+        APPEND("<td class='pk'>");
+        if (kem_any) {
+            for (int j = 0; j < 6; j++) APPEND("%02x", r->kem_pk[j]);
+            APPEND("...");
+        } else {
+            APPEND("<span style='color:#637777'>-</span>");
+        }
+        APPEND("</td><td class='pk'>");
+        if (fal_any) {
+            for (int j = 0; j < 6; j++) APPEND("%02x", r->falcon_pk[j]);
+            APPEND("...");
+        } else {
+            APPEND("<span style='color:#637777'>-</span>");
+        }
+        APPEND("</td>");
         /* Uptime (use first_seen if available, else published) */
         uint64_t up_base = r->first_seen ? r->first_seen : r->published;
         if (up_base > 0 && now > up_base) {
@@ -3412,15 +3435,14 @@ int moor_client_fetch_hs_descriptor(moor_hs_descriptor_t *desc,
     close(fd);
 
     /*
-     * Encrypted wire format from DA:
-     *   address_hash(32) + nonce(8) + ciphertext(plaintext + 16 MAC)
+     * Encrypted wire format from DA (v2):
+     *   address_hash(32) + ver(1=0x02) + nonce(12) + ciphertext(plaintext + 16 MAC)
      * Derive desc_key = BLAKE2b("moor-desc" || service_pk || time_period)
      */
-    if (len < 32 + 8 + 16) { free(buf); return -1; }
+    if (len < 32 + 1 + 12 + 16 || buf[32] != 0x02) { free(buf); return -1; }
 
-    uint64_t nonce = 0;
-    for (int i = 7; i >= 0; i--) nonce |= (uint64_t)buf[32 + (7 - i)] << (i * 8);
-    size_t ct_len = len - 32 - 8;
+    const uint8_t *nonce12 = buf + 33;
+    size_t ct_len = len - (32 + 1 + 12);
 
     uint8_t *plaintext = malloc(ct_len);
     if (!plaintext) { free(buf); return -1; }
@@ -3445,9 +3467,9 @@ int moor_client_fetch_hs_descriptor(moor_hs_descriptor_t *desc,
         uint8_t desc_key[32];
         moor_crypto_hash(desc_key, desc_key_input, 49);
 
-        if (moor_crypto_aead_decrypt(plaintext, &pt_len,
-                                      buf + 40, ct_len,
-                                      buf, 32, desc_key, nonce) == 0) {
+        if (moor_crypto_aead_decrypt_n12(plaintext, &pt_len,
+                                          buf + 45, ct_len,
+                                          buf, 32, desc_key, nonce12) == 0) {
             decrypted = 1;
             sodium_memzero(desc_key, 32);
             break;

@@ -935,8 +935,8 @@ int moor_hs_publish_descriptor(moor_hs_config_t *config) {
      * only sees the address_hash (lookup key). The DA cannot read
      * the intro points, onion key, or service identity.
      *
-     * Encrypted wire format:
-     *   address_hash(32) + nonce(8) + AEAD(plaintext_desc, ad=address_hash)
+     * Encrypted wire format (v2):
+     *   address_hash(32) + ver(1=0x02) + nonce(12) + AEAD(plaintext_desc, ad=address_hash)
      *
      * desc_key = BLAKE2b("moor-desc" || identity_pk || time_period)
      */
@@ -1155,28 +1155,30 @@ int moor_hs_publish_descriptor(moor_hs_config_t *config) {
     uint8_t desc_key[32];
     derive_desc_key(desc_key, config->identity_pk, current_time_period());
 
-    /* Generate random nonce */
-    uint64_t nonce;
-    moor_crypto_random((uint8_t *)&nonce, 8);
+    /* v2 descriptor: 96-bit nonce.  Birthday bound at 2^48 vs 2^32 for v1.
+     * Wire format: address_hash(32) + version(1=0x02) + nonce(12) + ciphertext. */
+    uint8_t nonce12[12];
+    moor_crypto_random(nonce12, 12);
 
     /* Outer encrypt: AEAD(body, ad=address_hash, key=desc_key, nonce) */
     uint8_t ciphertext[sizeof(to_encrypt) + 16];
     size_t ct_len;
-    if (moor_crypto_aead_encrypt(ciphertext, &ct_len,
-                                  to_encrypt, to_encrypt_len,
-                                  desc.address_hash, 32,
-                                  desc_key, nonce) != 0) {
+    if (moor_crypto_aead_encrypt_n12(ciphertext, &ct_len,
+                                      to_encrypt, to_encrypt_len,
+                                      desc.address_hash, 32,
+                                      desc_key, nonce12) != 0) {
         moor_crypto_wipe(desc_key, 32);
         sodium_memzero(to_encrypt, sizeof(to_encrypt));
         return -1;
     }
     moor_crypto_wipe(desc_key, 32);
 
-    /* Build encrypted wire data: address_hash(32) + nonce(8) + ciphertext */
-    uint8_t wire[sizeof(ciphertext) + 40]; /* address_hash(32) + nonce(8) + ciphertext */
+    /* Build encrypted wire data: address_hash(32) + ver(1) + nonce(12) + ciphertext */
+    uint8_t wire[sizeof(ciphertext) + 32 + 1 + 12];
     size_t wire_len = 0;
     memcpy(wire, desc.address_hash, 32); wire_len += 32;
-    for (int i = 7; i >= 0; i--) wire[wire_len++] = (uint8_t)(nonce >> (i * 8));
+    wire[wire_len++] = 0x02; /* descriptor version 2 */
+    memcpy(wire + wire_len, nonce12, 12); wire_len += 12;
     memcpy(wire + wire_len, ciphertext, ct_len); wire_len += ct_len;
 
     if (wire_len > UINT16_MAX) {
@@ -1617,33 +1619,32 @@ int moor_hs_client_connect_start(const char *moor_address,
             if (moor_dht_fetch(lookup_hash, dht_data, &dht_len,
                                 consensus, try_srv, try_tp,
                                 da_address, da_port) == 0 && dht_len > 0) {
-                if (dht_len < 40) continue; /* need at least key(32)+nonce(8) */
-                if (dht_len >= 32 + 8 + 16) {
-                    uint8_t desc_key[32];
-                    derive_desc_key(desc_key, service_pk, try_tp);
+                /* v2: addr_hash(32) + ver(1=0x02) + nonce(12) + ct+16 */
+                if (dht_len < 32 + 1 + 12 + 16) continue;
+                if (dht_data[32] != 0x02) continue; /* reject v1 / unknown */
 
-                    uint64_t nonce = 0;
-                    for (int i = 7; i >= 0; i--)
-                        nonce |= (uint64_t)dht_data[32 + (7 - i)] << (i * 8);
-                    size_t ct_len = dht_len - 32 - 8;
+                uint8_t desc_key[32];
+                derive_desc_key(desc_key, service_pk, try_tp);
 
-                    uint8_t *pt = malloc(ct_len);
-                    if (pt) {
-                        if (moor_crypto_aead_decrypt(pt, &outer_pt_len,
-                                                      dht_data + 40, ct_len,
-                                                      dht_data, 32,
-                                                      desc_key, nonce) == 0 &&
-                            outer_pt_len <= sizeof(outer_pt)) {
-                            memcpy(outer_pt, pt, outer_pt_len);
-                            desc_fetched = 1;
-                            LOG_INFO("HS: descriptor fetched via DHT (tp=%lu)",
-                                     (unsigned long)try_tp);
-                        }
-                        sodium_memzero(pt, ct_len);
-                        free(pt);
+                const uint8_t *nonce12 = dht_data + 33;
+                size_t ct_len = dht_len - (32 + 1 + 12);
+
+                uint8_t *pt = malloc(ct_len);
+                if (pt) {
+                    if (moor_crypto_aead_decrypt_n12(pt, &outer_pt_len,
+                                                     dht_data + 45, ct_len,
+                                                     dht_data, 32,
+                                                     desc_key, nonce12) == 0 &&
+                        outer_pt_len <= sizeof(outer_pt)) {
+                        memcpy(outer_pt, pt, outer_pt_len);
+                        desc_fetched = 1;
+                        LOG_INFO("HS: descriptor fetched via DHT (tp=%lu)",
+                                 (unsigned long)try_tp);
                     }
-                    moor_crypto_wipe(desc_key, 32);
+                    sodium_memzero(pt, ct_len);
+                    free(pt);
                 }
+                moor_crypto_wipe(desc_key, 32);
             }
         }
     }

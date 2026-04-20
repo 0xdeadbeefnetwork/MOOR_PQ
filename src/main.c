@@ -1856,6 +1856,12 @@ static int run_relay(void) {
     g_relay_listen_fd = moor_listen(g_bind_addr, g_or_port);
     if (g_relay_listen_fd < 0) return -1;
 
+    /* Register our own address:port so moor_connection_connect refuses
+     * to loopback onto ourselves (fleet wedge 2026-04-17). */
+    moor_connection_set_self_addr(
+        g_advertise_addr[0] ? g_advertise_addr : g_bind_addr,
+        g_or_port);
+
     moor_event_add(g_relay_listen_fd, MOOR_EVENT_READ, relay_accept_cb, NULL);
 
     /* Exit notice: serve a static "I'm a MOOR exit, not a website" page on :80.

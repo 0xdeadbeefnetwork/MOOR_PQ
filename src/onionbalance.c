@@ -256,25 +256,27 @@ int moor_ob_publish(moor_ob_config_t *config) {
     uint8_t desc_key[32];
     moor_crypto_hash(desc_key, desc_key_input, 49);
 
-    uint64_t nonce;
-    moor_crypto_random((uint8_t *)&nonce, 8);
+    /* v2 descriptor: 96-bit nonce, version byte in wire. */
+    uint8_t nonce12[12];
+    moor_crypto_random(nonce12, 12);
 
     uint8_t ciphertext[1024];
     size_t ct_len;
-    if (moor_crypto_aead_encrypt(ciphertext, &ct_len,
-                                  plaintext, pt_len,
-                                  desc.address_hash, 32,
-                                  desc_key, nonce) != 0) {
+    if (moor_crypto_aead_encrypt_n12(ciphertext, &ct_len,
+                                      plaintext, pt_len,
+                                      desc.address_hash, 32,
+                                      desc_key, nonce12) != 0) {
         moor_crypto_wipe(desc_key, 32);
         return -1;
     }
     moor_crypto_wipe(desc_key, 32);
 
-    /* Build wire data: address_hash(32) + nonce(8) + ciphertext */
+    /* Build wire data: address_hash(32) + ver(1) + nonce(12) + ciphertext */
     uint8_t wire[1024];
     size_t wire_len = 0;
     memcpy(wire, desc.address_hash, 32); wire_len += 32;
-    for (int i = 7; i >= 0; i--) wire[wire_len++] = (uint8_t)(nonce >> (i * 8));
+    wire[wire_len++] = 0x02; /* descriptor version 2 */
+    memcpy(wire + wire_len, nonce12, 12); wire_len += 12;
     memcpy(wire + wire_len, ciphertext, ct_len); wire_len += ct_len;
 
     /* Publish to DA */

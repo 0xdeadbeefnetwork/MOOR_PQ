@@ -194,6 +194,10 @@ void moor_connection_free(moor_connection_t *conn) {
         }
         moor_crypto_wipe(conn->send_key, 32);
         moor_crypto_wipe(conn->recv_key, 32);
+        moor_crypto_wipe(conn->send_chain, 32);
+        moor_crypto_wipe(conn->recv_chain, 32);
+        moor_crypto_wipe(conn->send_prev_key, 32);
+        moor_crypto_wipe(conn->recv_prev_key, 32);
         moor_crypto_wipe(conn->our_kx_sk, 32);
         moor_crypto_wipe(conn->recv_buf, sizeof(conn->recv_buf));
         moor_queue_clear(&conn->outq);
@@ -228,6 +232,10 @@ void moor_connection_free(moor_connection_t *conn) {
     }
     moor_crypto_wipe(conn->send_key, 32);
     moor_crypto_wipe(conn->recv_key, 32);
+    moor_crypto_wipe(conn->send_chain, 32);
+    moor_crypto_wipe(conn->recv_chain, 32);
+    moor_crypto_wipe(conn->send_prev_key, 32);
+    moor_crypto_wipe(conn->recv_prev_key, 32);
     moor_crypto_wipe(conn->our_kx_sk, 32);
     moor_crypto_wipe(conn->our_kx_pk, 32);
     moor_crypto_wipe(conn->recv_buf, sizeof(conn->recv_buf));
@@ -271,6 +279,37 @@ int moor_set_socket_timeout(int fd, int seconds) {
         return -1;
     return setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 #endif
+}
+
+/* Self-address filter — prevents OR loopback wedges. See
+ * include/moor/connection.h and project_fleet_wedge_2026_04_17. */
+static char g_self_addr[64] = "";
+static uint16_t g_self_port = 0;
+
+void moor_connection_set_self_addr(const char *addr, uint16_t port) {
+    if (!addr) {
+        g_self_addr[0] = '\0';
+        g_self_port = 0;
+        return;
+    }
+    snprintf(g_self_addr, sizeof(g_self_addr), "%s", addr);
+    g_self_port = port;
+}
+
+static int is_self_target(const char *addr, uint16_t port) {
+    if (g_self_port == 0 || g_self_addr[0] == '\0' || !addr)
+        return 0;
+    if (port != g_self_port)
+        return 0;
+    if (strcmp(addr, g_self_addr) == 0)
+        return 1;
+    int a_lb = (strcmp(addr, "127.0.0.1") == 0 ||
+                strcmp(addr, "localhost") == 0 ||
+                strcmp(addr, "::1") == 0);
+    int s_lb = (strcmp(g_self_addr, "127.0.0.1") == 0 ||
+                strcmp(g_self_addr, "localhost") == 0 ||
+                strcmp(g_self_addr, "::1") == 0);
+    return a_lb && s_lb;
 }
 
 int moor_tcp_connect_simple(const char *address, uint16_t port) {
@@ -919,6 +958,10 @@ cleanup_server:
  *   3. Receive kyber_ct(1088) encrypted
  *   4. Mix KEM shared secret: new_keys = HKDF(old_key, kem_shared)
  */
+/* Forward decl: link-layer rekey initializer (defined below with the
+ * send/recv rotation helpers). Called once at handshake completion. */
+void moor_link_rekey_init(moor_connection_t *conn);
+
 int link_handshake_client_pq(moor_connection_t *conn,
                               const uint8_t our_identity_pk[32],
                               const uint8_t our_identity_sk[64]) {
@@ -1015,6 +1058,9 @@ int link_handshake_client_pq(moor_connection_t *conn,
     moor_crypto_wipe(new_recv2, 32);
     moor_crypto_wipe(dummy, 32);
 
+    /* Initialize link-rekey state (epoch 0 uses the Noise+KEM-derived keys) */
+    moor_link_rekey_init(conn);
+
     conn->pq_handshake_done = 1;
     LOG_DEBUG("PQ hybrid Noise_IK link handshake complete (client)");
     return 0;
@@ -1103,6 +1149,9 @@ int link_handshake_server_pq(moor_connection_t *conn,
     moor_crypto_wipe(new_recv2, 32);
     moor_crypto_wipe(dummy, 32);
 
+    /* Initialize link-rekey state (epoch 0 uses the Noise+KEM-derived keys) */
+    moor_link_rekey_init(conn);
+
     conn->pq_handshake_done = 1;
     LOG_DEBUG("PQ hybrid Noise_IK link handshake complete (server)");
     return 0;
@@ -1122,6 +1171,11 @@ int moor_connection_connect(moor_connection_t *conn,
               address, port,
               conn->peer_identity[0], conn->peer_identity[1],
               conn->peer_identity[2], conn->peer_identity[3]);
+
+    if (is_self_target(address, port)) {
+        LOG_WARN("refusing self-loop OR connect to %s:%u", address, port);
+        return -1;
+    }
 
     int fd = moor_tcp_connect_simple(address, port);
     if (fd < 0) {
@@ -1297,6 +1351,112 @@ int moor_connection_accept(moor_connection_t *conn, int listen_fd,
     return ret;
 }
 
+/* ---- Link-layer AEAD rekey ----
+ *
+ * Both peers trigger implicitly on the same counter thresholds so no
+ * wire-format signalling is needed. Rotation happens on the *record*
+ * boundary: once the current epoch hits the limit, we derive the next
+ * key, slide current->prev, and use the new key for the next record.
+ *
+ * Derivation per direction:
+ *   next_key = HKDF-Expand(chaining_key, "moor link rekey" || be64(epoch))
+ *   chaining_key := next_key   (ratchet forward)
+ *   epoch++, records = 0, start_ms = now
+ *
+ * prev_key is retained for one epoch so a recv-side straggler cell (peer
+ * rotated slightly before us) can still be decrypted with the previous
+ * key. Both paths metered via g_stats.link_rekey*. */
+
+void moor_link_rekey_init(moor_connection_t *conn) {
+    if (!conn) return;
+    conn->send_epoch = 0;
+    conn->recv_epoch = 0;
+    conn->send_epoch_records = 0;
+    conn->recv_epoch_records = 0;
+    uint64_t now_ms = moor_time_ms();
+    conn->send_epoch_start_ms = now_ms;
+    conn->recv_epoch_start_ms = now_ms;
+    /* chaining_key for epoch 0 = the handshake-derived AEAD key */
+    memcpy(conn->send_chain, conn->send_key, 32);
+    memcpy(conn->recv_chain, conn->recv_key, 32);
+    memset(conn->send_prev_key, 0, 32);
+    memset(conn->recv_prev_key, 0, 32);
+    conn->send_prev_valid = 0;
+    conn->recv_prev_valid = 0;
+}
+
+/* Check the send-side rotation trigger and, if crossed, derive the next
+ * key. Called once per outgoing record, BEFORE the encrypt. */
+static void link_rekey_send_maybe_rotate(moor_connection_t *conn) {
+    /* Rekey state isn't installed until PQ handshake completes; the PQ
+     * phase itself sends encrypted cells using the post-Noise key, so
+     * suppress rotation until moor_link_rekey_init() has run. */
+    if (!conn->pq_handshake_done) return;
+    uint64_t now_ms = moor_time_ms();
+    uint64_t elapsed = (now_ms >= conn->send_epoch_start_ms)
+                           ? (now_ms - conn->send_epoch_start_ms) : 0;
+    if (conn->send_epoch_records < MOOR_LINK_REKEY_RECORDS &&
+        elapsed < MOOR_LINK_REKEY_INTERVAL_MS)
+        return;
+
+    uint64_t next_epoch = conn->send_epoch + 1;
+    uint8_t next_key[32];
+    if (moor_crypto_link_rekey(next_key, conn->send_chain, next_epoch) != 0) {
+        /* Derivation cannot fail in practice — log and skip rotation. */
+        LOG_ERROR("link rekey (send): KDF failed fd=%d", conn->fd);
+        moor_crypto_wipe(next_key, 32);
+        return;
+    }
+    memcpy(conn->send_prev_key, conn->send_key, 32);
+    conn->send_prev_valid = 1;
+    memcpy(conn->send_key, next_key, 32);
+    memcpy(conn->send_chain, next_key, 32);
+    moor_crypto_wipe(next_key, 32);
+
+    conn->send_epoch = next_epoch;
+    conn->send_epoch_records = 0;
+    conn->send_epoch_start_ms = now_ms;
+
+    moor_stats_t *stats = moor_monitor_stats();
+    stats->link_rekeys++;
+    LOG_DEBUG("link rekey (send): fd=%d epoch=%llu", conn->fd,
+              (unsigned long long)conn->send_epoch);
+}
+
+/* Check the recv-side rotation trigger and, if crossed, derive the next
+ * key. Called once per incoming record, BEFORE the decrypt attempt. */
+static void link_rekey_recv_maybe_rotate(moor_connection_t *conn) {
+    if (!conn->pq_handshake_done) return;
+    uint64_t now_ms = moor_time_ms();
+    uint64_t elapsed = (now_ms >= conn->recv_epoch_start_ms)
+                           ? (now_ms - conn->recv_epoch_start_ms) : 0;
+    if (conn->recv_epoch_records < MOOR_LINK_REKEY_RECORDS &&
+        elapsed < MOOR_LINK_REKEY_INTERVAL_MS)
+        return;
+
+    uint64_t next_epoch = conn->recv_epoch + 1;
+    uint8_t next_key[32];
+    if (moor_crypto_link_rekey(next_key, conn->recv_chain, next_epoch) != 0) {
+        LOG_ERROR("link rekey (recv): KDF failed fd=%d", conn->fd);
+        moor_crypto_wipe(next_key, 32);
+        return;
+    }
+    memcpy(conn->recv_prev_key, conn->recv_key, 32);
+    conn->recv_prev_valid = 1;
+    memcpy(conn->recv_key, next_key, 32);
+    memcpy(conn->recv_chain, next_key, 32);
+    moor_crypto_wipe(next_key, 32);
+
+    conn->recv_epoch = next_epoch;
+    conn->recv_epoch_records = 0;
+    conn->recv_epoch_start_ms = now_ms;
+
+    moor_stats_t *stats = moor_monitor_stats();
+    stats->link_rekeys++;
+    LOG_DEBUG("link rekey (recv): fd=%d epoch=%llu", conn->fd,
+              (unsigned long long)conn->recv_epoch);
+}
+
 /*
  * Wire format for encrypted cell:
  *   [2 bytes big-endian length] [ciphertext (cell_size + MAC_LEN)]
@@ -1317,6 +1477,10 @@ int moor_connection_send_cell(moor_connection_t *conn,
         return -1;
     }
 
+    /* Implicit link rekey: check threshold on record boundary BEFORE
+     * encrypt so this cell uses the new key. Peer counts identically. */
+    link_rekey_send_maybe_rotate(conn);
+
     uint8_t plain[MOOR_CELL_SIZE];
     moor_cell_pack(plain, cell);
 
@@ -1332,6 +1496,7 @@ int moor_connection_send_cell(moor_connection_t *conn,
         return -1;
     }
     moor_crypto_wipe(plain, sizeof(plain));
+    conn->send_epoch_records++;
 
     /* Length prefix */
     wire[0] = (uint8_t)(ct_len >> 8);
@@ -1411,6 +1576,9 @@ int moor_connection_encrypt_cell(moor_connection_t *conn,
         return -1;
     }
 
+    /* Implicit link rekey: rotate on the record boundary before encrypt. */
+    link_rekey_send_maybe_rotate(conn);
+
     uint8_t plain[MOOR_CELL_SIZE];
     moor_cell_pack(plain, cell);
 
@@ -1423,6 +1591,7 @@ int moor_connection_encrypt_cell(moor_connection_t *conn,
     }
     moor_crypto_wipe(plain, sizeof(plain));
     conn->send_nonce++;
+    conn->send_epoch_records++;
 
     wire[0] = (uint8_t)(ct_len >> 8);
     wire[1] = (uint8_t)(ct_len);
@@ -1490,6 +1659,9 @@ int moor_connection_recv_cell(moor_connection_t *conn, moor_cell_t *cell) {
         return -1;
     }
 
+    /* Implicit link rekey: rotate on record boundary BEFORE decrypt. */
+    link_rekey_recv_maybe_rotate(conn);
+
     /* Decrypt */
     uint8_t plain[MOOR_CELL_SIZE];
     size_t pt_len;
@@ -1497,15 +1669,32 @@ int moor_connection_recv_cell(moor_connection_t *conn, moor_cell_t *cell) {
                                   conn->recv_buf + 2, ct_len,
                                   NULL, 0, conn->recv_key,
                                   conn->recv_nonce) != 0) {
-        LOG_ERROR("cell decrypt failed (nonce=%llu ct_len=%u fd=%d)",
-                  (unsigned long long)conn->recv_nonce, ct_len, conn->fd);
-        /* Wipe and reset recv buffer -- bad data must not be retried */
-        moor_crypto_wipe(conn->recv_buf, conn->recv_len);
-        conn->recv_len = 0;
-        moor_crypto_wipe(plain, sizeof(plain));
-        return -1;
+        /* Desync fallback: retry once with previous-epoch key. Peer may
+         * have rotated slightly before us, or vice versa, so a single
+         * cell can straddle the boundary from our local POV. */
+        int recovered = 0;
+        if (conn->recv_prev_valid &&
+            moor_crypto_aead_decrypt(plain, &pt_len,
+                                      conn->recv_buf + 2, ct_len,
+                                      NULL, 0, conn->recv_prev_key,
+                                      conn->recv_nonce) == 0) {
+            recovered = 1;
+            moor_monitor_stats()->link_rekey_fallbacks++;
+        }
+        if (!recovered) {
+            LOG_ERROR("cell decrypt failed (nonce=%llu ct_len=%u fd=%d epoch=%llu)",
+                      (unsigned long long)conn->recv_nonce, ct_len, conn->fd,
+                      (unsigned long long)conn->recv_epoch);
+            moor_monitor_stats()->link_rekey_failures++;
+            /* Wipe and reset recv buffer -- bad data must not be retried */
+            moor_crypto_wipe(conn->recv_buf, conn->recv_len);
+            conn->recv_len = 0;
+            moor_crypto_wipe(plain, sizeof(plain));
+            return -1;
+        }
     }
     conn->recv_nonce++;
+    conn->recv_epoch_records++;
 
     moor_cell_unpack(cell, plain);
     moor_crypto_wipe(plain, sizeof(plain));
@@ -2015,6 +2204,9 @@ static void handle_pq_receiving(moor_connection_t *conn) {
     moor_crypto_wipe(new_recv2, 32);
     moor_crypto_wipe(dummy, 32);
 
+    /* Initialize link-rekey state (epoch 0 uses Noise+KEM-derived keys) */
+    moor_link_rekey_init(conn);
+
     conn->pq_handshake_done = 1;
     conn->state = CONN_STATE_OPEN;
     LOG_DEBUG("async PQ hybrid Noise_IK complete fd=%d", conn->fd);
@@ -2166,6 +2358,11 @@ int moor_connection_connect_async(moor_connection_t *conn,
                                    void *arg) {
     (void)transport;
     (void)transport_params;
+
+    if (is_self_target(address, port)) {
+        LOG_WARN("refusing self-loop async OR connect to %s:%u", address, port);
+        return -1;
+    }
 
     int fd = moor_tcp_connect_nonblocking(address, port);
     if (fd < 0) {

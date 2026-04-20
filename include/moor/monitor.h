@@ -52,6 +52,13 @@ typedef struct {
     uint64_t e2e_mac_failures;    /* HS rendezvous e2e AEAD decrypt failures —
                                      canary for ordering/key-desync/injection.
                                      Should stay 0 in a healthy fleet. */
+    uint64_t link_rekeys;         /* Successful link-layer epoch rotations
+                                     (counted per direction). */
+    uint64_t link_rekey_fallbacks;/* Decrypts that failed with the current
+                                     epoch key and succeeded using the
+                                     previous-epoch key (desync recovery). */
+    uint64_t link_rekey_failures; /* Decrypts that failed on both current
+                                     and previous epoch keys — link killed. */
     uint64_t started_at;          /* moor_time_ms() at init */
     /* BW tracking for event notification */
     uint64_t bw_read_last;        /* bytes_recv at last BW event */

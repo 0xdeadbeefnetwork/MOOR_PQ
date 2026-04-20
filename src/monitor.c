@@ -331,6 +331,9 @@ static void handle_ctrl_command(moor_ctrl_client_t *client, const char *cmd) {
                 "circuits_active=%u\r\n"
                 "cells_queued=%llu\r\n"
                 "cells_dropped=%llu\r\n"
+                "link_rekeys=%llu\r\n"
+                "link_rekey_fallbacks=%llu\r\n"
+                "link_rekey_failures=%llu\r\n"
                 "uptime_ms=%llu\r\n"
                 ".\r\n"
                 "250 OK\r\n",
@@ -344,6 +347,9 @@ static void handle_ctrl_command(moor_ctrl_client_t *client, const char *cmd) {
                 g_stats.circuits_active,
                 (unsigned long long)g_stats.cells_queued,
                 (unsigned long long)g_stats.cells_dropped,
+                (unsigned long long)g_stats.link_rekeys,
+                (unsigned long long)g_stats.link_rekey_fallbacks,
+                (unsigned long long)g_stats.link_rekey_failures,
                 (unsigned long long)(moor_time_ms() - g_stats.started_at));
         }
         else {
@@ -520,7 +526,8 @@ void moor_monitor_log_periodic(void) {
     LOG_INFO("monitor: uptime=%llus cells_sent=%llu cells_recv=%llu "
              "bytes_sent=%llu bytes_recv=%llu "
              "circuits=%u/%llu connections=%u "
-             "queued=%llu dropped=%llu",
+             "queued=%llu dropped=%llu "
+             "link_rekeys=%llu rekey_fb=%llu rekey_fail=%llu",
              (unsigned long long)uptime_s,
              (unsigned long long)g_stats.cells_sent,
              (unsigned long long)g_stats.cells_recv,
@@ -530,7 +537,10 @@ void moor_monitor_log_periodic(void) {
              (unsigned long long)g_stats.circuits_created,
              g_stats.connections_active,
              (unsigned long long)g_stats.cells_queued,
-             (unsigned long long)g_stats.cells_dropped);
+             (unsigned long long)g_stats.cells_dropped,
+             (unsigned long long)g_stats.link_rekeys,
+             (unsigned long long)g_stats.link_rekey_fallbacks,
+             (unsigned long long)g_stats.link_rekey_failures);
 }
 
 /* --- Async event notifications --- */

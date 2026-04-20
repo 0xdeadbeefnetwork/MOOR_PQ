@@ -48,6 +48,21 @@ int moor_crypto_aead_decrypt(uint8_t *pt, size_t *pt_len,
                              const uint8_t *ad, size_t ad_len,
                              const uint8_t key[32], uint64_t nonce);
 
+/* AEAD encrypt/decrypt variants taking a full 96-bit (12-byte) nonce.
+ * Used by HS descriptors v2 where the birthday bound at 64 bits under a
+ * per-time-period key was deemed too tight for comfort. */
+int moor_crypto_aead_encrypt_n12(uint8_t *ct, size_t *ct_len,
+                                  const uint8_t *pt, size_t pt_len,
+                                  const uint8_t *ad, size_t ad_len,
+                                  const uint8_t key[32],
+                                  const uint8_t nonce[12]);
+
+int moor_crypto_aead_decrypt_n12(uint8_t *pt, size_t *pt_len,
+                                  const uint8_t *ct, size_t ct_len,
+                                  const uint8_t *ad, size_t ad_len,
+                                  const uint8_t key[32],
+                                  const uint8_t nonce[12]);
+
 /* BLAKE2b-256 hash */
 int moor_crypto_hash(uint8_t out[32], const uint8_t *data, size_t len);
 
@@ -142,6 +157,15 @@ int moor_crypto_circuit_kx_pq(uint8_t fwd_key[32], uint8_t bwd_key[32],
 int moor_crypto_hkdf(uint8_t out1[32], uint8_t out2[32],
                      const uint8_t chaining_key[32],
                      const uint8_t *ikm, size_t ikm_len);
+
+/* Link-layer rekey KDF. Derives the next 32-byte AEAD key for a link
+ * direction using HKDF-Expand over the per-direction chaining key
+ * with info = "moor link rekey" || be64(epoch). Epoch is monotonic
+ * and starts at 0 — out_key for epoch 0 is the first post-rotation key
+ * (epoch 0 itself uses the Noise-derived key with no rotation). */
+int moor_crypto_link_rekey(uint8_t out_key[32],
+                           const uint8_t chaining_key[32],
+                           uint64_t epoch);
 
 /* Persistent relay key storage */
 int moor_keys_save(const char *data_dir,

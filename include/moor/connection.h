@@ -94,7 +94,34 @@ struct moor_connection {
      * If this stays nonzero and stale for too long, the connection is
      * silently wedged (TCP up, peer not reading) and gets force-closed. */
     uint64_t outq_stuck_since;
+    /* Link-layer AEAD rekey state (per direction). Both sides run an
+     * implicit schedule: every 2^31 records OR 30 min wall-clock, whichever
+     * comes first, they both roll forward one epoch. No control cell —
+     * the rotation is driven by counters both ends can see identically.
+     *
+     * next_key = HKDF-Expand(chaining_key, "moor link rekey" || be64(epoch), 32)
+     * After rotation: prev_key = current_key, current_key = next_key,
+     * chaining_key = next_key, epoch++, records=0, start_ms=now.
+     * On decrypt failure the recv side may retry once with recv_prev_key. */
+    uint64_t send_epoch;
+    uint64_t recv_epoch;
+    uint64_t send_epoch_records;
+    uint64_t recv_epoch_records;
+    uint64_t send_epoch_start_ms;
+    uint64_t recv_epoch_start_ms;
+    uint8_t  send_chain[32];
+    uint8_t  recv_chain[32];
+    uint8_t  send_prev_key[32];
+    uint8_t  recv_prev_key[32];
+    int      send_prev_valid;
+    int      recv_prev_valid;
 };
+
+/* Link rekey threshold: rotate after this many records in the current
+ * epoch OR after MOOR_LINK_REKEY_INTERVAL_MS wall-clock, whichever first.
+ * 2^31 records is ~65 GiB of cell traffic per direction before rotation. */
+#define MOOR_LINK_REKEY_RECORDS     (1ULL << 31)
+#define MOOR_LINK_REKEY_INTERVAL_MS (30ULL * 60ULL * 1000ULL) /* 30 min */
 
 /* Initialize connection pool */
 void moor_connection_init_pool(void);
@@ -195,6 +222,18 @@ int moor_set_socket_timeout(int fd, int seconds);
 /* Simple TCP connect using getaddrinfo (IPv4/IPv6 transparent).
  * Returns connected fd or -1 on error. */
 int moor_tcp_connect_simple(const char *address, uint16_t port);
+
+/* Record this relay's advertised address:port.  Subsequent
+ * moor_connection_connect / _connect_async targeting the same
+ * address:port will refuse immediately.
+ *
+ * Why: self-loop OR connections wedged the AWS fleet on 2026-04-17.
+ * A relay that ended up with its own fingerprint in its guard/middle
+ * pool would open a TCP connection to its own listen_fd, BEGIN a
+ * circuit, block in sendto waiting for itself to read, and the event
+ * loop deadlocked.  Refusing at the address layer catches the case
+ * where the identity check didn't (e.g. stale consensus, IP reuse). */
+void moor_connection_set_self_addr(const char *addr, uint16_t port);
 
 /* Async non-blocking TCP connect + link handshake.
  * Callback fires with status 0 on success, -1 on failure.
