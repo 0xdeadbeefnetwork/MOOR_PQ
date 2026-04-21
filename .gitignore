@@ -33,6 +33,11 @@ BUG_AUDIT.md
 BUILD_ID
 promo/
 .claude/
+
+# Private outreach / personal drafts — never push
+docs/phrack_moor.txt
+docs/contacts.txt
+docs/email_syverson.txt
 *.mp3
 *.mp4
 *.wav

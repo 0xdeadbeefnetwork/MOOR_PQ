@@ -1,8 +1,11 @@
 # Configuration
 
-MOOR is configured via a config file (`-f moorrc` or `--config moorrc`) or CLI flags. CLI flags override config file values. With no arguments, MOOR starts as a SOCKS5 client on `127.0.0.1:9050`.
+MOOR is configured via a config file (`-f moorrc` or `--config moorrc`) or CLI
+flags. CLI flags override config-file values. With no arguments, MOOR starts as
+a SOCKS5 client on `127.0.0.1:9050`.
 
-Config file format: one `Key Value` pair per line. Lines starting with `#` are comments.
+Config file format: one `Key Value` pair per line. Lines starting with `#` are
+comments.
 
 ```
 # Example moorrc
@@ -14,7 +17,8 @@ Verbose 1
 
 ## Client
 
-A client connects to the MOOR network and exposes a local SOCKS5 proxy. Applications route traffic through this proxy to reach destinations anonymously.
+A client connects to the MOOR network and exposes a local SOCKS5 proxy.
+Applications route traffic through the proxy to reach destinations anonymously.
 
 **Minimal usage:**
 
@@ -35,13 +39,16 @@ A client connects to the MOOR network and exposes a local SOCKS5 proxy. Applicat
 | `--da-address <addr>` | `DAAddress` | 107.174.70.38 | Directory authority address (comma-separated for multiple) |
 | `--da-port <port>` | `DAPort` | 9030 | Directory authority port |
 | `--data-dir <dir>` | `DataDir` / `DataDirectory` | ~/.moor | Persistent state directory (guard state, consensus cache) |
-| `--pir` / `--no-pir` | `PIR` | 1 (on) | PIR for hidden service descriptor lookups |
+| `--pir` / `--no-pir` | `PIR` | 1 (on) | PIR for hidden-service descriptor lookups |
 | `--geoip <file>` | `GeoIPFile` | | IPv4 GeoIP database (Tor-compatible format) |
 | `--geoip6 <file>` | `GeoIPv6File` | | IPv6 GeoIP database (Tor-compatible format) |
 | `--EntryNode <fp>` | `EntryNode` / `EntryNodes` | | Pin a specific entry relay by fingerprint |
 | `-v` | `Verbose` | 0 | Verbose logging |
 | `-f <file>` / `--config <file>` | | | Load config from file |
 | `-h` / `--help` | | | Print usage and exit |
+
+Requests for `.onion` addresses are rejected at the SOCKS5 ingress — MOOR
+uses `.moor`, not `.onion`.
 
 **Transparent proxy (gateway mode):**
 
@@ -51,7 +58,7 @@ A client connects to the MOOR network and exposes a local SOCKS5 proxy. Applicat
 | | `TransListenAddress` | | Bind address for transparent proxy |
 | `--DNSPort <port>` | `DNSPort` | 0 (off) | DNS resolver port for transparent proxying |
 | | `DNSListenAddress` | | Bind address for DNS port |
-| | `AutomapHostsOnResolve` | 0 | Map .moor hostnames to virtual IPs automatically |
+| | `AutomapHostsOnResolve` | 0 | Map `.moor` hostnames to virtual IPs automatically |
 
 **IPv6 options:**
 
@@ -70,32 +77,36 @@ A client connects to the MOOR network and exposes a local SOCKS5 proxy. Applicat
 
 ## Relay
 
-A relay forwards traffic for other MOOR users. The directory authority (DA) assigns consensus flags based on relay performance. You choose what *role* your relay plays.
+A relay forwards traffic for other MOOR users. The directory authority (DA)
+assigns consensus flags based on relay performance. You choose what *role*
+your relay plays.
 
-### Relay Types
+### Relay types
 
-| Type | How to Set | What It Does |
+| Type | How to set | What it does |
 |------|-----------|--------------|
-| **General relay** | `--mode relay` (no flags) | Forwards traffic within the network. The DA assigns Guard, Exit, or other flags automatically based on performance and uptime. |
-| **Guard** | `--guard` or `Guard 1` | Entry point for client circuits. Sees the client IP but not the destination. Self-declared, but the DA can strip the flag on large networks if performance criteria are not met. |
-| **Exit** | `--exit` or `Exit 1` / `ExitRelay 1` | Forwards traffic to the public internet. Self-declared -- the DA always preserves this flag. Nobody accidentally becomes an exit. |
-| **Middle-only** | `--middle-only` or `MiddleOnly 1` | Explicitly middle-only. The DA strips Guard, Exit, and HSDir flags from this relay. |
+| **General relay** | `--mode relay` (no flags) | Forwards traffic within the network. The DA assigns Guard, Exit, or other flags based on performance and uptime. |
+| **Guard** | `--guard` or `Guard 1` | Entry point for client circuits. Sees client IPs, not destinations. Self-declared; DAs can strip the flag on large networks if performance criteria are not met. |
+| **Exit** | `--exit` or `Exit 1` / `ExitRelay 1` | Forwards traffic to the public internet. Self-declared — the DA always preserves this flag. Nobody accidentally becomes an exit. |
+| **Middle-only** | `--middle-only` or `MiddleOnly 1` | Explicitly middle-only. DAs strip Guard, Exit, and HSDir flags from this relay. |
 | **Bridge** | `--is-bridge` or `IsBridge 1` | Unlisted relay for censorship circumvention. Not published in the public consensus. |
 
-### Flag Assignment by the DA
+### Flag assignment by the DA
 
-The DA computes flags statistically across all registered relays:
+DAs compute flags statistically across all registered relays. Each DA
+independently computes flags from medians — there is no cross-DA majority
+vote on flags.
 
 | Flag | Criteria | Notes |
 |------|----------|-------|
-| **Fast** | Bandwidth >= 12.5th percentile (floor: 4 KB/s) | ~87.5% of relays get this |
-| **Stable** | Uptime >= median uptime | ~50% of relays get this |
-| **Guard** | Fast + Stable + bandwidth >= median non-exit bandwidth + time known >= 8 days | Under 20 relays: self-declared Guard is trusted immediately |
-| **HSDir** | Fast + Stable + uptime >= 96 hours | Under 20 relays: uptime requirement waived |
+| **Fast** | Bandwidth ≥ 12.5th percentile (floor: 4 KB/s) | ~87.5% of relays get this |
+| **Stable** | Uptime ≥ median uptime | ~50% of relays get this |
+| **Guard** | Fast + Stable + bandwidth ≥ median non-exit bandwidth + time known ≥ 8 days | Under 20 relays: self-declared Guard is trusted immediately |
+| **HSDir** | Fast + Stable + uptime ≥ 96 hours | Under 20 relays: uptime requirement waived |
 | **Exit** | Relay self-declares `Exit 1` | DA always preserves this; never auto-assigned |
 | **MiddleOnly** | Relay self-declares `MiddleOnly 1` | DA strips Guard, Exit, and HSDir |
 
-### Relay Configuration
+### Relay configuration
 
 **Example:**
 
@@ -120,42 +131,50 @@ Verbose 1
 |----------|-----------|---------|-------------|
 | `--mode relay` | `Mode` | client | Run as relay |
 | `--or-port <port>` / `--ORPort <port>` | `ORPort` | 9001 | Onion routing port (required for relay mode) |
-| `--advertise <addr>` | `AdvertiseAddress` | auto-detected | Public IP address. Auto-detected via UDP probe to DA. Guard/exit relays fail startup if detection fails (e.g., behind NAT). |
+| `--advertise <addr>` | `AdvertiseAddress` | auto-detected | Public IP address. Auto-detected via connected-UDP probe to the DA. Guard/exit relays fail startup if detection fails. |
 | `--guard` | `Guard` | 0 | Advertise as guard relay |
 | `--exit` / `--ExitRelay 1` | `Exit` / `ExitRelay` | 0 | Advertise as exit relay |
 | `--middle-only` | `MiddleOnly` | 0 | Middle-only relay |
 | `--nickname <name>` / `--Nickname <name>` | `Nickname` | | Human-readable relay name |
 | `--bandwidth <bw>` / `--BandwidthRate <bw>` | `Bandwidth` / `BandwidthRate` | 1000000 | Advertised bandwidth in bytes/s |
 | `--is-bridge` | `IsBridge` | 0 | Run as unlisted bridge relay |
-| `--bridge-transport <t>` | | scramble | Bridge pluggable transport: `scramble`, `shade`, `mirage`, `shitstorm` |
+| `--bridge-transport <t>` | | scramble | Bridge pluggable transport (see Transports below) |
 | `--pow-difficulty <n>` | `PowDifficulty` | 0 | Argon2id proof-of-work difficulty for DA registration (0-64) |
-| `--pow-memlimit <KB>` | `PowMemLimit` | 0 | Argon2id memory limit in KB (stored internally as bytes) |
+| `--pow-memlimit <KB>` | `PowMemLimit` | 0 | Argon2id memory limit in KB |
 | `--mix-delay <ms>` | `MixDelay` | 0 | Poisson mixing delay in milliseconds (0 = disabled) |
-| `--exit-notice` | `ExitNotice` | 1 (on for exits) | Serve mandatory HTTP notice page on :80 ("this is a MOOR exit, not a website") |
+| `--exit-notice` | `ExitNotice` | 1 (on for exits) | Serve mandatory HTTP notice on :80 ("this is a MOOR exit, not a website") |
 | `--dns-server-port <p>` | `DNSServerPort` | 0 (off) | DNS-over-TCP listener port, intended to sit behind a hidden service |
 | `--dns-server-upstream <host[:p]>` | `DNSServerUpstream` | 91.239.100.100:53 | Upstream recursive resolver for DNS-over-TCP (default: UncensoredDNS, anycast, no logs/filtering) |
 
-**Additional relay config-file-only options:**
+**Additional relay config-file options:**
 
 | Config Key | Default | Description |
 |-----------|---------|-------------|
-| `RelayFamily` | | Ed25519 fingerprint (64 hex chars) of a sibling relay, for family declaration. Can appear up to 8 times. |
+| `RelayFamily` | | Ed25519 fingerprint (64 hex chars) of a sibling relay. Up to 8 entries. |
 | `AccountingMax` | 0 (off) | Maximum bytes transferred per accounting period |
 | `AccountingPeriod` | | Accounting period in seconds (required if AccountingMax is set) |
 | `RateLimit` | 0 (off) | Rate limit in bytes/s |
 | `DirCache` | 0 | Cache and serve directory data |
 | `UseMicrodescriptors` | 0 | Use microdescriptors instead of full descriptors |
 
-**Strict build-ID fleet gate:** every node stamps a 16-byte git-hash build ID into its
-descriptor. Directory authorities reject descriptors whose build_id differs from their
-own -- mixed-commit fleets cannot form. Coordinated full-fleet upgrades are required
-when the build ID changes.
+**Strict build-ID fleet gate.** Every node stamps a 16-byte git-hash build ID
+into its descriptor. Directory authorities reject descriptors whose
+`build_id` differs from their own — mixed-commit fleets cannot form. Upgrade
+the whole fleet in lockstep when the build ID changes.
+
+**Scanner honeypot.** Non-bridge relays intercept ORPort probes matching
+well-known DPI fingerprints (HTTP `GET `, `SSH-2.0`, SCADA banners) and
+return rotating fake industrial-control responses. Bridge relays skip this
+so legitimate transport cover prefixes pass through.
 
 ---
 
-## Directory Authority
+## Directory authority
 
-A directory authority (DA) maintains the network consensus -- the authoritative list of all relays and their flags. DAs exchange votes with peers and produce a signed consensus document.
+A directory authority (DA) maintains the network consensus — the
+authoritative list of all relays and their flags. DAs exchange votes with
+peers and produce a signed consensus document dual-signed Ed25519 +
+ML-DSA-65 (sequential-AND verify on the client).
 
 **Example:**
 
@@ -180,19 +199,23 @@ Verbose 1
 | `--dir-port <port>` / `--DirPort <port>` | `DirPort` | 9030 | Directory service port (required for DA mode) |
 | `--da-peers <list>` | `DAPeers` | | Peer DAs: `ip:port:hex_pk,...` (comma-separated) |
 
-The `--da-peers` format includes each peer's Ed25519 identity fingerprint (64 hex characters). Each DA prints its fingerprint at startup:
+The `--da-peers` format includes each peer's Ed25519 identity fingerprint
+(64 hex characters). Each DA prints its fingerprint at startup:
 
 ```
 DA identity fingerprint: 75655827bd8c9c68cf646a22936ea9f730dda8c955023ac0bfd05c62a1133cff
 ```
 
-Two DAs are hardcoded by default (107.174.70.38 and 107.174.70.122 with embedded Ed25519 public keys). Additional DAs can be configured via `DAAddress` with comma-separated entries:
+Two DAs are hardcoded by default (107.174.70.38 and 107.174.70.122 with
+embedded Ed25519 public keys). Additional DAs can be configured via
+`DAAddress` with comma-separated entries:
 
 ```
 DAAddress 107.174.70.38:9030,107.174.70.122:9030,10.0.0.5:9030
 ```
 
-Up to 9 DAs are supported.
+Up to 9 DAs are supported. Production-grade deployments should use 5-9 DAs
+for Byzantine fault tolerance.
 
 **Fallback directories:**
 
@@ -202,9 +225,10 @@ Up to 9 DAs are supported.
 
 ---
 
-## Hidden Service
+## Hidden service
 
-A hidden service exposes a local TCP service as a `.moor` onion address. Keys are generated on first run and reused on subsequent runs.
+A hidden service exposes a local TCP service as a `.moor` onion address.
+Keys are generated on first run and reused on subsequent runs.
 
 **Example (config file recommended):**
 
@@ -230,16 +254,30 @@ Verbose 1
 | `--hs-port <port>` | `HiddenServicePort` | 8080 | Local port to forward incoming connections to |
 | | `HiddenServiceAuthorizedClient` | | Base32-encoded Curve25519 public key for client authorization. Up to 16 per service. |
 
-Multiple hidden services can be configured in a single config file (up to 8). Each `HiddenServiceDir` line starts a new service, and subsequent `HiddenServicePort` and `HiddenServiceAuthorizedClient` lines apply to it:
+Multiple hidden services can be configured in one config file (up to 8).
+Each `HiddenServiceDir` line starts a new service, and subsequent
+`HiddenServicePort` and `HiddenServiceAuthorizedClient` lines apply to it:
 
 ```
 HiddenServiceDir /var/lib/moor/hs_web
-HiddenServicePort 80
+HiddenServicePort 80 8080
 HiddenServiceAuthorizedClient aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
 HiddenServiceDir /var/lib/moor/hs_ssh
 HiddenServicePort 22
 ```
+
+On first run, the HS generates:
+
+- Ed25519 identity keypair
+- Curve25519 onion keypair
+- ML-KEM-768 encapsulation keypair
+- Falcon-512 signing keypair
+
+and writes the resulting `.moor` address to `HiddenServiceDir/hostname`.
+The address is PQ-committed:
+`base32(Ed25519_pk || BLAKE2b_16(ML-KEM_pk || Falcon_pk)).moor`. Swapping
+either post-quantum key invalidates the address.
 
 **HS proof-of-work (anti-DoS):**
 
@@ -250,7 +288,8 @@ HiddenServicePort 22
 
 **OnionBalance (load balancing):**
 
-The `ob` mode runs an OnionBalance-style frontend that distributes traffic across backend hidden service instances.
+The `ob` mode runs an OnionBalance-style frontend that distributes traffic
+across backend hidden service instances.
 
 ```
 Mode ob
@@ -260,22 +299,25 @@ OnionBalancePort 8080
 
 | Config Key | Description |
 |-----------|-------------|
-| `OnionBalanceMaster` | Master .moor address for the OnionBalance frontend |
+| `OnionBalanceMaster` | Master `.moor` address for the OnionBalance frontend |
 | `OnionBalancePort` | Port the OnionBalance frontend listens on |
 
 ---
 
-## Exit Policy
+## Exit policy
 
-Exit relays control which destinations they allow traffic to. Rules are evaluated in order -- first match wins. If no rule matches, traffic is rejected (implicit `reject *:*`).
+Exit relays control which destinations they allow traffic to. Rules are
+evaluated in order — first match wins. If no rule matches, traffic is
+rejected (implicit `reject *:*`).
 
 **Syntax:** `ExitPolicy <action> <address>:<port>`
 
 - `<action>` is `accept` or `reject`
-- `<address>` is an IPv4 address, IPv4 CIDR, IPv6 address (in brackets), IPv6 CIDR, or `*` for wildcard
+- `<address>` is an IPv4 address, IPv4 CIDR, IPv6 address (in brackets),
+  IPv6 CIDR, or `*` for wildcard
 - `<port>` is a single port, a port range (`80-443`), or `*` for all ports
 
-**Example -- web-only exit:**
+**Example — web-only exit:**
 
 ```
 ExitPolicy accept *:80
@@ -283,7 +325,7 @@ ExitPolicy accept *:443
 ExitPolicy reject *:*
 ```
 
-**Example -- block a subnet:**
+**Example — block a subnet:**
 
 ```
 ExitPolicy reject 10.0.0.0/8:*
@@ -291,9 +333,11 @@ ExitPolicy reject [fc00::]/7:*
 ExitPolicy accept *:*
 ```
 
-**Default exit policy** (applied when no `ExitPolicy` lines are present and the relay is an exit):
-
-The default policy rejects private/reserved ranges (RFC 1918, loopback, link-local, CGNAT), blocks abuse-prone ports (SMTP 25/465/587, NNTP, SMB/RPC, P2P file sharing), and accepts everything else. This mirrors Tor's default exit policy.
+**Default exit policy** (applied when no `ExitPolicy` lines are present and
+the relay is an exit) rejects private/reserved ranges (RFC 1918, loopback,
+link-local, CGNAT), blocks abuse-prone ports (SMTP 25/465/587, NNTP,
+SMB/RPC, P2P file sharing), and accepts everything else. This mirrors
+Tor's default exit policy.
 
 Blocked port ranges in the default policy:
 
@@ -311,27 +355,45 @@ Blocked port ranges in the default policy:
 | 6699 | Napster |
 | 6881-6999 | BitTorrent |
 
+Every exit relay also serves a **mandatory HTTP notice** on :80 explaining
+it is a MOOR exit, not a web server (safe-harbor / mere-conduit posture).
+
 ---
 
 ## Bridges
 
-Bridges are unlisted relays that help users in censored regions connect to the MOOR network. Bridge addresses are not published in the public consensus.
+Bridges are unlisted relays that help users in censored regions connect
+to the MOOR network. Bridge addresses are not published in the public
+consensus.
 
-### Running a Bridge
+### Running a bridge
 
 ```bash
-./moor --mode relay --bind 0.0.0.0 --is-bridge --bridge-transport scramble -v
+./moor --mode relay --bind 0.0.0.0 --is-bridge --bridge-transport shitstorm -v
 ```
 
 | CLI Flag | Config Key | Default | Description |
 |----------|-----------|---------|-------------|
 | `--is-bridge` | `IsBridge` | 0 | Run as an unlisted bridge relay |
-| `--bridge-transport <t>` | | scramble | Pluggable transport: `scramble`, `shade`, `mirage`, `shitstorm` |
+| `--bridge-transport <t>` | | scramble | Pluggable transport: `scramble`, `shade`, `mirage`, `shitstorm`, `speakeasy`, `nether` |
 
-### Using Bridges (Client)
+### Pluggable transports
+
+Six cover-traffic transports are available. Pick one per bridge.
+
+| Transport | Cover | Wire appearance |
+|-----------|-------|-----------------|
+| **ShitStorm** | Chrome 146 JA4 + Elligator2 + ECH GREASE + HTTP/2 | Chrome browsing a CDN |
+| **Nether** | Minecraft 1.21.4 handshake + login | Minecraft gameplay |
+| **Mirage** | TLS 1.3 with real X25519 DH + configurable SNI | HTTPS to any domain |
+| **Shade** | Elligator2 obfuscation + inter-arrival-time modes | Random bytes |
+| **Scramble** | ASCII HTTP/1.1 GET prefix + ChaCha20 stream | HTTP traffic |
+| **Speakeasy** | SSH-2.0 banner + KEX + encrypted channel framing | SSH session |
+
+### Using bridges (client)
 
 ```bash
-./moor --use-bridges --bridge "scramble 1.2.3.4:443 a1b2c3d4e5f6...64hex"
+./moor --use-bridges --bridge "shitstorm 1.2.3.4:9001 a1b2c3d4e5f6...64hex"
 ```
 
 | CLI Flag | Config Key | Default | Description |
@@ -341,17 +403,18 @@ Bridges are unlisted relays that help users in censored regions connect to the M
 
 Bridge line format: `<transport> <address>:<port> <64-char-hex-fingerprint>`
 
-Using `--bridge` automatically implies `--use-bridges`. Up to 8 bridges can be configured.
+Using `--bridge` automatically implies `--use-bridges`. Up to 8 bridges can
+be configured.
 
 **Config file example:**
 
 ```
 UseBridges 1
-Bridge scramble 198.51.100.1:443 a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2
-Bridge shade 203.0.113.5:8080 deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+Bridge shitstorm 198.51.100.1:443 a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2
+Bridge nether    203.0.113.5:25565 deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
 ```
 
-### Bridge Authority and BridgeDB
+### Bridge authority and BridgeDB
 
 | Config Key | Default | Description |
 |-----------|---------|-------------|
@@ -359,17 +422,19 @@ Bridge shade 203.0.113.5:8080 deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefde
 | `BridgeDBPort` | 0 | Port for BridgeDB distribution service |
 | `BridgeDBFile` | | Path to BridgeDB state file |
 
-These are activated with `--mode bridge_auth` and `--mode bridgedb` respectively.
+These are activated with `--mode bridge_auth` and `--mode bridgedb`
+respectively.
 
 ---
 
-## Traffic Analysis Defenses
+## Traffic analysis defenses
 
 MOOR includes several mechanisms to resist traffic analysis.
 
-### Circuit Padding
+### Circuit padding
 
-Padding inserts cover traffic to obscure real traffic patterns. It is enabled by default (mandatory baseline).
+Padding inserts cover traffic to obscure real traffic patterns. It is
+enabled by default (mandatory baseline).
 
 ```bash
 ./moor --padding --padding-machine web --padding-mode constant
@@ -379,9 +444,10 @@ Padding inserts cover traffic to obscure real traffic patterns. It is enabled by
 |----------|-----------|---------|-------------|
 | `--padding` | `Padding` | 1 (on) | Enable circuit padding |
 | `--padding-machine <m>` | `PaddingMachine` | generic | WTF-PAD machine: `web`, `stream`, `generic`, `none` |
-| `--padding-mode <mode>` | `PaddingMode` | 0 (none) | Padding mode string (see below) |
+| `--padding-mode <mode>` | `PaddingMode` | 0 (none) | Advanced padding modes (see below) |
 
-`PaddingMode` accepts a string containing one or more of: `constant`, `adaptive`, `jitter`, `all`, `none`.
+`PaddingMode` accepts a string containing one or more of: `constant`,
+`adaptive`, `jitter`, `all`, `none`.
 
 | Mode | Bitmask | Description |
 |------|---------|-------------|
@@ -391,9 +457,15 @@ Padding inserts cover traffic to obscure real traffic patterns. It is enabled by
 | `all` | 7 | All modes combined |
 | `none` | 0 | No advanced padding (baseline padding still active if `Padding 1`) |
 
-### Conflux (Multi-Path Circuits)
+FRONT padding (Rayleigh-sampled burst cover over the first 5 seconds) and
+volume padding (cells-per-circuit padded to the next power of two) are
+applied automatically when `Padding 1`.
 
-Splits traffic across multiple circuit paths for improved resistance to single-path traffic analysis.
+### Conflux (multi-path circuits)
+
+Splits traffic across up to 4 circuit legs with Feistel PRP sequence
+encoding and a reorder buffer. SKIPS RTT-adaptive scheduling picks the
+lowest-latency leg at each send.
 
 ```bash
 ./moor --conflux --conflux-legs 3
@@ -404,7 +476,7 @@ Splits traffic across multiple circuit paths for improved resistance to single-p
 | `--conflux` | `Conflux` | 0 | Enable multi-path circuits |
 | `--conflux-legs <n>` | `ConfluxLegs` | 2 | Number of circuit legs (2-4, clamped) |
 
-### Poisson Mixing
+### Poisson mixing
 
 Adds random delay to forwarded cells to decorrelate timing.
 
@@ -414,11 +486,13 @@ Adds random delay to forwarded cells to decorrelate timing.
 
 ---
 
-## Advanced Options
+## Advanced options
 
-### GeoIP Path Diversity
+### GeoIP path diversity
 
-MOOR uses Tor-compatible GeoIP files to enforce geographic diversity in circuit paths. Clients avoid building circuits where two hops share the same country or AS number.
+MOOR uses Tor-compatible GeoIP files to enforce geographic diversity in
+circuit paths. Clients avoid building circuits where two hops share the
+same country or AS number.
 
 ```bash
 ./moor --geoip /usr/share/tor/geoip --geoip6 /usr/share/tor/geoip6
@@ -427,9 +501,10 @@ MOOR uses Tor-compatible GeoIP files to enforce geographic diversity in circuit 
 IPv4 format: `INTLOW,INTHIGH,CC` (decimal integers, comma-separated).
 IPv6 format: `IPV6LOW,IPV6HIGH,CC` (standard notation, comma-separated).
 
-GeoIP databases can be obtained from the Tor Project or IPFire Location database.
+A ~370 K-entry IPv4 database is vendored with MOOR. Additional databases
+can be obtained from the Tor Project or IPFire Location database.
 
-### Control Port
+### Control port
 
 A Tor-compatible control protocol interface for programmatic access.
 
@@ -448,15 +523,18 @@ A Tor-compatible control protocol interface for programmatic access.
 |----------|-----------|---------|-------------|
 | `--monitor` | `Monitor` | 0 | Enable built-in monitoring/metrics |
 
-### Post-Quantum Cryptography
+### Post-quantum cryptography
 
-PQ hybrid key exchange (ML-DSA + Ed25519) is always enabled. The `PQHybrid` config key is accepted for compatibility but has no effect -- it cannot be disabled.
+Hybrid classical + post-quantum is **mandatory**. There is no flag to
+disable PQ, no fallback to classical-only, and no downgrade path. The
+legacy `PQHybrid` config key is accepted for compatibility but has no
+effect — PQ is always on.
 
-### Tor-Compatible CLI Aliases
+### Tor-compatible CLI aliases
 
 Several flags match Tor's naming convention for users migrating from Tor:
 
-| Tor-Style Flag | Maps To |
+| Tor-style flag | Maps to |
 |---------------|---------|
 | `--SocksPort <port>` | `SocksPort` |
 | `--ORPort <port>` | `ORPort` |
@@ -471,9 +549,10 @@ Several flags match Tor's naming convention for users migrating from Tor:
 
 ---
 
-## Daemon Mode
+## Daemon mode
 
-Run MOOR as a background daemon. Using `--pid-file` automatically enables daemon mode.
+Run MOOR as a background daemon. Using `--pid-file` automatically enables
+daemon mode.
 
 ```bash
 ./moor --daemon --pid-file /var/run/moor.pid
@@ -501,7 +580,7 @@ WantedBy=multi-user.target
 
 ---
 
-## Complete Config Key Reference
+## Complete config key reference
 
 Every key accepted in a config file, listed alphabetically:
 
@@ -530,14 +609,15 @@ Every key accepted in a config file, listed alphabetically:
 | `Daemon` | 0/1 | 0 | `--daemon` |
 | `DataDir` / `DataDirectory` | path | ~/.moor | `--data-dir` / `--DataDirectory` |
 | `DirCache` | 0/1 | 0 | |
-| `DNSServerPort` | port | 0 | `--dns-server-port` |
-| `DNSServerUpstream` | host[:port] | 91.239.100.100:53 | `--dns-server-upstream` |
-| `ExitNotice` | 0/1 | 1 (exits) | `--exit-notice` |
 | `DirPort` | port | 9030 | `--dir-port` / `--DirPort` |
 | `DNSListenAddress` | IP | | |
 | `DNSPort` | port | 0 | `--DNSPort` |
+| `DNSServerPort` | port | 0 | `--dns-server-port` |
+| `DNSServerUpstream` | host[:port] | 91.239.100.100:53 | `--dns-server-upstream` |
+| `Enclave` | path | | `--enclave` |
 | `EntryNode` / `EntryNodes` | fingerprint | | `--EntryNode` |
 | `Exit` / `ExitRelay` | 0/1 | 0 | `--exit` / `--ExitRelay` |
+| `ExitNotice` | 0/1 | 1 (exits) | `--exit-notice` |
 | `ExitPolicy` | rule | | |
 | `FallbackDir` | string | | |
 | `GeoIPFile` | path | | `--geoip` |
@@ -572,12 +652,15 @@ Every key accepted in a config file, listed alphabetically:
 | `TransPort` | port | 0 | `--TransPort` |
 | `UseBridges` | 0/1 | 0 | `--use-bridges` / `--UseBridges` |
 | `UseMicrodescriptors` | 0/1 | 0 | |
-| `Enclave` | path | | `--enclave` |
 | `Verbose` | 0/1 | 0 | `-v` |
+
+---
 
 ## Enclaves
 
-An enclave is an independent MOOR network with its own directory authorities. The `--enclave <file>` flag replaces the hardcoded DA list entirely.
+An enclave is an independent MOOR network with its own directory
+authorities. The `--enclave <file>` flag replaces the hardcoded DA list
+entirely.
 
 **Enclave file format** (one DA per line):
 
@@ -594,4 +677,5 @@ An enclave is an independent MOOR network with its own directory authorities. Th
 moor --keygen-enclave --advertise 1.2.3.4 --data-dir /var/lib/moor
 ```
 
-Generates Ed25519 + ML-DSA-65 + Curve25519 keys, prints the enclave file line.
+Generates Ed25519 + ML-DSA-65 + Curve25519 keys, prints the enclave file
+line.

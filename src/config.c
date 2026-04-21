@@ -314,6 +314,27 @@ static int parse_exit_policy_rule(moor_exit_policy_rule_t *rule,
     return 0;
 }
 
+/* Restore Ed25519 + ML-DSA pks on a DA entry by matching its address
+ * against a snapshot of the prior da_list. DAAddress overrides specify
+ * only address:port; without this, the override would wipe the hardcoded
+ * trust anchors and moor_set_trusted_da_keys would reject the entry.
+ * For truly foreign DAs use an Enclave file, which ships keys inline. */
+static int da_restore_keys_from_snapshot(moor_da_entry_t *entry,
+                                         const moor_da_entry_t *snap,
+                                         int snap_count) {
+    for (int i = 0; i < snap_count; i++) {
+        if (snap[i].address[0] &&
+            strcmp(snap[i].address, entry->address) == 0) {
+            memcpy(entry->identity_pk,    snap[i].identity_pk,    32);
+            memcpy(entry->pq_identity_pk, snap[i].pq_identity_pk,
+                   MOOR_MLDSA_PK_LEN);
+            entry->has_pq = snap[i].has_pq;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int moor_config_set(moor_config_t *cfg, const char *key, const char *value) {
     if (strcmp(key, "Mode") == 0) {
         if (strcmp(value, "client") == 0) cfg->mode = MOOR_MODE_CLIENT;
@@ -351,6 +372,14 @@ int moor_config_set(moor_config_t *cfg, const char *key, const char *value) {
             LOG_WARN("DAAddress: empty value, ignoring");
             return 0;
         }
+        /* Snapshot existing da_list so we can re-attach identity_pk and
+         * pq_identity_pk on any override whose address matches a known DA.
+         * Unmatched entries stay zero-keyed — the trust gate in
+         * moor_set_trusted_da_keys will skip them and we emit a warning. */
+        moor_da_entry_t snap[9];
+        int snap_count = cfg->num_das < 9 ? cfg->num_das : 9;
+        memcpy(snap, cfg->da_list, sizeof(snap));
+
         /* Support comma-separated multi-DA: "addr1:port1,addr2:port2,..."
          * or single address (backward compat): "addr" */
         if (strchr(value, ',')) {
@@ -382,6 +411,14 @@ int moor_config_set(moor_config_t *cfg, const char *key, const char *value) {
                              "%s", token);
                     cfg->da_list[cfg->num_das].port = cfg->da_port ? cfg->da_port : MOOR_DEFAULT_DIR_PORT;
                 }
+                if (!da_restore_keys_from_snapshot(&cfg->da_list[cfg->num_das],
+                                                    snap, snap_count)) {
+                    LOG_WARN("DAAddress: %s:%u has no known identity keys; "
+                             "consensus from this DA will be rejected. "
+                             "Ship keys via an Enclave file for custom DAs.",
+                             cfg->da_list[cfg->num_das].address,
+                             cfg->da_list[cfg->num_das].port);
+                }
                 cfg->num_das++;
                 token = strtok_r(NULL, ",", &saveptr);
             }
@@ -392,7 +429,25 @@ int moor_config_set(moor_config_t *cfg, const char *key, const char *value) {
                 cfg->da_port = cfg->da_list[0].port;
             }
         } else {
+            /* Single-DA override. Previously this only mutated the legacy
+             * da_address field and left da_list untouched — consistent only
+             * when the override pointed at one of the hardcoded defaults.
+             * Now we also rewrite da_list[0] so downstream iterators (which
+             * use da_list, not da_address) see the override, and restore
+             * its pks via address-match so trust isn't silently dropped. */
             snprintf(cfg->da_address, sizeof(cfg->da_address), "%s", value);
+            memset(&cfg->da_list[0], 0, sizeof(cfg->da_list[0]));
+            snprintf(cfg->da_list[0].address, sizeof(cfg->da_list[0].address),
+                     "%s", value);
+            cfg->da_list[0].port = cfg->da_port ? cfg->da_port : MOOR_DEFAULT_DIR_PORT;
+            if (!da_restore_keys_from_snapshot(&cfg->da_list[0],
+                                                snap, snap_count)) {
+                LOG_WARN("DAAddress: %s has no known identity keys; "
+                         "consensus from this DA will be rejected. "
+                         "Ship keys via an Enclave file for custom DAs.",
+                         value);
+            }
+            if (cfg->num_das == 0) cfg->num_das = 1;
         }
     }
     else if (strcmp(key, "DAPort") == 0) {

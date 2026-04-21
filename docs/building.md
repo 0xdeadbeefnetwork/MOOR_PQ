@@ -6,7 +6,8 @@
 make
 ```
 
-This produces the `./moor` binary. It dynamically links against libsodium and zlib.
+This produces the `./moor` binary. It dynamically links against libsodium, zlib,
+and libevent.
 
 ## Dependencies
 
@@ -14,32 +15,37 @@ This produces the `./moor` binary. It dynamically links against libsodium and zl
 |---------|----------------|-----------------------|----------------|
 | libsodium | >= 1.0.18 | `libsodium-dev` | `libsodium-devel` |
 | zlib | any | `zlib1g-dev` | `zlib-devel` |
+| libevent | >= 2.0 | `libevent-dev` | `libevent-devel` |
 | pthreads | -- | included with glibc | included with glibc |
 
 You also need a C compiler (gcc or clang) and `pkg-config` (recommended but optional).
 
+No OpenSSL. No GnuTLS. No liboqs. The post-quantum primitives (ML-KEM-768,
+ML-DSA-65, Falcon-512) are vendored from the PQClean reference implementations
+in `src/pqclean/` and built in-tree.
+
 On Debian/Ubuntu:
 
 ```
-sudo apt install build-essential libsodium-dev zlib1g-dev pkg-config
+sudo apt install build-essential libsodium-dev zlib1g-dev libevent-dev pkg-config
 ```
 
 On Fedora:
 
 ```
-sudo dnf install gcc make libsodium-devel zlib-devel pkg-config
+sudo dnf install gcc make libsodium-devel zlib-devel libevent-devel pkg-config
 ```
 
 On Arch:
 
 ```
-sudo pacman -S base-devel libsodium zlib
+sudo pacman -S base-devel libsodium zlib libevent
 ```
 
 On Alpine:
 
 ```
-apk add build-base libsodium-dev zlib-dev pkgconfig
+apk add build-base libsodium-dev zlib-dev libevent-dev pkgconfig
 ```
 
 ## Build targets
@@ -48,7 +54,7 @@ apk add build-base libsodium-dev zlib-dev pkgconfig
 |---------|-------------|
 | `make` | Build the `moor` binary |
 | `make tools` | Build `moor_keygen` (key generation) and `moor-top` (ncurses monitor) |
-| `make tests` | Compile the test suite (30+ test binaries) |
+| `make tests` | Compile the test suite |
 | `make test` | Compile and run all tests |
 | `make install` | Install binary, manpage, and config directory to PREFIX |
 | `make uninstall` | Remove installed files |
@@ -74,6 +80,8 @@ These can be passed on the command line:
 | `LDFLAGS` | (hardened, see below) | Linker flags |
 | `SODIUM_CFLAGS` | from pkg-config | libsodium include path |
 | `SODIUM_LIBS` | from pkg-config | libsodium link flags |
+| `LIBEVENT_CFLAGS` | from pkg-config | libevent include path |
+| `LIBEVENT_LIBS` | from pkg-config | libevent link flags |
 | `EXTRA_CFLAGS` | empty | Appended to CFLAGS |
 | `EXTRA_LDFLAGS` | empty | Appended to LDFLAGS |
 | `PREFIX` | `/usr/local` | Install prefix |
@@ -96,6 +104,14 @@ need to set them yourself:
 - `-fPIE` + `-pie` -- position-independent executable (ASLR)
 - `-Wl,-z,relro,-z,now` -- full RELRO (GOT hardening)
 - `-Wformat -Wformat-security` -- format string warnings
+
+## Build ID fleet gate
+
+Every `make` run stamps the current git commit hash into the binary as a 16-byte
+build ID. Directory authorities reject relay descriptors whose build ID differs
+from their own, so the whole fleet must upgrade in lockstep when the build ID
+changes. For tarball builds where `.git` is not available, write a `BUILD_ID`
+file next to the Makefile containing the full git hash and the build picks it up.
 
 ## Easy relay setup
 
@@ -128,7 +144,7 @@ to the link flags.
 3. Install dependencies:
 
 ```
-pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-libsodium mingw-w64-x86_64-zlib make pkg-config
+pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-libsodium mingw-w64-x86_64-zlib mingw-w64-x86_64-libevent make pkg-config
 ```
 
 4. Build:
@@ -140,8 +156,8 @@ make
 This produces `moor.exe`.
 
 For cross-compiling from Linux with `x86_64-w64-mingw32-gcc`, you will need
-MinGW-built libsodium and zlib, and should pass the compiler and library paths
-explicitly:
+MinGW-built libsodium, zlib, and libevent, and should pass the compiler and
+library paths explicitly:
 
 ```
 make CC=x86_64-w64-mingw32-gcc \
@@ -177,7 +193,7 @@ These are useful during development but not needed for normal builds.
 | `make coverage` | Build with gcov instrumentation and generate coverage report |
 | `make static-analysis` | Run cppcheck and flawfinder, write reports to `audit/` |
 | `make fuzz` | Build and run libFuzzer harnesses (requires clang) |
-| `make kat` | Build and run Known Answer Tests for Kyber and ML-DSA |
+| `make kat` | Build and run Known Answer Tests for ML-KEM-768 and ML-DSA-65 |
 | `make dudect` | Build constant-time validation test |
 | `make cbmc` | Run CBMC bounded model checker on crypto functions |
 | `make infer` | Run Facebook Infer static analysis |

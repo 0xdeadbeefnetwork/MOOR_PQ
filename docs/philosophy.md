@@ -10,7 +10,7 @@ Tor proved that onion routing works. Millions of people use it daily to circumve
 
 MOOR exists because Tor was built before quantum computers were a real threat. RSA-1024 keys from a decade ago are already weak. RSA-4096 will fall when large-scale quantum hardware arrives. Every Tor circuit ever built using classical-only key exchange is a stored ciphertext waiting to be opened.
 
-MOOR is onion routing rebuilt with post-quantum cryptography from the ground up. Not bolted on. Not negotiated. Every key exchange, every hop, every signature -- hybrid classical and post-quantum by default. X25519 and Kyber768. Ed25519 and ML-DSA-65. If either algorithm holds, the traffic stays sealed.
+MOOR is onion routing rebuilt with post-quantum cryptography from the ground up. Not bolted on. Not negotiated. Every key exchange, every hop, every signature -- hybrid classical and post-quantum by default. X25519 and ML-KEM-768 for confidentiality. Ed25519 and ML-DSA-65 for consensus. Ed25519 and Falcon-512 for hidden-service identity, with both post-quantum keys hashed into the onion address itself. If either algorithm in the pair holds, the traffic stays sealed.
 
 ## Design principles
 

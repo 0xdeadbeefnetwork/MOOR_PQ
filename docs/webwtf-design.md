@@ -1,6 +1,11 @@
-# WebWTF Transport — Design Document
+# WebWTF Transport — Design Document (NOT IMPLEMENTED)
 
-## MOOR Pluggable Transport #5: WebRTC Video Call Camouflage over UDP
+> **Status: design proposal only.** WebWTF is sketched here for reference.
+> It is not compiled into the binary and not selectable via
+> `--bridge-transport`. The six shipped transports are ShitStorm, Nether,
+> Mirage, Shade, Scramble, and Speakeasy.
+
+## MOOR Pluggable Transport: WebRTC Video Call Camouflage over UDP
 
 ### Summary
 

@@ -70,7 +70,7 @@ Last updated: 2026-04-14
 5. **PIR/DPF-PIR** — `dht.c:645-1100` (query/response, privacy guarantees)
 6. **Transport obfuscation** — each `transport_*.c` (DPI resistance claims)
 7. **EWMA fairness** — `channel.c:340-567` (does the min-heap actually prevent starvation?)
-8. **Key management** — identity key generation, storage, rotation; SCP03 integration (Pi/SE050)
+8. **Key management** — identity key generation, storage, rotation; optional hardware-token integration
 
 ## Removed Dead Code (2026-04-14)
 
