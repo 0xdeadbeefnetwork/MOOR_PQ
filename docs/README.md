@@ -106,7 +106,7 @@ Classical crypto from libsodium. Post-quantum primitives are vendored NIST refer
 
 | Transport | Technique | Looks like |
 |-----------|-----------|------------|
-| **ShitStorm** | Chrome 146 JA4, Elligator2, ECH GREASE, HTTP/2 | Chrome browsing |
+| **ShitStorm** | Chrome 131+ JA4, Elligator2, ECH GREASE, HTTP/2 | Chrome browsing |
 | **Nether** | Minecraft 1.21.4 protocol, real handshake + login | Minecraft gameplay |
 | **Mirage** | TLS 1.3 camouflage with real X25519 DH, configurable SNI | HTTPS to any domain |
 | **Shade** | Elligator2 key obfuscation + IAT modes | Random bytes |

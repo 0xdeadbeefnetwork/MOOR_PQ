@@ -8,7 +8,7 @@ MOOR is an onion router. Your traffic takes a three-hop encrypted path through t
 
 Every cryptographic step is **hybrid post-quantum**: a classical primitive (X25519, Ed25519) combined with a NIST-standardized post-quantum primitive (ML-KEM-768, ML-DSA-65, Falcon-512). An adversary must break **both** to recover anything. Traffic captured today cannot be decrypted by a quantum computer tomorrow.
 
-~55,000 lines of C across the core, plus ~16,000 lines of vendored NIST PQ reference implementations (PQClean). Dependencies: libsodium, zlib, libevent, pthreads. No OpenSSL.
+~55,000 lines of C across the core, plus ~21,000 lines of vendored NIST PQ reference implementations (PQClean). Dependencies: libsodium, zlib, libevent, pthreads. No OpenSSL.
 
 ```
 You  --->  Guard  --->  Middle  --->  Exit  --->  Destination
@@ -94,7 +94,7 @@ Six cover-traffic transports for censored networks. Pick one when running a brid
 
 | Transport | Cover | What it looks like on the wire |
 |-----------|-------|--------------------------------|
-| **ShitStorm** | Chrome 146 JA4 fingerprint, Elligator2, ECH GREASE, HTTP/2 | Chrome browsing a CDN |
+| **ShitStorm** | Chrome 131+ JA4 fingerprint (X25519MLKEM768 keyshare), Elligator2, ECH GREASE, HTTP/2 | Chrome browsing a CDN |
 | **Nether** | Minecraft 1.21.4 real handshake + login | Minecraft game traffic |
 | **Mirage** | TLS 1.3 ClientHello with real X25519 DH, configurable SNI | HTTPS to any domain |
 | **Shade** | Elligator2 obfuscation + inter-arrival-time modes | Random bytes |
@@ -124,7 +124,7 @@ Non-bridge relays run a **scanner honeypot** on their ORPort that intercepts pro
 - **Vegas congestion control** — Prop 324 per-circuit CC + Prop 289 authenticated SENDME (20-byte digest FIFO)
 - **Multi-DA consensus** — directory authorities sign every consensus with Ed25519 **and** ML-DSA-65; sequential-AND verification on the client
 - **Prop 271 guard selection** — sampled / primary / confirmed guard sets (activates at ≥20 relays)
-- **GeoIP path diversity** — country + AS exclusion, ~370K IPv4 entries vendored
+- **GeoIP path diversity** — country + AS exclusion; supports standard MaxMind GeoIP CSV loaded at runtime (up to 524K IPv4 + 524K IPv6 entries)
 - **Bandwidth-weighted selection** — Tor-aligned flag assignment (Guard, Fast, Stable, Exit)
 - **Path-bias detection** — per-guard circuit-success statistics with WARN/EXTREME thresholds
 - **Argon2id relay PoW** — mandatory for relay admission, configurable difficulty
@@ -179,7 +179,7 @@ moor             --enclave mynet.enclave  # client
 
 ## Source
 
-~55,000 lines of C (core) across `src/` and `include/moor/`, plus ~16,000 lines of vendored NIST PQ reference code in `src/pqclean/` (ML-KEM-768, ML-DSA-65, Falcon-512, FIPS 202 / SHA-2 / AES primitives).
+~55,000 lines of C (core) across `src/` and `include/moor/`, plus ~21,000 lines of vendored NIST PQ reference code in `src/pqclean/` (ML-KEM-768, ML-DSA-65, Falcon-512, FIPS 202 / SHA-2 / AES primitives).
 
 Website: <https://moor.afflicted.sh>
 

@@ -383,7 +383,7 @@ Six cover-traffic transports are available. Pick one per bridge.
 
 | Transport | Cover | Wire appearance |
 |-----------|-------|-----------------|
-| **ShitStorm** | Chrome 146 JA4 + Elligator2 + ECH GREASE + HTTP/2 | Chrome browsing a CDN |
+| **ShitStorm** | Chrome 131+ JA4 (X25519MLKEM768 keyshare) + Elligator2 + ECH GREASE + HTTP/2 | Chrome browsing a CDN |
 | **Nether** | Minecraft 1.21.4 handshake + login | Minecraft gameplay |
 | **Mirage** | TLS 1.3 with real X25519 DH + configurable SNI | HTTPS to any domain |
 | **Shade** | Elligator2 obfuscation + inter-arrival-time modes | Random bytes |

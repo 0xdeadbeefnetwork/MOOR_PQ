@@ -67,7 +67,7 @@ src/
   transport_shade.c   Elligator2-inspired key obfuscation + ChaCha20-Poly1305 AEAD +
                       inter-arrival-time modes
   transport_mirage.c  TLS 1.3 camouflage with real X25519 DH and configurable SNI
-  transport_shitstorm.c Chrome 146 JA4 fingerprint + Elligator2 + ECH GREASE + HTTP/2
+  transport_shitstorm.c Chrome 131+ JA4 (X25519MLKEM768 keyshare) + Elligator2 + ECH GREASE + HTTP/2
   transport_speakeasy.c SSH-2.0 banner + KEX + encrypted channel framing
   transport_nether.c  Minecraft 1.21.4 handshake + login + plugin-channel framing
   geoip.c             Tor-compatible GeoIP database parser (IPv4/IPv6): country +
@@ -532,7 +532,7 @@ MOOR layers several defenses:
 
 | Transport | Technique | Looks like on the wire |
 |-----------|-----------|------------------------|
-| **ShitStorm** | Chrome 146 JA4 + Elligator2 + ECH GREASE + HTTP/2 | Chrome browsing a CDN |
+| **ShitStorm** | Chrome 131+ JA4 (X25519MLKEM768 keyshare) + Elligator2 + ECH GREASE + HTTP/2 | Chrome browsing a CDN |
 | **Nether** | Minecraft 1.21.4 handshake + login + plugin channels | Minecraft gameplay |
 | **Mirage** | TLS 1.3 with real X25519 DH + configurable SNI | HTTPS to any domain |
 | **Shade** | Elligator2 key obfuscation + IAT modes | Random bytes |
