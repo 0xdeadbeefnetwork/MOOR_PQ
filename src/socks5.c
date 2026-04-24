@@ -1794,8 +1794,24 @@ int moor_socks5_start(const moor_socks5_config_t *config) {
     }
     if (!have_cons) {
         int fetched = 0;
+        /* Microdesc bootstrap: smaller payload, still PQ-capable (kem_pk
+         * embedded). Fallback/bridge paths below keep using full consensus. */
+        if (g_config.use_microdescriptors && config->num_das > 0) {
+            for (int i = 0; i < config->num_das && !fetched; i++) {
+                if (moor_client_fetch_consensus_via_microdesc(
+                        &g_client_consensus,
+                        config->da_list[i].address,
+                        config->da_list[i].port) == 0) {
+                    LOG_INFO("bootstrap via microdesc from DA %s:%u",
+                             config->da_list[i].address,
+                             config->da_list[i].port);
+                    fetched = 1;
+                }
+            }
+        }
         /* Try DAs first */
-        if (moor_client_fetch_consensus_multi(&g_client_consensus,
+        if (!fetched &&
+            moor_client_fetch_consensus_multi(&g_client_consensus,
                                               config->da_list,
                                               config->num_das) == 0)
             fetched = 1;

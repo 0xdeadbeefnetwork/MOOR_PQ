@@ -2065,10 +2065,13 @@ static int fetch_consensus_via_dir_guard(moor_consensus_t *fresh) {
     moor_consensus_t *current = moor_socks5_get_consensus();
     if (!current || current->num_relays == 0) return -1;
 
+    /* Prefer microdesc if the client bootstrapped via it. Mirrors that run
+     * this codebase serve both CONSENSUS and MICRODESC from the same cache. */
+    int md = g_config.use_microdescriptors;
+
     /* Try the client's own guards first — these already know our IP */
     moor_guard_state_t *gs = moor_pathbias_get_state();
     if (gs) {
-        /* Primary guards (highest priority) */
         for (int p = 0; p < gs->num_primary; p++) {
             int idx = gs->primary_indices[p];
             const moor_guard_entry_t *g = &gs->sampled[idx];
@@ -2076,12 +2079,15 @@ static int fetch_consensus_via_dir_guard(moor_consensus_t *fresh) {
             char addr[64];
             uint16_t dp = find_relay_dir_port(current, g->identity_pk, addr, sizeof(addr));
             if (dp == 0) continue;
-            if (moor_client_fetch_consensus(fresh, addr, dp) == 0) {
-                LOG_INFO("consensus fetched via primary guard %s:%u", addr, dp);
+            int rc = md
+                ? moor_client_fetch_consensus_via_microdesc(fresh, addr, dp)
+                : moor_client_fetch_consensus(fresh, addr, dp);
+            if (rc == 0) {
+                LOG_INFO("consensus fetched via primary guard %s:%u (%s)",
+                         addr, dp, md ? "microdesc" : "full");
                 return 0;
             }
         }
-        /* Confirmed guards (already connected at least once) */
         for (int c = 0; c < gs->num_confirmed; c++) {
             int idx = gs->confirmed_indices[c];
             const moor_guard_entry_t *g = &gs->sampled[idx];
@@ -2089,8 +2095,12 @@ static int fetch_consensus_via_dir_guard(moor_consensus_t *fresh) {
             char addr[64];
             uint16_t dp = find_relay_dir_port(current, g->identity_pk, addr, sizeof(addr));
             if (dp == 0) continue;
-            if (moor_client_fetch_consensus(fresh, addr, dp) == 0) {
-                LOG_INFO("consensus fetched via confirmed guard %s:%u", addr, dp);
+            int rc = md
+                ? moor_client_fetch_consensus_via_microdesc(fresh, addr, dp)
+                : moor_client_fetch_consensus(fresh, addr, dp);
+            if (rc == 0) {
+                LOG_INFO("consensus fetched via confirmed guard %s:%u (%s)",
+                         addr, dp, md ? "microdesc" : "full");
                 return 0;
             }
         }
@@ -2104,9 +2114,12 @@ static int fetch_consensus_via_dir_guard(moor_consensus_t *fresh) {
         if (!(r->flags & NODE_FLAG_RUNNING)) continue;
         if (r->dir_port == 0) continue;
 
-        if (moor_client_fetch_consensus(fresh, r->address, r->dir_port) == 0) {
-            LOG_INFO("consensus fetched via directory guard %s:%u",
-                     r->address, r->dir_port);
+        int rc = md
+            ? moor_client_fetch_consensus_via_microdesc(fresh, r->address, r->dir_port)
+            : moor_client_fetch_consensus(fresh, r->address, r->dir_port);
+        if (rc == 0) {
+            LOG_INFO("consensus fetched via directory guard %s:%u (%s)",
+                     r->address, r->dir_port, md ? "microdesc" : "full");
             return 0;
         }
     }
@@ -2124,6 +2137,13 @@ static void *client_consensus_refresh_thread(void *arg) {
     int ok = 0;
     if (fetch_consensus_via_dir_guard(fresh) == 0)
         ok = 1;
+    if (!ok && g_config.use_microdescriptors) {
+        for (int i = 0; i < g_num_das && !ok; i++) {
+            if (moor_client_fetch_consensus_via_microdesc(
+                    fresh, g_da_list[i].address, g_da_list[i].port) == 0)
+                ok = 1;
+        }
+    }
     if (!ok && moor_client_fetch_consensus_multi(fresh, g_da_list, g_num_das) == 0)
         ok = 1;
 

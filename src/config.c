@@ -153,6 +153,7 @@ void moor_config_defaults(moor_config_t *cfg) {
     cfg->num_hidden_services = 0;
     cfg->pir = 1;
     cfg->pir_dpf = 1;  /* DPF-PIR preferred over XOR-bitmask PIR */
+    cfg->use_microdescriptors = 1;
     snprintf(cfg->dns_server_addr, sizeof(cfg->dns_server_addr), "127.0.0.1");
     snprintf(cfg->dns_server_upstream, sizeof(cfg->dns_server_upstream),
              "91.239.100.100");

@@ -658,8 +658,11 @@ static int consensus_body_build(uint8_t **body_out, size_t *body_len_out,
     buf[off++] = (uint8_t)(cons->num_relays >> 8);
     buf[off++] = (uint8_t)(cons->num_relays);
 
-    /* Relay identity keys (sorted, 32 bytes each) + bandwidth (8 bytes each).
-     * These fields survive text serialization perfectly. */
+    /* Relay identity keys (sorted, 32 bytes each) + RAW self-reported
+     * bandwidth (8 bytes each). We sign relay-signed fields only so every
+     * DA hashes an identical body. DA-local measurements (verified_bandwidth,
+     * flags, family_id, country, AS) live outside the signed body and are
+     * published alongside it — same model as Tor's unsigned "r" lines. */
     for (uint32_t i = 0; i < cons->num_relays; i++) {
         if (off + 40 > buf_sz) { free(buf); return -1; }
         memcpy(buf + off, cons->relays[i].identity_pk, 32); off += 32;
@@ -1073,13 +1076,19 @@ int moor_da_build_microdesc_consensus(moor_microdesc_consensus_t *mc,
         moor_microdesc_t *m = &mc->relays[i];
         memcpy(m->identity_pk, d->identity_pk, 32);
         memcpy(m->onion_pk, d->onion_pk, 32);
+        memcpy(m->address, d->address, 64);
+        m->address[63] = '\0';
+        m->or_port = d->or_port;
+        m->dir_port = d->dir_port;
         m->flags = d->flags;
-        m->bandwidth = moor_bw_auth_effective(d->bandwidth, d->verified_bandwidth);
+        m->bandwidth = d->bandwidth;
+        m->verified_bandwidth = d->verified_bandwidth;
         m->features = d->features;
         memcpy(m->family_id, d->family_id, 32);
         m->country_code = d->country_code;
         m->as_number = d->as_number;
         memcpy(m->nickname, d->nickname, 32);
+        memcpy(m->kem_pk, d->kem_pk, 1184);
     }
 
     /* Copy DA signatures (including PQ) from full consensus */
@@ -2051,14 +2060,7 @@ static int da_dispatch_request(int client_fd, moor_da_config_t *config,
             return -1;
         }
         moor_da_build_microdesc_consensus(mc, config);
-        /* Account for PQ signature data in buffer size */
-        size_t pq_extra = 0;
-        for (uint32_t s = 0; s < mc->num_da_sigs; s++) {
-            if (mc->da_sigs[s].has_pq)
-                pq_extra += 1 + MOOR_MLDSA_SIG_LEN + MOOR_MLDSA_PK_LEN;
-        }
-        size_t md_sz = 32 + (size_t)mc->num_relays * 150 + 4 +
-                        (size_t)mc->num_da_sigs * 97 + pq_extra;
+        size_t md_sz = moor_microdesc_consensus_wire_size(mc);
         if (md_sz < 1024) md_sz = 1024;
         uint8_t *buf = malloc(md_sz);
         if (!buf) { moor_microdesc_consensus_cleanup(mc); free(mc); da_unlock(config); return -1; }
@@ -4092,12 +4094,98 @@ int moor_client_fetch_microdesc_consensus(moor_microdesc_consensus_t *mc,
     int ret = moor_microdesc_consensus_deserialize(mc, buf, len);
     free(buf);
 
-    if (ret > 0) {
-        LOG_INFO("fetched microdesc consensus: %u relays (%u bytes)",
-                 mc->num_relays, len);
-        return 0;
+    if (ret <= 0) return -1;
+
+    /* Freshness + DA-signature verification (parity with full-consensus fetch).
+     * Body hash only uses identity_pk + bandwidth + timestamps + num_relays —
+     * all present in microdesc — so we synthesize a minimal shadow consensus
+     * and delegate to moor_consensus_verify_hybrid. */
+    if (g_num_trusted_da_keys == 0) {
+        LOG_ERROR("microdesc: no trusted DA keys configured");
+        moor_microdesc_consensus_cleanup(mc);
+        return -1;
     }
-    return -1;
+
+    moor_consensus_t shadow;
+    if (moor_consensus_init(&shadow, mc->num_relays) != 0) {
+        moor_microdesc_consensus_cleanup(mc);
+        return -1;
+    }
+    shadow.valid_after = mc->valid_after;
+    shadow.fresh_until = mc->fresh_until;
+    shadow.valid_until = mc->valid_until;
+    shadow.num_relays = mc->num_relays;
+    for (uint32_t i = 0; i < mc->num_relays; i++) {
+        memcpy(shadow.relays[i].identity_pk, mc->relays[i].identity_pk, 32);
+        shadow.relays[i].bandwidth = mc->relays[i].bandwidth;
+    }
+    shadow.num_da_sigs = mc->num_da_sigs;
+    for (uint32_t i = 0; i < mc->num_da_sigs &&
+                         i < MOOR_MAX_DA_AUTHORITIES; i++) {
+        memcpy(shadow.da_sigs[i].signature, mc->da_sigs[i].signature, 64);
+        memcpy(shadow.da_sigs[i].identity_pk, mc->da_sigs[i].identity_pk, 32);
+        shadow.da_sigs[i].has_pq = mc->da_sigs[i].has_pq;
+        if (mc->da_sigs[i].has_pq) {
+            memcpy(shadow.da_sigs[i].pq_signature,
+                   mc->da_sigs[i].pq_signature, MOOR_MLDSA_SIG_LEN);
+            memcpy(shadow.da_sigs[i].pq_pk,
+                   mc->da_sigs[i].pq_pk, MOOR_MLDSA_PK_LEN);
+        }
+    }
+
+    if (!moor_consensus_is_fresh(&shadow)) {
+        LOG_WARN("microdesc consensus is stale");
+        moor_consensus_cleanup(&shadow);
+        moor_microdesc_consensus_cleanup(mc);
+        return -1;
+    }
+    if (moor_consensus_verify_hybrid(&shadow, g_trusted_da_keys,
+                                     g_num_trusted_da_keys) != 0) {
+        LOG_ERROR("microdesc: hybrid signature verification FAILED");
+        moor_consensus_cleanup(&shadow);
+        moor_microdesc_consensus_cleanup(mc);
+        return -1;
+    }
+    moor_consensus_cleanup(&shadow);
+
+    LOG_INFO("fetched microdesc consensus: %u relays (%u bytes, %u DA sigs verified)",
+             mc->num_relays, len, mc->num_da_sigs);
+    return 0;
+}
+
+int moor_client_fetch_consensus_via_microdesc(moor_consensus_t *cons,
+                                               const char *address,
+                                               uint16_t port) {
+    moor_microdesc_consensus_t mc;
+    memset(&mc, 0, sizeof(mc));
+    if (moor_client_fetch_microdesc_consensus(&mc, address, port) != 0)
+        return -1;
+
+    if (moor_consensus_init(cons, mc.num_relays) != 0) {
+        moor_microdesc_consensus_cleanup(&mc);
+        return -1;
+    }
+    cons->valid_after = mc.valid_after;
+    cons->fresh_until = mc.fresh_until;
+    cons->valid_until = mc.valid_until;
+    cons->num_relays = mc.num_relays;
+    for (uint32_t i = 0; i < mc.num_relays; i++)
+        moor_microdesc_to_descriptor(&cons->relays[i], &mc.relays[i]);
+    cons->num_da_sigs = mc.num_da_sigs;
+    for (uint32_t i = 0; i < mc.num_da_sigs &&
+                         i < MOOR_MAX_DA_AUTHORITIES; i++) {
+        memcpy(cons->da_sigs[i].signature, mc.da_sigs[i].signature, 64);
+        memcpy(cons->da_sigs[i].identity_pk, mc.da_sigs[i].identity_pk, 32);
+        cons->da_sigs[i].has_pq = mc.da_sigs[i].has_pq;
+        if (mc.da_sigs[i].has_pq) {
+            memcpy(cons->da_sigs[i].pq_signature,
+                   mc.da_sigs[i].pq_signature, MOOR_MLDSA_SIG_LEN);
+            memcpy(cons->da_sigs[i].pq_pk,
+                   mc.da_sigs[i].pq_pk, MOOR_MLDSA_PK_LEN);
+        }
+    }
+    moor_microdesc_consensus_cleanup(&mc);
+    return 0;
 }
 
 /* ================================================================
@@ -4433,6 +4521,11 @@ static int              g_dir_published_len = 0;
 /* Compressed snapshot for bandwidth savings (~2.5x with zlib) */
 static uint8_t         *g_dir_compressed_buf = NULL;
 static size_t           g_dir_compressed_len = 0;
+/* Pre-serialized microdesc consensus (built from the same fresh input
+ * as the full snapshot). No separate compression — microdescs are already
+ * binary and don't text-compress as well. */
+static uint8_t         *g_dir_microdesc_buf = NULL;
+static int              g_dir_microdesc_len = 0;
 
 int moor_relay_dir_has_cache(void) {
     pthread_mutex_lock(&g_dir_cache_lock);
@@ -4455,21 +4548,50 @@ int moor_relay_dir_cache_update(const moor_consensus_t *fresh) {
     size_t comp_len = 0;
     moor_consensus_compress(buf, (size_t)len, &comp, &comp_len);
 
+    /* Also build a microdesc snapshot so prop-207 guard refreshes and
+     * clients that bootstrapped via microdesc can refresh via us. */
+    uint8_t *md_buf = NULL;
+    int md_len = 0;
+    {
+        moor_microdesc_consensus_t mc;
+        memset(&mc, 0, sizeof(mc));
+        /* Build a temp da_config wrapper so we can reuse the DA builder. */
+        moor_da_config_t tmp;
+        memset(&tmp, 0, sizeof(tmp));
+        moor_consensus_copy(&tmp.consensus, fresh);
+        if (moor_microdesc_consensus_init(&mc, fresh->num_relays) == 0) {
+            moor_da_build_microdesc_consensus(&mc, &tmp);
+            size_t md_sz = moor_microdesc_consensus_wire_size(&mc);
+            if (md_sz < 1024) md_sz = 1024;
+            md_buf = malloc(md_sz);
+            if (md_buf) {
+                md_len = moor_microdesc_consensus_serialize(md_buf, md_sz, &mc);
+                if (md_len <= 0) { free(md_buf); md_buf = NULL; md_len = 0; }
+            }
+            moor_microdesc_consensus_cleanup(&mc);
+        }
+        moor_consensus_cleanup(&tmp.consensus);
+    }
+
     pthread_mutex_lock(&g_dir_cache_lock);
     uint8_t *old_buf = g_dir_published_buf;
     uint8_t *old_comp = g_dir_compressed_buf;
+    uint8_t *old_md = g_dir_microdesc_buf;
     moor_consensus_copy(&g_dir_cache, fresh);
     g_dir_published_buf = buf;
     g_dir_published_len = len;
     g_dir_compressed_buf = comp;
     g_dir_compressed_len = comp_len;
+    g_dir_microdesc_buf = md_buf;
+    g_dir_microdesc_len = md_len;
     g_dir_cache_valid = 1;
     pthread_mutex_unlock(&g_dir_cache_lock);
 
     free(old_buf);
     free(old_comp);
-    LOG_INFO("dir mirror: cached consensus with %u relays (%d bytes, %zu compressed)",
-             fresh->num_relays, len, comp_len);
+    free(old_md);
+    LOG_INFO("dir mirror: cached consensus with %u relays (%d bytes, %zu compressed, %d md)",
+             fresh->num_relays, len, comp_len, md_len);
     return 0;
 }
 
@@ -4505,6 +4627,26 @@ int moor_relay_dir_handle_request(int client_fd) {
             "\r\n", html_len);
         send(client_fd, hdr, (size_t)hdr_len, 0);
         send(client_fd, MOOR_EXIT_NOTICE_HTML, html_len, 0);
+        return 0;
+    }
+
+    if (strncmp(req, "MICRODESC\n", 10) == 0) {
+        pthread_mutex_lock(&g_dir_cache_lock);
+        if (!g_dir_cache_valid || !g_dir_microdesc_buf ||
+            g_dir_microdesc_len <= 0) {
+            pthread_mutex_unlock(&g_dir_cache_lock);
+            send(client_fd, "ERR\n", 4, 0);
+            return -1;
+        }
+        uint8_t len_buf[4];
+        uint32_t ml = (uint32_t)g_dir_microdesc_len;
+        len_buf[0] = (uint8_t)(ml >> 24);
+        len_buf[1] = (uint8_t)(ml >> 16);
+        len_buf[2] = (uint8_t)(ml >> 8);
+        len_buf[3] = (uint8_t)ml;
+        send(client_fd, len_buf, 4, MSG_NOSIGNAL);
+        send(client_fd, g_dir_microdesc_buf, g_dir_microdesc_len, MSG_NOSIGNAL);
+        pthread_mutex_unlock(&g_dir_cache_lock);
         return 0;
     }
 

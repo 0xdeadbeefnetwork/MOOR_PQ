@@ -1330,11 +1330,12 @@ const moor_node_descriptor_t *moor_node_select_relay_diverse(
 }
 
 /*
- * Microdescriptor wire format: 150 bytes
- *   identity_pk(32) + onion_pk(32) + flags(4) + bandwidth(8) +
- *   features(4) + family_id(32) + country_code(2) + as_number(4) + nickname(32)
+ * Microdescriptor wire format: 1410 bytes. See moor_microdesc_t in node.h
+ * for the field breakdown. Two uint64 bandwidth fields: `bandwidth` (raw,
+ * relay-signed, covered by consensus body hash) and `verified_bandwidth`
+ * (DA-measured, NOT signed — path-selection input, may differ per DA).
  */
-#define MICRODESC_WIRE_SIZE 150
+#define MICRODESC_WIRE_SIZE 1410
 
 int moor_microdesc_serialize(uint8_t *out, size_t out_len,
                              const moor_microdesc_t *md) {
@@ -1342,11 +1343,17 @@ int moor_microdesc_serialize(uint8_t *out, size_t out_len,
     size_t off = 0;
     memcpy(out + off, md->identity_pk, 32); off += 32;
     memcpy(out + off, md->onion_pk, 32); off += 32;
+    memcpy(out + off, md->address, 64); off += 64;
+    out[off++] = (uint8_t)(md->or_port >> 8);
+    out[off++] = (uint8_t)(md->or_port);
+    out[off++] = (uint8_t)(md->dir_port >> 8);
+    out[off++] = (uint8_t)(md->dir_port);
     out[off++] = (uint8_t)(md->flags >> 24);
     out[off++] = (uint8_t)(md->flags >> 16);
     out[off++] = (uint8_t)(md->flags >> 8);
     out[off++] = (uint8_t)(md->flags);
     for (int i = 7; i >= 0; i--) out[off++] = (uint8_t)(md->bandwidth >> (i * 8));
+    for (int i = 7; i >= 0; i--) out[off++] = (uint8_t)(md->verified_bandwidth >> (i * 8));
     out[off++] = (uint8_t)(md->features >> 24);
     out[off++] = (uint8_t)(md->features >> 16);
     out[off++] = (uint8_t)(md->features >> 8);
@@ -1359,6 +1366,7 @@ int moor_microdesc_serialize(uint8_t *out, size_t out_len,
     out[off++] = (uint8_t)(md->as_number >> 8);
     out[off++] = (uint8_t)(md->as_number);
     memcpy(out + off, md->nickname, 32); off += 32;
+    memcpy(out + off, md->kem_pk, 1184); off += 1184;
     return (int)off;
 }
 
@@ -1369,10 +1377,16 @@ int moor_microdesc_deserialize(moor_microdesc_t *md,
     size_t off = 0;
     memcpy(md->identity_pk, data + off, 32); off += 32;
     memcpy(md->onion_pk, data + off, 32); off += 32;
+    memcpy(md->address, data + off, 64); off += 64;
+    md->address[63] = '\0';
+    md->or_port = ((uint16_t)data[off] << 8) | data[off + 1]; off += 2;
+    md->dir_port = ((uint16_t)data[off] << 8) | data[off + 1]; off += 2;
     md->flags = ((uint32_t)data[off] << 24) | ((uint32_t)data[off+1] << 16) |
                 ((uint32_t)data[off+2] << 8) | data[off+3]; off += 4;
     md->bandwidth = 0;
     for (int i = 7; i >= 0; i--) md->bandwidth |= (uint64_t)data[off++] << (i * 8);
+    md->verified_bandwidth = 0;
+    for (int i = 7; i >= 0; i--) md->verified_bandwidth |= (uint64_t)data[off++] << (i * 8);
     md->features = ((uint32_t)data[off] << 24) | ((uint32_t)data[off+1] << 16) |
                    ((uint32_t)data[off+2] << 8) | data[off+3]; off += 4;
     memcpy(md->family_id, data + off, 32); off += 32;
@@ -1381,12 +1395,11 @@ int moor_microdesc_deserialize(moor_microdesc_t *md,
                     ((uint32_t)data[off+2] << 8) | data[off+3]; off += 4;
     memcpy(md->nickname, data + off, 32); off += 32;
     md->nickname[31] = '\0';
+    memcpy(md->kem_pk, data + off, 1184); off += 1184;
     return (int)off;
 }
 
-int moor_microdesc_consensus_serialize(uint8_t *out, size_t out_len,
-                                       const moor_microdesc_consensus_t *mc) {
-    /* Calculate needed size accounting for PQ fields */
+size_t moor_microdesc_consensus_wire_size(const moor_microdesc_consensus_t *mc) {
     int mc_has_pq = 0;
     for (uint32_t i = 0; i < mc->num_da_sigs && i < MOOR_MAX_DA_AUTHORITIES; i++) {
         if (mc->da_sigs[i].has_pq) { mc_has_pq = 1; break; }
@@ -1400,6 +1413,12 @@ int moor_microdesc_consensus_serialize(uint8_t *out, size_t out_len,
                 needed += (size_t)MOOR_MLDSA_SIG_LEN + MOOR_MLDSA_PK_LEN;
         }
     }
+    return needed;
+}
+
+int moor_microdesc_consensus_serialize(uint8_t *out, size_t out_len,
+                                       const moor_microdesc_consensus_t *mc) {
+    size_t needed = moor_microdesc_consensus_wire_size(mc);
     if (out_len < needed) return -1;
 
     size_t off = 0;
@@ -1536,14 +1555,19 @@ void moor_microdesc_to_descriptor(moor_node_descriptor_t *out,
     memset(out, 0, sizeof(*out));
     memcpy(out->identity_pk, md->identity_pk, 32);
     memcpy(out->onion_pk, md->onion_pk, 32);
-    /* address is zeroed -- middle relay must resolve from its own consensus */
+    memcpy(out->address, md->address, 64);
+    out->address[63] = '\0';
+    out->or_port = md->or_port;
+    out->dir_port = md->dir_port;
     out->flags = md->flags;
     out->bandwidth = md->bandwidth;
+    out->verified_bandwidth = md->verified_bandwidth;
     out->features = md->features;
     memcpy(out->family_id, md->family_id, 32);
     out->country_code = md->country_code;
     out->as_number = md->as_number;
     memcpy(out->nickname, md->nickname, 32);
+    memcpy(out->kem_pk, md->kem_pk, 1184);
 }
 
 const moor_node_descriptor_t *moor_node_select_relay_pq(

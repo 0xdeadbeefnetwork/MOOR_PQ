@@ -155,19 +155,40 @@ const moor_node_descriptor_t *moor_node_select_relay_pq(
 int moor_node_same_family(const moor_node_descriptor_t *a,
                           const moor_node_descriptor_t *b);
 
-/* --- Microdescriptors: compact client consensus --- */
-
-/* 150 bytes on wire per relay */
+/* --- Microdescriptors: compact client consensus ---
+ *
+ * Carries everything a client needs to select paths AND build PQ circuits
+ * without a second fetch. Omits fields only relays/DAs need:
+ *   - per-relay Ed25519/Falcon signatures (DA consensus signature covers
+ *     the microdesc entry; clients trust the DA's ML-DSA sig)
+ *   - contact_info, build_id, prev_onion_pk, onion_key_version/published,
+ *     IPv6 address, protocol_version (kept on relays' full consensus)
+ *
+ * Bandwidth fields mirror the full descriptor: `bandwidth` is the relay's
+ * signed self-report (covered by the consensus body hash so every DA signs
+ * identical bytes). `verified_bandwidth` is a DA-local measurement published
+ * alongside but NOT part of the signed body — clients apply it via
+ * moor_bw_auth_effective() at path-selection time, identical to how
+ * full-consensus clients already use it.
+ *
+ * Wire size = 1410 bytes per entry (see MICRODESC_WIRE_SIZE in node.c);
+ * use moor_microdesc_consensus_wire_size() to size a full-consensus buffer.
+ */
 typedef struct {
     uint8_t  identity_pk[32];
     uint8_t  onion_pk[32];
+    char     address[64];           /* IP:port string for guard hop */
+    uint16_t or_port;
+    uint16_t dir_port;              /* 0 if not a dir mirror; needed for prop-207 */
     uint32_t flags;
-    uint64_t bandwidth;
+    uint64_t bandwidth;             /* relay-signed self-report (in body hash) */
+    uint64_t verified_bandwidth;    /* DA-measured cap (unsigned, path selection) */
     uint32_t features;
     uint8_t  family_id[32];
     uint16_t country_code;
     uint32_t as_number;
     char     nickname[32];
+    uint8_t  kem_pk[1184];          /* Kyber768 pk; zero if !NODE_FEATURE_PQ */
 } moor_microdesc_t;
 
 typedef struct {
@@ -198,6 +219,9 @@ int moor_microdesc_serialize(uint8_t *out, size_t out_len,
 /* Deserialize a single microdescriptor. Returns bytes consumed or -1. */
 int moor_microdesc_deserialize(moor_microdesc_t *md,
                                const uint8_t *data, size_t data_len);
+
+/* Exact wire size for a microdesc consensus. Matches what serialize would write. */
+size_t moor_microdesc_consensus_wire_size(const moor_microdesc_consensus_t *mc);
 
 /* Serialize microdescriptor consensus. Returns bytes written. */
 int moor_microdesc_consensus_serialize(uint8_t *out, size_t out_len,

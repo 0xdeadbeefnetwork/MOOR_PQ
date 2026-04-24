@@ -218,6 +218,12 @@ int moor_client_fetch_microdesc_consensus(moor_microdesc_consensus_t *mc,
                                            const char *da_address,
                                            uint16_t da_port);
 
+/* Fetch microdesc from a DA/mirror and synthesize a full consensus for
+ * path selection. Caller must moor_consensus_cleanup() on success. */
+int moor_client_fetch_consensus_via_microdesc(moor_consensus_t *cons,
+                                               const char *address,
+                                               uint16_t port);
+
 /* Consensus caching */
 int moor_consensus_cache_save(const moor_consensus_t *cons,
                                const char *data_dir);
