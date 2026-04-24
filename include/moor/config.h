@@ -154,9 +154,6 @@ typedef struct {
     uint64_t        accounting_period_sec;  /* default 86400 */
     uint64_t        rate_limit_bps;         /* sustained rate, 0=unlimited */
 
-    /* Bridge authority */
-    uint16_t        bridge_auth_port;
-
     /* Directory mirror/cache */
     int             dir_cache;          /* 1 = serve cached consensus to clients */
 

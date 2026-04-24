@@ -344,7 +344,6 @@ int moor_config_set(moor_config_t *cfg, const char *key, const char *value) {
         else if (strcmp(value, "hs") == 0) cfg->mode = MOOR_MODE_HS;
         else if (strcmp(value, "ob") == 0) cfg->mode = MOOR_MODE_OB;
         else if (strcmp(value, "bridgedb") == 0) cfg->mode = MOOR_MODE_BRIDGEDB;
-        else if (strcmp(value, "bridge_auth") == 0) cfg->mode = MOOR_MODE_BRIDGE_AUTH;
         else return -1;
     }
     else if (strcmp(key, "BindAddress") == 0) {
@@ -724,11 +723,6 @@ int moor_config_set(moor_config_t *cfg, const char *key, const char *value) {
     }
     else if (strcmp(key, "RateLimit") == 0) {
         cfg->rate_limit_bps = (uint64_t)atoll(value);
-    }
-    else if (strcmp(key, "BridgeAuthPort") == 0) {
-        int p = parse_port(value);
-        if (p < 0) return -1;
-        cfg->bridge_auth_port = (uint16_t)p;
     }
     else if (strcmp(key, "DirCache") == 0) {
         cfg->dir_cache = atoi(value);

@@ -4732,10 +4732,6 @@ int main(int argc, char **argv) {
     case MOOR_MODE_BRIDGEDB:
         ret = run_bridgedb();
         break;
-    case MOOR_MODE_BRIDGE_AUTH:
-        LOG_ERROR("bridge_auth mode is not yet implemented");
-        ret = -1;
-        break;
     default:
         ret = -1;
     }

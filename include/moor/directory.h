@@ -242,15 +242,6 @@ int moor_da_generate_signing_cert(moor_da_config_t *config);
 int moor_da_verify_signing_cert(const moor_da_signing_cert_t *cert);
 int moor_da_rotate_signing_key(moor_da_config_t *config);
 
-/* Consensus diff: build binary diff between two consensuses */
-int moor_da_build_consensus_diff(const moor_consensus_t *old_cons,
-                                  const moor_consensus_t *new_cons,
-                                  uint8_t *buf, size_t buf_len);
-
-/* Consensus diff: apply binary diff to a consensus */
-int moor_client_apply_consensus_diff(moor_consensus_t *cons,
-                                      const uint8_t *diff, size_t diff_len);
-
 /* SRV commit-reveal protocol */
 int moor_da_srv_generate_commit(moor_da_config_t *config);
 int moor_da_srv_reveal(moor_da_config_t *config,

@@ -158,7 +158,6 @@ typedef enum {
     MOOR_MODE_HS,       /* Hidden Service */
     MOOR_MODE_OB,       /* OnionBalance master */
     MOOR_MODE_BRIDGEDB,    /* Bridge distribution service */
-    MOOR_MODE_BRIDGE_AUTH, /* Bridge authority */
 } moor_mode_t;
 
 /* Error codes */
@@ -208,7 +207,6 @@ typedef enum {
 #include "bootstrap.h"
 #include "transparent.h"
 #include "addressmap.h"
-#include "bridge_auth.h"
 #include "exit_sla.h"
 #include "transport_shade.h"
 #include "transport_mirage.h"
