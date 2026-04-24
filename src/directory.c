@@ -1534,7 +1534,6 @@ static void da_serve_metrics(int fd, moor_da_config_t *config) {
         if (r->flags & NODE_FLAG_EXIT)   APPEND("<span class='flag f-exit'>Exit</span>");
         if (r->flags & NODE_FLAG_FAST)   APPEND("<span class='flag f-fast'>Fast</span>");
         if (r->flags & NODE_FLAG_STABLE) APPEND("<span class='flag f-stable'>Stable</span>");
-        if (r->flags & NODE_FLAG_HSDIR)  APPEND("<span class='flag f-stable'>HSDir</span>");
         if (r->features & NODE_FEATURE_PQ) APPEND("<span class='flag f-pq'>PQ</span>");
         if (r->flags & NODE_FLAG_BADEXIT) APPEND("<span class='flag f-badexit'>BadExit</span>");
         APPEND("</td>");
@@ -4333,7 +4332,6 @@ int32_t moor_consensus_get_param(const moor_da_config_t *config,
  * Fast:   bandwidth >= 12.5th percentile (7/8 of relays get it)
  * Stable: uptime >= median uptime
  * Guard:  Fast + Stable + bw >= guard_bw_threshold + time_known >= 1/8th percentile
- * HSDir:  Fast + Stable + uptime >= 96 hours (MinUptimeHidServDirectory)
  * Exit:   relay self-declares, DA validates exit policy exists
  * ================================================================ */
 static int cmp_u64_dir(const void *a, const void *b) {
@@ -4344,9 +4342,6 @@ static int cmp_u64_dir(const void *a, const void *b) {
 
 /* Minimum bandwidth to even consider a relay (4 KB/s, Tor's ABSOLUTE_MIN_VALUE) */
 #define DA_MIN_BW_KB  4
-
-/* Minimum uptime for HSDir flag (Tor: MinUptimeHidServDirectoryV2 = 96 hours) */
-#define DA_HSDIR_MIN_UPTIME  (96 * 3600U)
 
 /* Guard WFU threshold (simplified: we use uptime ratio as proxy) */
 #define DA_GUARD_MIN_WFU  0.98
@@ -4479,19 +4474,9 @@ void moor_da_compute_flags_statistical(moor_da_config_t *config) {
 
         /* Exit: relay must self-declare --exit. DA preserves it. */
 
-        /* HSDir: Fast + Stable + uptime >= 96 hours (Tor's MinUptimeHidServDirectory).
-         * On small networks (<20 relays), waive uptime requirement. */
-        if ((r->flags & NODE_FLAG_FAST) &&
-            (r->flags & NODE_FLAG_STABLE) &&
-            (n_active < 20 || uptime >= DA_HSDIR_MIN_UPTIME)) {
-            r->flags |= NODE_FLAG_HSDIR;
-        } else {
-            r->flags &= ~NODE_FLAG_HSDIR;
-        }
-
-        /* MiddleOnly: strip Guard/Exit/HSDir */
+        /* MiddleOnly: strip Guard/Exit */
         if (r->flags & NODE_FLAG_MIDDLEONLY)
-            r->flags &= ~(NODE_FLAG_GUARD | NODE_FLAG_EXIT | NODE_FLAG_HSDIR);
+            r->flags &= ~(NODE_FLAG_GUARD | NODE_FLAG_EXIT);
     }
 
     free(bws);

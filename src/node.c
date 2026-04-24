@@ -655,7 +655,6 @@ static const struct { uint32_t bit; const char *name; } flag_table[] = {
     { NODE_FLAG_EXIT,      "Exit" },
     { NODE_FLAG_FAST,      "Fast" },
     { NODE_FLAG_GUARD,     "Guard" },
-    { NODE_FLAG_HSDIR,     "HSDir" },
     { NODE_FLAG_MIDDLEONLY, "MiddleOnly" },
     { NODE_FLAG_RUNNING,   "Running" },
     { NODE_FLAG_STABLE,    "Stable" },

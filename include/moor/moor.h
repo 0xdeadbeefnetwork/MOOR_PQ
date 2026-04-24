@@ -115,12 +115,12 @@ extern const char moor_build_id[MOOR_BUILD_ID_LEN];
 #define NODE_FLAG_AUTHORITY     (1u << 6)
 #define NODE_FLAG_BADEXIT       (1u << 7)
 #define NODE_FLAG_MIDDLEONLY    (1u << 8)
-#define NODE_FLAG_HSDIR         (1u << 9)   /* Suitable for HS descriptor storage */
+/* bit 9: reserved (was NODE_FLAG_HSDIR, removed — MOOR uses DHT+DPF-PIR for HS
+ * descriptor storage, so no HSDir role exists). Don't reuse without a wire bump. */
 
 /* Flags assigned by DA (not signed by relay) — must be stripped for sig verify
  * and excluded from consensus body hash (so all DAs produce identical hashes) */
-#define NODE_FLAGS_DA_ASSIGNED  (NODE_FLAG_FAST | NODE_FLAG_STABLE | NODE_FLAG_BADEXIT | \
-                                 NODE_FLAG_HSDIR)
+#define NODE_FLAGS_DA_ASSIGNED  (NODE_FLAG_FAST | NODE_FLAG_STABLE | NODE_FLAG_BADEXIT)
 
 /* Defaults */
 #define MOOR_DEFAULT_SOCKS_PORT     9050
