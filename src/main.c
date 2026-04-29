@@ -2029,10 +2029,21 @@ static int run_relay(void) {
      * without RST -- common with NAT, mobile, WSL). */
     moor_event_add_timer(30000, conn_reap_timer_cb, NULL);
 
-    LOG_WARN("defenses: WTF-PAD=%s mixing=%s (lambda=%llums) PQ-hybrid=on",
-             g_wfpad_machine ? g_wfpad_machine->name : "off",
-             g_config.mix_delay > 0 ? "on" : "off",
-             (unsigned long long)g_config.mix_delay);
+    {
+        char mix_str[64];
+        if (g_config.mix_delay > 0)
+            snprintf(mix_str, sizeof(mix_str), "on (lambda=%llums)",
+                     (unsigned long long)g_config.mix_delay);
+        else
+            snprintf(mix_str, sizeof(mix_str), "off");
+        fprintf(stderr,
+            "\n  Active defenses on this relay:\n"
+            "    WTF-PAD (per-circuit padding):  %s\n"
+            "    Mixing (cell-delay batching):   %s\n"
+            "    PQ-hybrid (ML-KEM + Falcon):    on\n\n",
+            g_wfpad_machine ? g_wfpad_machine->name : "off",
+            mix_str);
+    }
     LOG_INFO("relay running on %s:%u", g_bind_addr, g_or_port);
 #ifndef _WIN32
     if (maybe_drop_privileges() != 0) return -1;
@@ -2401,10 +2412,15 @@ static int run_client(void) {
      * WTF-PAD (per-circuit padding) and PIR (private HS lookups). */
     {
         extern moor_config_t g_config;
-        LOG_WARN("defenses: WTF-PAD=%s PIR=%s DPF-PIR=%s PQ-hybrid=on",
-                 g_wfpad_machine ? g_wfpad_machine->name : "off",
-                 g_config.pir ? "on" : "off",
-                 (g_config.pir && g_config.pir_dpf) ? "on" : "off");
+        fprintf(stderr,
+            "\n  Active defenses on this client:\n"
+            "    WTF-PAD (per-circuit padding):  %s\n"
+            "    PIR (private HS lookups):       %s\n"
+            "    DPF-PIR (info-theoretic PIR):   %s\n"
+            "    PQ-hybrid (ML-KEM + Falcon):    on\n\n",
+            g_wfpad_machine ? g_wfpad_machine->name : "off",
+            g_config.pir ? "on" : "off",
+            (g_config.pir && g_config.pir_dpf) ? "on" : "off");
     }
     LOG_INFO("SOCKS5 client running on %s:%u", g_bind_addr, g_socks_port);
 #ifndef _WIN32
@@ -4242,6 +4258,67 @@ static int keygen_enclave(const char *data_dir, const char *address,
 }
 
 int main(int argc, char **argv) {
+    /* 0a. --check-relay <addr>:<port> -- TCP reachability test, early exit.
+     * For relay/bridge operators to verify their listener is reachable from
+     * this host. Doesn't perform a MOOR handshake (transports vary); a TCP
+     * accept proves the OS is forwarding traffic to the relay process. */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--check-relay") == 0 && i + 1 < argc) {
+            const char *target = argv[i + 1];
+            char host[256] = {0};
+            uint16_t port = 0;
+            const char *colon = strrchr(target, ':');
+            if (!colon || colon == target) {
+                fprintf(stderr,
+                    "Usage: moor --check-relay <addr>:<port>\n"
+                    "  Tests TCP reachability of a MOOR relay/bridge.\n"
+                    "  Examples:\n"
+                    "    moor --check-relay 1.2.3.4:9001\n"
+                    "    moor --check-relay [2001:db8::1]:9001\n");
+                return 2;
+            }
+            size_t hlen = (size_t)(colon - target);
+            if (hlen >= sizeof(host)) hlen = sizeof(host) - 1;
+            memcpy(host, target, hlen);
+            /* Strip [..] for IPv6 literals */
+            if (host[0] == '[' && host[hlen - 1] == ']') {
+                memmove(host, host + 1, hlen - 2);
+                host[hlen - 2] = '\0';
+            }
+            int p = atoi(colon + 1);
+            if (p <= 0 || p > 65535) {
+                fprintf(stderr, "check-relay: invalid port: %s\n", colon + 1);
+                return 2;
+            }
+            port = (uint16_t)p;
+            fprintf(stdout, "check-relay: connecting to %s:%u ...\n", host, port);
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            int fd = moor_tcp_connect_simple(host, port);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            double ms = (t1.tv_sec - t0.tv_sec) * 1000.0
+                      + (t1.tv_nsec - t0.tv_nsec) / 1.0e6;
+            if (fd < 0) {
+                fprintf(stdout,
+                    "check-relay: UNREACHABLE %s:%u (after %.0fms)\n"
+                    "  - if this is your own relay: check that the moor process is running,\n"
+                    "    that the firewall allows inbound on port %u, and that NAT/router\n"
+                    "    forwards %u to this host.\n"
+                    "  - if checking from outside: TCP was filtered, blocked, or refused.\n",
+                    host, port, ms, port, port);
+                return 1;
+            }
+            close(fd);
+            fprintf(stdout,
+                "check-relay: REACHABLE %s:%u (TCP accept in %.0fms)\n"
+                "  - the OS at %s is forwarding traffic and accepting on port %u.\n"
+                "  - this confirms reachability only; for full handshake validation,\n"
+                "    add a Bridge line to a client config and observe Bootstrapped 100%%.\n",
+                host, port, ms, host, port);
+            return 0;
+        }
+    }
+
     /* 0. Check for --keygen-enclave (early exit, no config needed) */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--keygen-enclave") == 0) {

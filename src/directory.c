@@ -1131,7 +1131,7 @@ int moor_consensus_verify_hybrid(const moor_consensus_t *cons,
                 if (moor_crypto_sign_verify(cons->da_sigs[i].signature,
                                              body_hash, 32,
                                              cons->da_sigs[i].identity_pk) != 0) {
-                    LOG_WARN("hybrid verify: Ed25519 failed for DA sig %u", i);
+                    LOG_DEBUG("hybrid verify: Ed25519 failed for DA sig %u (outer summary will report if this breaks consensus)", i);
                     break;
                 }
 
@@ -1141,7 +1141,7 @@ int moor_consensus_verify_hybrid(const moor_consensus_t *cons,
                     if (memcmp(cons->da_sigs[i].pq_pk,
                                trusted_keys[j].mldsa_pk,
                                MOOR_MLDSA_PK_LEN) != 0) {
-                        LOG_WARN("hybrid verify: PQ pk mismatch for DA sig %u", i);
+                        LOG_WARN("hybrid verify: ML-DSA public key mismatch for DA sig %u -- DA may have rotated keys, or signature may be spoofed; check trusted DA key list", i);
                         break;
                     }
 
@@ -1156,13 +1156,13 @@ int moor_consensus_verify_hybrid(const moor_consensus_t *cons,
                                           MOOR_MLDSA_SIG_LEN,
                                           body, body_len,
                                           cons->da_sigs[i].pq_pk) != 0) {
-                        LOG_WARN("hybrid verify: ML-DSA-65 failed for DA sig %u", i);
+                        LOG_DEBUG("hybrid verify: ML-DSA-65 failed for DA sig %u (outer summary will report if this breaks consensus)", i);
                         break;
                     }
                 }
                 /* Require PQ sig if trusted key has PQ capability */
                 if (trusted_keys[j].has_pq && !cons->da_sigs[i].has_pq) {
-                    LOG_WARN("hybrid verify: PQ-capable DA %u sent Ed25519-only sig", i);
+                    LOG_WARN("hybrid verify: PQ-capable DA %u sent Ed25519-only sig -- possible PQ downgrade attempt, signature rejected", i);
                     break;
                 }
 
@@ -1723,6 +1723,121 @@ static void da_serve_metrics_json(int fd, moor_da_config_t *config) {
     while (recv(fd, drain, sizeof(drain), 0) > 0) {}
 }
 
+/* Serve single-relay lookup by fingerprint hex — for relay operators
+ * to verify their relay is in consensus. Accepts:
+ *   GET /relay/<64-hex>            → path param
+ *   GET /relay?fp=<64-hex>         → query param
+ *   GET /api/relay?fp=<64-hex>     → query param under /api
+ * Returns JSON: {"found":bool, "fingerprint":hex, ...relay fields if found...}
+ */
+static void da_serve_relay_lookup(int fd, moor_da_config_t *config,
+                                   const char *cmd_buf) {
+    /* Extract 64-char hex fingerprint from URL. Try ?fp= first, then path. */
+    const char *fp_str = NULL;
+    const char *q = strstr(cmd_buf, "?fp=");
+    if (!q) q = strstr(cmd_buf, "&fp=");
+    if (q) {
+        fp_str = q + 4;
+    } else {
+        const char *p = strstr(cmd_buf, "/relay/");
+        if (p) fp_str = p + 7;
+    }
+
+    /* Parse 64 hex chars; reject anything else as 400. */
+    uint8_t target_pk[32];
+    int valid = 0;
+    if (fp_str) {
+        /* Require exactly 64 hex chars; reject non-hex. */
+        valid = 1;
+        for (int i = 0; i < 64; i++) {
+            char c = fp_str[i];
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                  (c >= 'A' && c <= 'F'))) {
+                valid = 0; break;
+            }
+        }
+        if (valid) {
+            for (int i = 0; i < 32; i++) {
+                unsigned int b;
+                if (sscanf(fp_str + i * 2, "%2x", &b) != 1) { valid = 0; break; }
+                target_pk[i] = (uint8_t)b;
+            }
+        }
+    }
+
+    char body[4096];
+    size_t off = 0;
+    int status = 200;
+
+    if (!valid) {
+        off = (size_t)snprintf(body, sizeof(body),
+            "{\"error\":\"invalid or missing fingerprint; expected 64 hex chars via /relay/<fp> or /relay?fp=<fp>\"}\n");
+        status = 400;
+    } else {
+        moor_consensus_t *cons = &config->consensus;
+        moor_node_descriptor_t *found = NULL;
+        for (uint32_t i = 0; i < cons->num_relays; i++) {
+            if (sodium_memcmp(cons->relays[i].identity_pk, target_pk, 32) == 0) {
+                found = &cons->relays[i];
+                break;
+            }
+        }
+
+        char fp_hex[65];
+        for (int i = 0; i < 32; i++)
+            snprintf(fp_hex + i * 2, 3, "%02x", target_pk[i]);
+        fp_hex[64] = 0;
+
+        if (!found) {
+            off = (size_t)snprintf(body, sizeof(body),
+                "{\"found\":false,\"fingerprint\":\"%s\","
+                "\"hint\":\"not in current consensus; if this is a hidden bridge, that is expected (bridges are unlisted by design); for non-bridge relays, check that the relay reached the DA, build_id matches, and Falcon identity signature is valid\"}\n",
+                fp_hex);
+            status = 404;
+        } else {
+            char cc[3] = "??";
+            if (found->country_code) moor_geoip_unpack_country(found->country_code, cc);
+            char esc_nick[128], esc_addr[256], esc_contact[256];
+            json_escape(esc_nick, sizeof(esc_nick), found->nickname[0] ? found->nickname : "Unnamed");
+            json_escape(esc_addr, sizeof(esc_addr), found->address);
+            json_escape(esc_contact, sizeof(esc_contact), found->contact_info);
+            uint64_t age = (cons->valid_after > 0)
+                ? ((uint64_t)time(NULL) - cons->valid_after) : 0ULL;
+            off = (size_t)snprintf(body, sizeof(body),
+                "{\"found\":true,\"fingerprint\":\"%s\","
+                "\"nickname\":\"%s\",\"address\":\"%s\",\"or_port\":%u,"
+                "\"bandwidth\":%llu,\"verified_bandwidth\":%llu,"
+                "\"flags\":%u,\"features\":%u,\"country\":\"%s\","
+                "\"contact\":\"%s\",\"published\":%llu,\"first_seen\":%llu,"
+                "\"consensus_age_seconds\":%llu}\n",
+                fp_hex, esc_nick, esc_addr, found->or_port,
+                (unsigned long long)found->bandwidth,
+                (unsigned long long)found->verified_bandwidth,
+                found->flags, found->features, cc, esc_contact,
+                (unsigned long long)found->published,
+                (unsigned long long)found->first_seen,
+                (unsigned long long)age);
+        }
+    }
+
+    char hdr[256];
+    const char *status_str = (status == 200) ? "200 OK"
+                           : (status == 404) ? "404 Not Found"
+                           : "400 Bad Request";
+    int hlen = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 %s\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "\r\n", status_str, off);
+    send(fd, hdr, (size_t)hlen, MSG_NOSIGNAL);
+    send(fd, body, off, MSG_NOSIGNAL);
+    shutdown(fd, SHUT_WR);
+    char drain[64];
+    while (recv(fd, drain, sizeof(drain), 0) > 0) {}
+}
+
 /*
  * DA request handler: simple text protocol over TCP.
  * Commands:
@@ -1761,7 +1876,7 @@ static int da_dispatch_request(int client_fd, moor_da_config_t *config,
 
 int moor_da_handle_request_with_prefix(int client_fd, moor_da_config_t *config,
                                         const char *prefix, size_t prefix_len) {
-    char cmd_buf[64];
+    char cmd_buf[512]; /* GET /relay?fp=<64 hex> + HTTP/1.1 + headers fit */
     memset(cmd_buf, 0, sizeof(cmd_buf));
     ssize_t n = (ssize_t)prefix_len;
     if (n > (ssize_t)(sizeof(cmd_buf) - 1))
@@ -1780,7 +1895,7 @@ int moor_da_handle_request_with_prefix(int client_fd, moor_da_config_t *config,
 }
 
 int moor_da_handle_request(int client_fd, moor_da_config_t *config) {
-    char cmd_buf[64];
+    char cmd_buf[512]; /* GET /relay?fp=<64 hex> + HTTP/1.1 + headers fit */
     memset(cmd_buf, 0, sizeof(cmd_buf));
 
     ssize_t n = recv(client_fd, cmd_buf, sizeof(cmd_buf) - 1, 0);
@@ -1800,7 +1915,9 @@ static int da_dispatch_request(int client_fd, moor_da_config_t *config,
     if (n >= 5 && strncmp(cmd_buf, "GET /", 5) == 0) {
         moor_setsockopt_timeo(client_fd, SO_SNDTIMEO, 2);
         da_lock(config);
-        if (strstr(cmd_buf, "/api") || strstr(cmd_buf, "/json"))
+        if (strstr(cmd_buf, "/relay/") || strstr(cmd_buf, "/relay?"))
+            da_serve_relay_lookup(client_fd, config, cmd_buf);
+        else if (strstr(cmd_buf, "/api") || strstr(cmd_buf, "/json"))
             da_serve_metrics_json(client_fd, config);
         else
             da_serve_metrics(client_fd, config);
