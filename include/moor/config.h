@@ -97,6 +97,7 @@ typedef struct {
     int             num_bridges;
     int             use_bridges;    /* Client: connect via bridges */
     int             is_bridge;      /* Relay: don't register with DA */
+    char            bridge_transport[32]; /* scramble|shade|mirage|shitstorm|speakeasy|nether */
 
     /* Post-quantum hybrid -- always enabled, config field kept for parsing compat */
     int             pq_hybrid;

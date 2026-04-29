@@ -205,6 +205,8 @@ static void apply_config_to_globals(const moor_config_t *cfg) {
     g_verbose = cfg->verbose;
     g_is_bridge = cfg->is_bridge;
     g_use_bridges = cfg->use_bridges;
+    if (cfg->bridge_transport[0])
+        snprintf(g_bridge_transport, sizeof(g_bridge_transport), "%s", cfg->bridge_transport);
     /* PQ hybrid always enabled -- cfg->pq_hybrid ignored */
     g_pow_difficulty = cfg->pow_difficulty;
     snprintf(g_geoip_file, sizeof(g_geoip_file), "%s", cfg->geoip_file);
@@ -329,7 +331,7 @@ static void parse_args_into_config(moor_config_t *cfg, int argc, char **argv) {
             moor_config_set(cfg, "UseBridges", "1");
         }
         else if (strcmp(argv[i], "--bridge-transport") == 0 && i + 1 < argc) {
-            snprintf(g_bridge_transport, sizeof(g_bridge_transport), "%s", argv[++i]);
+            moor_config_set(cfg, "BridgeTransport", argv[++i]);
         }
         else if (strcmp(argv[i], "--pq-hybrid") == 0) {
             /* PQ hybrid is always enabled -- flag accepted for compat but ignored */

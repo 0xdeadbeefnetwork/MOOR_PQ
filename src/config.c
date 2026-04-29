@@ -599,6 +599,9 @@ int moor_config_set(moor_config_t *cfg, const char *key, const char *value) {
     else if (strcmp(key, "IsBridge") == 0) {
         cfg->is_bridge = atoi(value);
     }
+    else if (strcmp(key, "BridgeTransport") == 0) {
+        snprintf(cfg->bridge_transport, sizeof(cfg->bridge_transport), "%s", value);
+    }
     else if (strcmp(key, "PQHybrid") == 0) {
         cfg->pq_hybrid = 1; /* Always enabled -- ignore user value */
     }
