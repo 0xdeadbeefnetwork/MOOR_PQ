@@ -11,6 +11,13 @@
 
 set -euo pipefail
 
+# When this script runs inside the pinned container, the bind-mounted
+# tree was cp'd in by the entrypoint and is owned by the host runner's
+# UID rather than container-root. Git 2.35.2+ refuses to operate on
+# such repos by default (CVE-2022-24765). The container is ephemeral,
+# so a wildcard safe.directory is fine here.
+git config --global --add safe.directory '*'
+
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
