@@ -1519,6 +1519,18 @@ static void da_serve_metrics(int fd, moor_da_config_t *config) {
 
     /* Relay table */
     APPEND("<div class='section'><h2>Relays</h2>");
+    APPEND("<form action='/relay.html' method='get' "
+           "style='margin-bottom:14px;display:flex;gap:8px;flex-wrap:wrap'>"
+           "<input type='text' name='fp' placeholder='Paste 64-hex fingerprint to look up your relay' "
+           "minlength='64' maxlength='64' pattern='[0-9a-fA-F]{64}' required "
+           "style='flex:1;min-width:280px;padding:8px 10px;background:#1a1e2e;"
+           "border:1px solid #2a2e3e;border-radius:4px;color:#c0c8d8;"
+           "font-family:monospace;font-size:0.85em'>"
+           "<button type='submit' "
+           "style='padding:8px 16px;background:#1a3a2a;color:#7fdbca;"
+           "border:1px solid #2a2e3e;border-radius:4px;cursor:pointer;"
+           "font-family:monospace;font-weight:bold'>Look up</button>"
+           "</form>");
     APPEND("<table><tr><th>Nickname</th><th>Address</th><th>Flags</th>"
            "<th>Bandwidth</th><th>Country</th><th>Contact</th><th>Identity</th>"
            "<th>KEM</th><th>Falcon</th><th>Uptime</th></tr>");
@@ -1563,10 +1575,15 @@ static void da_serve_metrics(int fd, moor_da_config_t *config) {
           html_escape(esc_contact, sizeof(esc_contact),
                       r->contact_info[0] ? r->contact_info : "");
           APPEND("<td style='font-size:0.75em;color:#637777'>%s</td>", esc_contact); }
-        /* Identity fingerprint (first 8 bytes hex) */
-        APPEND("<td class='pk'>");
+        /* Identity fingerprint -- truncated for display, but the link
+         * carries the full 64 hex chars to /relay.html?fp=... so the
+         * operator can drill in without typing it. */
+        char full_fp[65];
+        for (int j = 0; j < 32; j++) snprintf(full_fp + j*2, 3, "%02x", r->identity_pk[j]);
+        full_fp[64] = 0;
+        APPEND("<td class='pk'><a href='/relay.html?fp=%s' title='%s'>", full_fp, full_fp);
         for (int j = 0; j < 8; j++) APPEND("%02x", r->identity_pk[j]);
-        APPEND("...</td>");
+        APPEND("&hellip;</a></td>");
         /* KEM / Falcon key digests — show first 6 bytes of each raw pk
          * so operators can visually confirm keys rotated on fleet upgrade. */
         int kem_any = 0, fal_any = 0;
@@ -1838,6 +1855,228 @@ static void da_serve_relay_lookup(int fd, moor_da_config_t *config,
     while (recv(fd, drain, sizeof(drain), 0) > 0) {}
 }
 
+/* Browser-friendly per-relay view. Same fingerprint extraction logic as
+ * the JSON endpoint, but emits an HTML card with the full identity hex
+ * (selectable for copy/paste) and a "moor --check-relay" command line
+ * the operator can run. Linked from the dashboard relay table.
+ *
+ * Routes:
+ *   GET /relay.html?fp=<64-hex>
+ *   GET /relay/<64-hex>.html
+ */
+static void da_serve_relay_lookup_html(int fd, moor_da_config_t *config,
+                                        const char *cmd_buf) {
+    /* Extract fp via ?fp= or path */
+    const char *fp_str = NULL;
+    const char *q = strstr(cmd_buf, "?fp=");
+    if (!q) q = strstr(cmd_buf, "&fp=");
+    if (q) {
+        fp_str = q + 4;
+    } else {
+        const char *p = strstr(cmd_buf, "/relay/");
+        if (p) fp_str = p + 7;
+    }
+
+    uint8_t target_pk[32];
+    int valid = 0;
+    if (fp_str) {
+        valid = 1;
+        for (int i = 0; i < 64; i++) {
+            char c = fp_str[i];
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                  (c >= 'A' && c <= 'F'))) { valid = 0; break; }
+        }
+        if (valid) {
+            for (int i = 0; i < 32; i++) {
+                unsigned int b;
+                if (sscanf(fp_str + i * 2, "%2x", &b) != 1) {
+                    valid = 0; break;
+                }
+                target_pk[i] = (uint8_t)b;
+            }
+        }
+    }
+
+    char body[8192];
+    size_t off = 0;
+    int status = 200;
+#define HAPPEND(...) do { \
+        int _w = snprintf(body + off, sizeof(body) - off, __VA_ARGS__); \
+        if (_w > 0 && (size_t)_w < sizeof(body) - off) off += (size_t)_w; \
+    } while (0)
+
+    HAPPEND("<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<title>MOOR Relay Lookup</title><style>"
+            "*{margin:0;padding:0;box-sizing:border-box}"
+            "body{font-family:'Courier New',monospace;background:#0a0e17;color:#c0c8d8;padding:20px;max-width:900px;margin:0 auto}"
+            "h1{color:#7fdbca;font-size:1.6em;margin-bottom:4px}"
+            ".sub{color:#637777;font-size:0.85em;margin-bottom:20px}"
+            ".section{background:#111827;border:1px solid #2a2e3e;border-radius:8px;padding:20px;margin-bottom:16px}"
+            ".section h2{color:#82aaff;font-size:1.05em;margin-bottom:12px}"
+            ".kv{display:grid;grid-template-columns:200px 1fr;gap:8px 16px;font-size:0.9em}"
+            ".kv .k{color:#637777}"
+            ".kv .v{color:#c0c8d8;word-break:break-all}"
+            ".pk{font-family:monospace;color:#c792ea;user-select:all}"
+            ".flag{display:inline-block;padding:2px 8px;border-radius:3px;font-size:0.75em;margin-right:4px;font-weight:bold}"
+            ".f-guard{background:#1a3a2a;color:#7fdbca}"
+            ".f-exit{background:#3a1a2a;color:#ff6b6b}"
+            ".f-fast{background:#2a2a1a;color:#ffd700}"
+            ".f-stable{background:#1a2a3a;color:#82aaff}"
+            ".f-pq{background:#2a1a3a;color:#c792ea}"
+            ".f-badexit{background:#4a0a0a;color:#ff2222}"
+            ".ok{color:#7fdbca;font-weight:bold}"
+            ".bad{color:#ff6b6b;font-weight:bold}"
+            "code{background:#1a1e2e;padding:2px 6px;border-radius:3px;color:#c3e88d;user-select:all}"
+            "a{color:#7fdbca;text-decoration:none}a:hover{text-decoration:underline}"
+            "footer{margin-top:24px;color:#3a3e4e;font-size:0.75em;text-align:center}"
+            "</style></head><body>"
+            "<h1>MOOR Relay Lookup</h1>"
+            "<div class='sub'><a href='/'>&larr; Back to network metrics</a></div>");
+
+    if (!valid) {
+        HAPPEND("<div class='section'><h2>Invalid fingerprint</h2>"
+                "<div class='kv'><div class='k'>Error:</div>"
+                "<div class='v bad'>Expected exactly 64 hex characters via "
+                "<code>/relay.html?fp=&lt;fp&gt;</code> or "
+                "<code>/relay/&lt;fp&gt;.html</code>.</div></div></div>");
+        status = 400;
+    } else {
+        moor_consensus_t *cons = &config->consensus;
+        moor_node_descriptor_t *found = NULL;
+        for (uint32_t i = 0; i < cons->num_relays; i++) {
+            if (sodium_memcmp(cons->relays[i].identity_pk, target_pk, 32) == 0) {
+                found = &cons->relays[i]; break;
+            }
+        }
+
+        char fp_hex[65];
+        for (int i = 0; i < 32; i++)
+            snprintf(fp_hex + i * 2, 3, "%02x", target_pk[i]);
+        fp_hex[64] = 0;
+
+        if (!found) {
+            HAPPEND("<div class='section'><h2>Status: <span class='bad'>NOT IN CONSENSUS</span></h2>"
+                    "<div class='kv'>"
+                    "<div class='k'>Fingerprint:</div><div class='v pk'>%s</div>"
+                    "</div><p style='margin-top:14px;color:#637777;font-size:0.85em'>"
+                    "Hidden bridges (<code>IsBridge 1</code>) are unlisted by design "
+                    "and do not appear in consensus. For public relays not appearing here, "
+                    "confirm: the relay reached the DA (<code>PUBLISH ok</code> in the relay log), "
+                    "the BUILD_ID matches the fleet, and a fresh consensus has been signed since the relay started."
+                    "</p></div>", fp_hex);
+            status = 404;
+        } else {
+            char esc_nick[128], esc_addr[256], esc_contact[768];
+            html_escape(esc_nick, sizeof(esc_nick),
+                        found->nickname[0] ? found->nickname : "Unnamed");
+            html_escape(esc_addr, sizeof(esc_addr), found->address);
+            html_escape(esc_contact, sizeof(esc_contact),
+                        found->contact_info[0] ? found->contact_info : "");
+            char cc[3] = "??";
+            if (found->country_code) moor_geoip_unpack_country(found->country_code, cc);
+            uint64_t age = (cons->valid_after > 0)
+                ? ((uint64_t)time(NULL) - cons->valid_after) : 0ULL;
+            uint64_t up_base = found->first_seen ? found->first_seen : found->published;
+            uint64_t now = (uint64_t)time(NULL);
+            char uptime[64] = "-";
+            if (up_base > 0 && now > up_base) {
+                uint64_t up = now - up_base;
+                if (up >= 86400)
+                    snprintf(uptime, sizeof(uptime), "%llud %lluh",
+                             (unsigned long long)(up / 86400),
+                             (unsigned long long)((up % 86400) / 3600));
+                else if (up >= 3600)
+                    snprintf(uptime, sizeof(uptime), "%lluh %llum",
+                             (unsigned long long)(up / 3600),
+                             (unsigned long long)((up % 3600) / 60));
+                else
+                    snprintf(uptime, sizeof(uptime), "%llum",
+                             (unsigned long long)(up / 60));
+            }
+
+            HAPPEND("<div class='section'>"
+                    "<h2>Status: <span class='ok'>IN CONSENSUS</span></h2>"
+                    "<div class='kv'>"
+                    "<div class='k'>Nickname:</div><div class='v'>%s</div>"
+                    "<div class='k'>Address:</div><div class='v'>%s:%u</div>"
+                    "<div class='k'>Country:</div><div class='v'>%s</div>"
+                    "<div class='k'>Uptime:</div><div class='v'>%s</div>"
+                    "<div class='k'>Flags:</div><div class='v'>",
+                    esc_nick, esc_addr, found->or_port, cc, uptime);
+            if (found->flags & NODE_FLAG_GUARD)  HAPPEND("<span class='flag f-guard'>Guard</span>");
+            if (found->flags & NODE_FLAG_EXIT)   HAPPEND("<span class='flag f-exit'>Exit</span>");
+            if (found->flags & NODE_FLAG_FAST)   HAPPEND("<span class='flag f-fast'>Fast</span>");
+            if (found->flags & NODE_FLAG_STABLE) HAPPEND("<span class='flag f-stable'>Stable</span>");
+            if (found->features & NODE_FEATURE_PQ) HAPPEND("<span class='flag f-pq'>PQ</span>");
+            if (found->flags & NODE_FLAG_BADEXIT) HAPPEND("<span class='flag f-badexit'>BadExit</span>");
+            HAPPEND("</div>"
+                    "<div class='k'>Bandwidth (advertised):</div><div class='v'>%llu B/s</div>"
+                    "<div class='k'>Bandwidth (measured):</div><div class='v'>%llu B/s</div>"
+                    "<div class='k'>Contact:</div><div class='v'>%s</div>"
+                    "<div class='k'>Last published:</div><div class='v'>%llu (epoch)</div>"
+                    "<div class='k'>First seen:</div><div class='v'>%llu (epoch)</div>"
+                    "<div class='k'>Consensus age:</div><div class='v'>%llus</div>"
+                    "</div></div>",
+                    (unsigned long long)found->bandwidth,
+                    (unsigned long long)found->verified_bandwidth,
+                    esc_contact[0] ? esc_contact : "<span style='color:#637777'>(none)</span>",
+                    (unsigned long long)found->published,
+                    (unsigned long long)found->first_seen,
+                    (unsigned long long)age);
+
+            HAPPEND("<div class='section'><h2>Identity</h2>"
+                    "<div class='kv'>"
+                    "<div class='k'>Ed25519 fingerprint:</div><div class='v pk'>%s</div>",
+                    fp_hex);
+            int kem_any = 0, fal_any = 0;
+            for (size_t j = 0; j < sizeof(found->kem_pk); j++)
+                if (found->kem_pk[j]) { kem_any = 1; break; }
+            for (size_t j = 0; j < sizeof(found->falcon_pk); j++)
+                if (found->falcon_pk[j]) { fal_any = 1; break; }
+            if (kem_any) {
+                HAPPEND("<div class='k'>ML-KEM-768 (first 12B):</div><div class='v pk'>");
+                for (int j = 0; j < 12; j++) HAPPEND("%02x", found->kem_pk[j]);
+                HAPPEND("&hellip;</div>");
+            }
+            if (fal_any) {
+                HAPPEND("<div class='k'>Falcon-512 (first 12B):</div><div class='v pk'>");
+                for (int j = 0; j < 12; j++) HAPPEND("%02x", found->falcon_pk[j]);
+                HAPPEND("&hellip;</div>");
+            }
+            HAPPEND("</div></div>");
+
+            HAPPEND("<div class='section'><h2>Verify from your shell</h2>"
+                    "<p style='font-size:0.85em;color:#637777;margin-bottom:10px'>"
+                    "The DA confirms this relay is in consensus. To also verify it is "
+                    "answering MOOR protocol right now (live PROBE/ALIVE):</p>"
+                    "<code>moor --check-relay %s</code>"
+                    "</div>", fp_hex);
+        }
+    }
+
+    HAPPEND("<footer>MOOR %s &mdash; per-relay lookup</footer>"
+            "</body></html>", MOOR_VERSION_STRING);
+
+#undef HAPPEND
+
+    char hdr[256];
+    const char *status_str = (status == 200) ? "200 OK"
+                           : (status == 404) ? "404 Not Found"
+                           : "400 Bad Request";
+    int hlen = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 %s\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n"
+        "\r\n", status_str, off);
+    send(fd, hdr, (size_t)hlen, MSG_NOSIGNAL);
+    send(fd, body, off, MSG_NOSIGNAL);
+    shutdown(fd, SHUT_WR);
+    char drain[64];
+    while (recv(fd, drain, sizeof(drain), 0) > 0) {}
+}
+
 /*
  * DA request handler: simple text protocol over TCP.
  * Commands:
@@ -1915,7 +2154,14 @@ static int da_dispatch_request(int client_fd, moor_da_config_t *config,
     if (n >= 5 && strncmp(cmd_buf, "GET /", 5) == 0) {
         moor_setsockopt_timeo(client_fd, SO_SNDTIMEO, 2);
         da_lock(config);
-        if (strstr(cmd_buf, "/relay/") || strstr(cmd_buf, "/relay?"))
+        /* HTML per-relay view: /relay.html?fp=... or /relay/<fp>.html or
+         * /relay?fp=...&format=html. Browser-friendly drilldown for the
+         * dashboard. JSON CLI consumers stick with plain /relay?fp=... */
+        if (strstr(cmd_buf, "/relay.html") ||
+            strstr(cmd_buf, ".html") ||
+            strstr(cmd_buf, "format=html"))
+            da_serve_relay_lookup_html(client_fd, config, cmd_buf);
+        else if (strstr(cmd_buf, "/relay/") || strstr(cmd_buf, "/relay?"))
             da_serve_relay_lookup(client_fd, config, cmd_buf);
         else if (strstr(cmd_buf, "/api") || strstr(cmd_buf, "/json"))
             da_serve_metrics_json(client_fd, config);

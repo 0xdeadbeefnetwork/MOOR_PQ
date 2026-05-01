@@ -39,6 +39,7 @@ MOOR_USER="moor"
 TRANSPORT=""
 ENCLAVE=""
 CONTACT_INFO=""
+REINSTALL=0
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -58,6 +59,7 @@ while [[ $# -gt 0 ]]; do
         --transport) TRANSPORT="$2"; shift 2 ;;
         --enclave)   ENCLAVE="$2"; shift 2 ;;
         --contact)   CONTACT_INFO="$2"; shift 2 ;;
+        --reinstall) REINSTALL=1; shift ;;
         --help|-h)
             echo "Usage: sudo $0 [OPTIONS]"
             echo ""
@@ -68,12 +70,26 @@ while [[ $# -gt 0 ]]; do
             echo "  --transport <name>  Bridge transport: shitstorm|mirage|shade|scramble|speakeasy|nether"
             echo "  --enclave <file>    Use independent network (enclave file with DA list)"
             echo "  --contact <info>    Contact email/URL (optional)"
+            echo "  --reinstall         Force-overwrite existing moor.conf and moor.service"
+            echo "                      (existing files saved as .bak.<timestamp>). Default"
+            echo "                      behavior on rerun is upgrade-only: rebuild+restart,"
+            echo "                      preserve config."
             exit 0 ;;
         *) die "Unknown option: $1" ;;
     esac
 done
 
 [[ "$(id -u)" -eq 0 ]] || die "Run with: curl -sL .../install.sh | sudo bash"
+
+# Upgrade detection: if moor.conf already exists and --reinstall wasn't
+# passed, treat this run as an upgrade — rebuild + restart, but leave
+# config and systemd unit untouched. Operator can pass --reinstall to
+# explicitly opt into clobbering (the previous behavior, which routinely
+# stomped operators' customizations on every rerun).
+UPGRADE_MODE=0
+if [[ -f "$CONF_DIR/moor.conf" && $REINSTALL -eq 0 ]]; then
+    UPGRADE_MODE=1
+fi
 
 cat << 'BANNER'
 
@@ -87,7 +103,34 @@ cat << 'BANNER'
 
 BANNER
 
-# ---- interactive prompts (skipped if all required args provided) ----
+if [[ $UPGRADE_MODE -eq 1 ]]; then
+    echo " Existing config detected: $CONF_DIR/moor.conf"
+    echo " Running in UPGRADE mode — rebuild + restart only."
+    echo " Your config and systemd unit will not be modified."
+    echo " Pass --reinstall to force-overwrite (saves .bak.<timestamp> first)."
+    echo ""
+fi
+
+# ---- interactive prompts (skipped if all required args provided, or
+#      if we're in upgrade mode and don't need them) ----
+if [[ $UPGRADE_MODE -eq 1 ]]; then
+    # Read NICKNAME from existing config so the success banner is accurate.
+    EXISTING_NICK=$(awk '/^Nickname[ \t]/{print $2; exit}' "$CONF_DIR/moor.conf" 2>/dev/null || true)
+    NICKNAME="${EXISTING_NICK:-existing}"
+    EXISTING_ROLE_LINE=$(awk '/^(Exit|Guard|MiddleOnly|IsBridge)[ \t]/{print $1; exit}' "$CONF_DIR/moor.conf" 2>/dev/null || true)
+    case "$EXISTING_ROLE_LINE" in
+        Exit)        ROLE="exit" ;;
+        Guard)       ROLE="guard" ;;
+        MiddleOnly)  ROLE="middle" ;;
+        IsBridge)    ROLE="bridge" ;;
+        *)           ROLE="relay" ;;
+    esac
+    EXISTING_PORT=$(awk '/^ORPort[ \t]/{print $2; exit}' "$CONF_DIR/moor.conf" 2>/dev/null || true)
+    OR_PORT="${EXISTING_PORT:-$OR_PORT}"
+    EXISTING_ADV=$(awk '/^AdvertiseAddress[ \t]/{print $2; exit}' "$CONF_DIR/moor.conf" 2>/dev/null || true)
+    ADVERTISE="${EXISTING_ADV:-?}"
+fi
+
 
 # Helper: prompt only if we have a terminal
 ask() {
@@ -100,6 +143,8 @@ ask() {
         die "$var is required (no terminal for prompt — pass via flags)"
     fi
 }
+
+if [[ $UPGRADE_MODE -eq 0 ]]; then
 
 if [[ -z "$ROLE" ]]; then
     if [[ -z "$STDIN_FD" ]]; then
@@ -203,6 +248,8 @@ if [[ -n "$STDIN_FD" ]]; then
     [[ "${confirm:-y}" =~ ^[Yy]|^$ ]] || { echo " Aborted."; exit 0; }
 fi
 
+fi  # end UPGRADE_MODE prompt gate
+
 # ---- install dependencies ----
 
 echo ""
@@ -291,6 +338,16 @@ mkdir -p "$DATA_DIR/keys" "$CONF_DIR"
 chown -R "$MOOR_USER:$MOOR_USER" "$DATA_DIR"
 chmod 700 "$DATA_DIR/keys"
 
+if [[ $UPGRADE_MODE -eq 1 ]]; then
+    echo "  preserved $CONF_DIR/moor.conf (upgrade mode)"
+else
+
+if [[ $REINSTALL -eq 1 && -f "$CONF_DIR/moor.conf" ]]; then
+    BAK="$CONF_DIR/moor.conf.bak.$(date +%s)"
+    cp -a "$CONF_DIR/moor.conf" "$BAK"
+    echo "  saved existing config to $BAK"
+fi
+
 # Build config
 ROLE_LINE=""
 BRIDGE_LINES=""
@@ -343,11 +400,24 @@ sed -i '/^$/d' "$CONF_DIR/moor.conf"
 
 echo "  wrote $CONF_DIR/moor.conf"
 
+fi  # end UPGRADE_MODE config-write gate
+
 # ---- systemd + start ----
 
 echo "[5/5] Starting..."
 
-cat > /etc/systemd/system/moor.service << EOF
+UNIT=/etc/systemd/system/moor.service
+if [[ $UPGRADE_MODE -eq 1 && -f $UNIT ]]; then
+    echo "  preserved $UNIT (upgrade mode)"
+else
+
+if [[ $REINSTALL -eq 1 && -f $UNIT ]]; then
+    BAKU="$UNIT.bak.$(date +%s)"
+    cp -a "$UNIT" "$BAKU"
+    echo "  saved existing unit to $BAKU"
+fi
+
+cat > $UNIT << EOF
 [Unit]
 Description=MOOR Node ($NICKNAME)
 After=network-online.target
@@ -365,6 +435,8 @@ LimitCORE=infinity
 [Install]
 WantedBy=multi-user.target
 EOF
+
+fi  # end UPGRADE_MODE unit-write gate
 
 systemctl daemon-reload
 systemctl enable moor --quiet
