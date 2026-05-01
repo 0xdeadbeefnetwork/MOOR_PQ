@@ -177,11 +177,11 @@ static void print_usage(const char *prog) {
         "  --print-fingerprint [--data-dir <dir>]\n"
         "                        Print this relay/DA's Ed25519 fingerprint as 64 hex.\n"
         "  --check-relay <fingerprint> [<da_ip:da_port>]\n"
-        "                        Ask a DA whether the relay is in current consensus\n"
-        "                        (universe-side reachability). Default DA: hardcoded.\n"
+        "                        Ask a DA if relay is in consensus, then live-probe\n"
+        "                        it (PROBE/ALIVE roundtrip). Default DA: hardcoded.\n"
         "  --check-relay <addr>:<port>\n"
-        "                        Local TCP probe only -- says nothing about whether\n"
-        "                        the relay is reachable from anywhere but this host.\n",
+        "                        Direct PROBE/ALIVE roundtrip against the relay,\n"
+        "                        no DA lookup. Confirms it's actually a MOOR relay.\n",
         MOOR_VERSION_STRING,
         prog, prog,
         (unsigned)MOOR_DEFAULT_SOCKS_PORT,
@@ -4267,21 +4267,64 @@ static int keygen_enclave(const char *data_dir, const char *address,
     return 0;
 }
 
+/* Real connection test against a MOOR relay's OR port. Speaks the same
+ * PROBE\n -> ALIVE\n protocol the DA uses for liveness checks (see
+ * src/main.c:855 for the relay-side handler). Returns:
+ *    0  on ALIVE response,
+ *   -1  if TCP connect failed,
+ *   -2  if connected but no ALIVE\n (wrong service / not a moor relay),
+ *   -3  if send/recv errored.
+ * On all paths *ms_out is set to elapsed wall time. */
+static int check_relay_probe(const char *host, uint16_t port,
+                              double *ms_out) {
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int fd = moor_tcp_connect_simple(host, port);
+    if (fd < 0) {
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        if (ms_out) *ms_out = (t1.tv_sec - t0.tv_sec) * 1000.0
+                            + (t1.tv_nsec - t0.tv_nsec) / 1.0e6;
+        return -1;
+    }
+    moor_setsockopt_timeo(fd, SO_SNDTIMEO, 5);
+    moor_setsockopt_timeo(fd, SO_RCVTIMEO, 5);
+    int rc = 0;
+    if (send(fd, "PROBE\n", 6, MSG_NOSIGNAL) != 6) {
+        rc = -3;
+    } else {
+        char resp[16];
+        ssize_t n = recv(fd, resp, sizeof(resp), 0);
+        if (n < 0)                                            rc = -3;
+        else if (n >= 6 && memcmp(resp, "ALIVE\n", 6) == 0)   rc = 0;
+        else                                                   rc = -2;
+    }
+    close(fd);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    if (ms_out) *ms_out = (t1.tv_sec - t0.tv_sec) * 1000.0
+                        + (t1.tv_nsec - t0.tv_nsec) / 1.0e6;
+    return rc;
+}
+
 int main(int argc, char **argv) {
     /* 0a. --check-relay <target> [<da_ip:da_port>]  (early exit, no config)
      *
-     * Two modes, distinguished by argument shape:
+     * Two modes, distinguished by argument shape. Both perform a real
+     * PROBE\n -> ALIVE\n roundtrip against the relay's OR port -- not
+     * just a TCP accept -- so a passing result means the relay is
+     * actually serving MOOR protocol, not just listening.
      *
      *   1. Universe mode -- arg is a 64-hex relay fingerprint.
-     *      Asks a DA's /relay?fp=<fp> endpoint whether the relay is in the
-     *      current consensus. This is the "from the universe" view: not
-     *      whether a TCP socket on this box accepts, but whether DAs and
-     *      clients have a routable, current descriptor for the relay.
-     *      Default DA: 107.174.70.38:9030 (matches config.c hardcoded fallback).
+     *      Asks a DA's /relay?fp=<fp> endpoint for the relay's current
+     *      address from consensus, then probes that address directly.
+     *      Reports both consensus presence ("does the rest of the
+     *      network see you?") and live response ("does the relay
+     *      actually answer right now?"). Default DA: 107.174.70.38:9030
+     *      (matches config.c hardcoded fallback).
      *
-     *   2. Local TCP mode -- arg is <addr>:<port>.
-     *      Plain TCP connect from THIS host. Confirms the local OS forwards
-     *      to the relay; says nothing about reachability from anyone else. */
+     *   2. Local mode -- arg is <addr>:<port>.
+     *      Probes the given address:port directly, no DA lookup.
+     *      Useful when the relay isn't yet in consensus (bridge,
+     *      first-time deploy) or when checking from a remote vantage. */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--check-relay") == 0 && i + 1 < argc) {
             const char *target = argv[i + 1];
@@ -4403,11 +4446,40 @@ int main(int argc, char **argv) {
                         "  nickname:        %s\n"
                         "  address:         %s:%ld\n"
                         "  last published:  %ld (epoch)\n"
-                        "  consensus age:   %lds\n"
-                        "  Your relay is integrated into the network -- clients\n"
-                        "  fetching this consensus see your descriptor.\n",
+                        "  consensus age:   %lds\n",
                         da_host, da_port, nick_v, addr_v, or_port_v,
                         published_v, age_v);
+
+                    /* Live probe: prove the relay is actually answering
+                     * MOOR protocol right now, not just sitting in stale
+                     * consensus. Same PROBE/ALIVE protocol the DA uses. */
+                    if (or_port_v > 0 && or_port_v < 65536 &&
+                        addr_v[0] && strcmp(addr_v, "?") != 0) {
+                        double ms = 0;
+                        int prc = check_relay_probe(addr_v,
+                                                    (uint16_t)or_port_v, &ms);
+                        if (prc == 0) {
+                            fprintf(stdout,
+                                "  live probe:      ALIVE (%.0fms PROBE/ALIVE roundtrip)\n"
+                                "  Relay is in consensus AND responding to MOOR\n"
+                                "  protocol -- clients can use it right now.\n",
+                                ms);
+                            return 0;
+                        }
+                        const char *why =
+                            (prc == -1) ? "TCP connect failed"
+                          : (prc == -2) ? "connected but did not reply ALIVE"
+                          :               "send/recv errored";
+                        fprintf(stdout,
+                            "  live probe:      FAILED -- %s (%.0fms)\n"
+                            "  WARN: relay is in consensus but is not responding\n"
+                            "  to a live PROBE from this host. Either the relay\n"
+                            "  has just gone down (DA hasn't evicted it yet), the\n"
+                            "  consensus address is stale, or a network path issue\n"
+                            "  exists between this host and the relay.\n",
+                            why, ms);
+                        return 1;
+                    }
                     return 0;
                 }
                 if (status == 404) {
@@ -4431,15 +4503,15 @@ int main(int argc, char **argv) {
                 return 1;
             }
 
-            /* Local TCP mode (legacy behavior) */
+            /* Local mode: PROBE\n -> ALIVE\n roundtrip directly to addr:port */
             const char *colon = strrchr(target, ':');
             if (!colon || colon == target) {
                 fprintf(stderr,
                     "Usage:\n"
                     "  moor --check-relay <fingerprint> [<da_ip:da_port>]\n"
-                    "                                  (universe view via DA)\n"
+                    "                                  (universe view: consensus + live probe)\n"
                     "  moor --check-relay <addr>:<port>\n"
-                    "                                  (local TCP probe only)\n"
+                    "                                  (direct live probe, no DA)\n"
                     "Examples:\n"
                     "  moor --check-relay 7816dfa4...28b4\n"
                     "  moor --check-relay 7816dfa4...28b4 1.2.3.4:9030\n"
@@ -4461,36 +4533,41 @@ int main(int argc, char **argv) {
             }
             uint16_t port = (uint16_t)p;
             fprintf(stdout,
-                "check-relay (local TCP only): connecting to %s:%u ...\n"
-                "  note: local probe only proves your OS forwards to the relay;\n"
-                "        it says nothing about reachability from elsewhere on\n"
-                "        the internet. For the universe view, run again with\n"
-                "        the relay's fingerprint instead.\n",
-                host, port);
-            struct timespec t0, t1;
-            clock_gettime(CLOCK_MONOTONIC, &t0);
-            int fd = moor_tcp_connect_simple(host, port);
-            clock_gettime(CLOCK_MONOTONIC, &t1);
-            double ms = (t1.tv_sec - t0.tv_sec) * 1000.0
-                      + (t1.tv_nsec - t0.tv_nsec) / 1.0e6;
-            if (fd < 0) {
+                "check-relay: probing %s:%u (PROBE/ALIVE) ...\n", host, port);
+            double ms = 0;
+            int prc = check_relay_probe(host, port, &ms);
+            if (prc == 0) {
                 fprintf(stdout,
-                    "check-relay: UNREACHABLE %s:%u (after %.0fms)\n"
-                    "  - if this is your own relay: check that the moor process is running,\n"
-                    "    that the firewall allows inbound on port %u, and that NAT/router\n"
+                    "check-relay: ALIVE %s:%u (%.0fms PROBE/ALIVE roundtrip)\n"
+                    "  - the relay at %s:%u answered ALIVE to the same probe\n"
+                    "    DAs use for liveness. The MOOR process is running and\n"
+                    "    serving protocol from this host's vantage point.\n",
+                    host, port, ms, host, port);
+                return 0;
+            }
+            if (prc == -1) {
+                fprintf(stdout,
+                    "check-relay: UNREACHABLE %s:%u (TCP connect failed after %.0fms)\n"
+                    "  - if this is your own relay: confirm the moor process is\n"
+                    "    running, the firewall allows inbound on %u, and NAT/router\n"
                     "    forwards %u to this host.\n"
                     "  - if checking from outside: TCP was filtered, blocked, or refused.\n",
                     host, port, ms, port, port);
                 return 1;
             }
-            close(fd);
+            if (prc == -2) {
+                fprintf(stdout,
+                    "check-relay: WRONG SERVICE %s:%u (TCP open, but no ALIVE reply, %.0fms)\n"
+                    "  - something is listening on %u, but it is NOT a MOOR relay\n"
+                    "    (or it's a bridge with a transport that doesn't answer\n"
+                    "    PROBE -- bridges still answer ALIVE on the OR port).\n",
+                    host, port, ms, port);
+                return 1;
+            }
             fprintf(stdout,
-                "check-relay: local TCP REACHABLE %s:%u (%.0fms)\n"
-                "  - the OS at %s accepts inbound on port %u from this host's\n"
-                "    vantage point only. To check whether the rest of the network\n"
-                "    can reach you, run: moor --check-relay <fingerprint>\n",
-                host, port, ms, host, port);
-            return 0;
+                "check-relay: PROBE FAILED %s:%u (send/recv errored after %.0fms)\n",
+                host, port, ms);
+            return 1;
         }
     }
 
