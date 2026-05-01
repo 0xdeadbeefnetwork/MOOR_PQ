@@ -3555,12 +3555,28 @@ int moor_client_fetch_consensus(moor_consensus_t *cons,
     free(buf);
 
     if (ret > 0) {
-        /* Reject stale consensuses to prevent replay attacks */
-        if (!moor_consensus_is_fresh(cons)) {
-            LOG_WARN("fetched consensus is stale (valid_after=%llu, now=%llu)",
-                     (unsigned long long)cons->valid_after,
+        /* Replay window: reject anything outside [valid_after-skew, valid_until).
+         * The protocol defines two windows -- fresh_until (1h, "should fetch
+         * a new one") and valid_until (3h, "still safe to route through").
+         * Rejecting at fresh_until kills clients that fetch in the few-second
+         * to few-minute gap between hour-boundary rotations on the DA side
+         * (issue #6). Both DAs flip valid_after at the same UTC hour, so
+         * adding more DAs does not widen the window. Accept stale-but-valid
+         * here and let the periodic refresh pick up the new consensus when
+         * the DAs publish it. */
+        if (!moor_consensus_is_valid(cons)) {
+            LOG_WARN("fetched consensus expired (valid_until=%llu, now=%llu)",
+                     (unsigned long long)cons->valid_until,
                      (unsigned long long)(uint64_t)time(NULL));
             return -1;
+        }
+        if (!moor_consensus_is_fresh(cons)) {
+            LOG_INFO("fetched consensus past fresh_until (age=%llus, valid for "
+                     "%llus more) -- accepting; refresh will pick up new",
+                     (unsigned long long)((uint64_t)time(NULL) - cons->valid_after),
+                     (unsigned long long)(cons->valid_until > (uint64_t)time(NULL)
+                                          ? cons->valid_until - (uint64_t)time(NULL)
+                                          : 0));
         }
         /* Verify DA signatures against pre-configured trusted DA keys.
          * Uses hybrid Ed25519 + ML-DSA-65 verification: a PQ-capable trusted
@@ -3630,7 +3646,16 @@ int moor_client_fetch_consensus_multi(moor_consensus_t *cons,
         }
     }
 
-    LOG_ERROR("all %d DAs unreachable", num_das);
+    /* "Unreachable" is the worst phrasing -- if the DAs were reachable but
+     * returned a consensus that failed verification (expired, bad sig, empty),
+     * the network is the failure, not the DA. We can't tell from here which
+     * branch fired without per-DA bookkeeping; the per-attempt LOG_WARN/ERROR
+     * lines above already say which (e.g. "consensus expired", "hybrid sig
+     * verification FAILED"). Make this summary line point the operator at
+     * those, instead of asserting unreachability. */
+    LOG_ERROR("consensus fetch: all %d DAs failed; see preceding lines for "
+              "per-DA cause (TCP failure / expired / sig mismatch / empty)",
+              num_das);
     return -1;
 }
 
@@ -4241,11 +4266,20 @@ int moor_client_fetch_microdesc_consensus(moor_microdesc_consensus_t *mc,
         }
     }
 
-    if (!moor_consensus_is_fresh(&shadow)) {
-        LOG_WARN("microdesc consensus is stale");
+    /* Same fresh-vs-valid distinction as in moor_client_fetch_consensus
+     * (issue #6): reject only when fully expired, accept-with-INFO when
+     * past fresh_until but inside valid_until. */
+    if (!moor_consensus_is_valid(&shadow)) {
+        LOG_WARN("microdesc consensus expired (valid_until=%llu, now=%llu)",
+                 (unsigned long long)shadow.valid_until,
+                 (unsigned long long)(uint64_t)time(NULL));
         moor_consensus_cleanup(&shadow);
         moor_microdesc_consensus_cleanup(mc);
         return -1;
+    }
+    if (!moor_consensus_is_fresh(&shadow)) {
+        LOG_INFO("microdesc consensus past fresh_until -- accepting; "
+                 "refresh will pick up new");
     }
     if (moor_consensus_verify_hybrid(&shadow, g_trusted_da_keys,
                                      g_num_trusted_da_keys) != 0) {
