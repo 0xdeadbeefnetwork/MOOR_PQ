@@ -866,6 +866,16 @@ int moor_keys_save(const char *data_dir,
     return 0;
 }
 
+/* Read only the Ed25519 identity public key. Used by --print-fingerprint
+ * so operators without secret-key read perms (e.g. relay runs as a
+ * different user) can still recover their fingerprint. */
+int moor_identity_pk_load(const char *data_dir, uint8_t id_pk[32]) {
+    char path[576];
+    int n = snprintf(path, sizeof(path), "%s/keys/identity_pk", data_dir);
+    if (n < 0 || (size_t)n >= sizeof(path)) return -1;
+    return read_key_file(path, id_pk, 32);
+}
+
 int moor_keys_load(const char *data_dir,
                    uint8_t id_pk[32], uint8_t id_sk[64],
                    uint8_t onion_pk[32], uint8_t onion_sk[32]) {

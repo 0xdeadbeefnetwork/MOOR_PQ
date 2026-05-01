@@ -174,6 +174,9 @@ int moor_keys_save(const char *data_dir,
 int moor_keys_load(const char *data_dir,
                    uint8_t id_pk[32], uint8_t id_sk[64],
                    uint8_t onion_pk[32], uint8_t onion_sk[32]);
+/* Public-key-only loader; for --print-fingerprint when the caller does
+ * not have read access to identity_sk. */
+int moor_identity_pk_load(const char *data_dir, uint8_t id_pk[32]);
 
 /* PQ (ML-DSA-65) key persistence */
 int moor_pq_keys_save(const char *data_dir,

@@ -4509,20 +4509,21 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "print-fingerprint: sodium_init failed\n");
                 return 1;
             }
-            uint8_t pk[32], sk[64], opk[32], osk[32];
-            if (moor_keys_load(data_dir, pk, sk, opk, osk) != 0) {
+            uint8_t pk[32];
+            if (moor_identity_pk_load(data_dir, pk) != 0) {
                 fprintf(stderr,
-                    "print-fingerprint: no persistent keys at %s\n"
-                    "  Keys are written on first relay/DA startup. Run moor\n"
-                    "  once with --data-dir %s in relay or da mode first.\n",
+                    "print-fingerprint: cannot read %s/keys/identity_pk\n"
+                    "  - if the relay has never started, the keys do not\n"
+                    "    exist yet -- run moor in relay or da mode first.\n"
+                    "  - if the file exists but is unreadable, your shell\n"
+                    "    user may differ from the relay's runtime user;\n"
+                    "    try: sudo moor --print-fingerprint --data-dir %s\n",
                     data_dir, data_dir);
                 return 1;
             }
             char hex[65];
             sodium_bin2hex(hex, sizeof(hex), pk, 32);
             fprintf(stdout, "%s\n", hex);
-            sodium_memzero(sk, sizeof(sk));
-            sodium_memzero(osk, sizeof(osk));
             return 0;
         }
     }
