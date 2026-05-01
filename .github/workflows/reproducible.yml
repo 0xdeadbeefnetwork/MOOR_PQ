@@ -1,0 +1,90 @@
+name: reproducible-build
+
+# Build moor twice in identical pinned containers and confirm the
+# resulting binary is byte-identical. Drift here means a third party
+# can't independently verify a release artifact, which is the whole
+# point of source-only distribution + verifiable builds.
+#
+# We also assemble the .deb on each PR so packaging breakage is caught
+# before it lands.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  reproducible-binary:
+    name: Build twice, diff binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # build.sh wants full history for SOURCE_DATE_EPOCH
+
+      - name: Build pinned container
+        run: docker build -t moor-repro contrib/reproducible
+
+      - name: First build
+        run: |
+          mkdir build-a
+          docker run --rm \
+            -v $PWD:/src:ro \
+            -v $PWD/build-a:/out \
+            moor-repro bash -c \
+              'cp -a /src/. /tmp/b && cd /tmp/b && \
+               contrib/reproducible/build.sh && \
+               install -m 755 moor /out/moor'
+          sha256sum build-a/moor
+
+      - name: Second build
+        run: |
+          mkdir build-b
+          docker run --rm \
+            -v $PWD:/src:ro \
+            -v $PWD/build-b:/out \
+            moor-repro bash -c \
+              'cp -a /src/. /tmp/b && cd /tmp/b && \
+               contrib/reproducible/build.sh && \
+               install -m 755 moor /out/moor'
+          sha256sum build-b/moor
+
+      - name: Compare
+        run: |
+          if cmp -s build-a/moor build-b/moor; then
+            echo "REPRODUCIBLE: $(sha256sum build-a/moor | cut -d' ' -f1)"
+          else
+            echo "::error::Builds diverged — diffoscope output below"
+            docker run --rm \
+              -v $PWD:/w \
+              moor-repro diffoscope /w/build-a/moor /w/build-b/moor || true
+            exit 1
+          fi
+
+  debian-package:
+    name: dpkg-buildpackage smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential debhelper-compat devscripts fakeroot \
+            libsodium-dev libevent-dev zlib1g-dev pkg-config lintian
+
+      - name: Build .deb
+        run: |
+          dpkg-buildpackage -us -uc -b
+          ls ../moor_*.deb
+
+      - name: Lintian
+        run: |
+          lintian --no-tag-display-limit ../moor_*.deb || true

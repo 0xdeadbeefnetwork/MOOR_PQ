@@ -406,6 +406,48 @@ uninstall:
 	rmdir $(DESTDIR)$(SYSCONFDIR)/moor 2>/dev/null || true
 
 # =============================================================================
+# Reproducible builds
+# =============================================================================
+# Two invocations of `make reproducible` from the same git revision must
+# produce byte-identical `moor` binaries. The actual build runs inside a
+# digest-pinned Debian container so the toolchain is fully reproducible
+# between machines, not just between rebuilds on the same machine.
+REPRO_IMAGE ?= moor-reproducible:bookworm
+
+repro-image:
+	docker build -t $(REPRO_IMAGE) contrib/reproducible
+
+reproducible: repro-image
+	docker run --rm -v $(CURDIR):/src:ro \
+	           -v $(CURDIR)/build-repro:/out \
+	           $(REPRO_IMAGE) bash -c \
+	    'cp -a /src/. /tmp/build && cd /tmp/build && \
+	     contrib/reproducible/build.sh && \
+	     install -m 755 moor /out/moor && \
+	     sha256sum /out/moor'
+
+# Verify reproducibility: build twice, diff the binaries.
+reproducible-verify: repro-image
+	@rm -rf build-repro-a build-repro-b
+	@mkdir build-repro-a build-repro-b
+	@for d in a b; do \
+	    echo "==> Build $$d"; \
+	    docker run --rm -v $(CURDIR):/src:ro \
+	               -v $(CURDIR)/build-repro-$$d:/out \
+	               $(REPRO_IMAGE) bash -c \
+	    'cp -a /src/. /tmp/build && cd /tmp/build && \
+	     contrib/reproducible/build.sh > /dev/null 2>&1 && \
+	     install -m 755 moor /out/moor'; \
+	done
+	@if cmp -s build-repro-a/moor build-repro-b/moor; then \
+	    echo "REPRODUCIBLE: $$(sha256sum build-repro-a/moor | cut -d' ' -f1)"; \
+	else \
+	    echo "NOT REPRODUCIBLE — binaries differ"; \
+	    sha256sum build-repro-a/moor build-repro-b/moor; \
+	    exit 1; \
+	fi
+
+# =============================================================================
 # Static Analysis
 # =============================================================================
 static-analysis:

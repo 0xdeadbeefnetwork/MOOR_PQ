@@ -1,0 +1,31 @@
+[Unit]
+Description=MOOR — post-quantum anonymous overlay network
+Documentation=man:moor(1) https://moor.afflicted.sh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=moor
+Group=moor
+ExecStart=/usr/bin/moor --config /etc/moor/moor.conf
+Restart=on-failure
+RestartSec=5
+
+# File system / device hardening
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+NoNewPrivileges=true
+ReadWritePaths=/var/lib/moor
+
+# Resource limits — match upstream sandbox expectations
+LimitNOFILE=65536
+LimitCORE=infinity
+
+[Install]
+WantedBy=multi-user.target

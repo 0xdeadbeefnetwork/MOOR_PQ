@@ -1,0 +1,50 @@
+moor for Debian
+===============
+
+This is the Debian source package for MOOR — a post-quantum anonymous
+overlay network. The package is a thin wrapper around upstream's
+Makefile-driven build; no patches are applied.
+
+Distribution posture
+--------------------
+Upstream operates source-only — no project-run binary distribution
+channel. This package exists so Debian can do what Debian does:
+maintainer-built, distro-signed, mirror-replicated, apt-distributed.
+The trust chain is the same as for any other Debian package.
+
+For operators who want updates without manual rebuilds, the supported
+path is:
+
+    apt install moor unattended-upgrades
+
+`unattended-upgrades` is a stock Debian package that pulls security
+updates on a schedule. Combined with apt-transport-tor (recommended in
+debian/control) it can also fetch over Tor so your update cadence does
+not leak `this IP runs MOOR vX` to passive observers.
+
+After install
+-------------
+The systemd unit ships *disabled*. The package writes neither key
+material nor a default config because both are mode-specific. To
+finish setup:
+
+    sudoedit /etc/moor/moor.conf       # see example.conf, man moor(1)
+    systemctl enable --now moor
+    journalctl -u moor -f
+
+Reproducible builds
+-------------------
+Builds are intended to be reproducible — `SOURCE_DATE_EPOCH` is
+honoured, paths are stripped from debug info, and `dpkg-buildflags`
+hardening is applied. To verify locally:
+
+    dpkg-buildpackage -us -uc -b
+    sha256sum ../moor_*.deb           # record
+    rm -rf debian/moor debian/.debhelper obj
+    dpkg-buildpackage -us -uc -b
+    sha256sum ../moor_*.deb           # must match
+
+If hashes diverge, please file a bug — non-determinism is a packaging
+defect, not a feature.
+
+ -- 0xdeadbeefnetwork <stc@afflicted.sh>

@@ -1,0 +1,33 @@
+#!/usr/bin/make -f
+
+# debhelper drives the standard build steps. The flags below are the
+# minimum needed to make the resulting .deb byte-reproducible:
+#   - SOURCE_DATE_EPOCH is set automatically by debhelper from the
+#     latest debian/changelog entry; CFLAGS pick it up via macros.
+#   - -ffile-prefix-map strips the random builder path from debug info.
+#   - dpkg-buildflags supplies hardening flags (PIE, RELRO, BIND_NOW,
+#     stack protector, _FORTIFY_SOURCE) which already match upstream's
+#     Makefile, so we just append rather than override.
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all reproducible=+all
+export DEB_LDFLAGS_MAINT_APPEND = -Wl,--as-needed
+
+# Keep upstream Makefile in charge of the build. Override PREFIX so
+# `dh_auto_install` lands files under /usr (not /usr/local).
+override_dh_auto_build:
+	$(MAKE) PREFIX=/usr SYSCONFDIR=/etc
+
+override_dh_auto_install:
+	$(MAKE) install \
+	    DESTDIR=$(CURDIR)/debian/moor \
+	    PREFIX=/usr \
+	    SYSCONFDIR=/etc
+
+override_dh_auto_test:
+	# Skip on package builds — upstream tests need libsodium runtime
+	# fixtures and a non-sandboxed network for some integration suites.
+
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start --name=moor
+
+%:
+	dh $@

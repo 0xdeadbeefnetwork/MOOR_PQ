@@ -1,0 +1,7 @@
+moor (0.8.1-1) unstable; urgency=medium
+
+  * Initial Debian source packaging.
+  * Targets the same source tree built by the upstream Makefile.
+  * No upstream code changes; all packaging lives under debian/.
+
+ -- 0xdeadbeefnetwork <stc@afflicted.sh>  Fri, 01 May 2026 00:00:00 +0000

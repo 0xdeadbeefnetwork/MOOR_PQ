@@ -1,0 +1,64 @@
+#!/bin/sh
+# postinst: create the moor system user, prepare directories.
+# The systemd unit ships disabled by default — operators edit
+# /etc/moor/moor.conf and then run `systemctl enable --now moor`.
+
+set -e
+
+case "$1" in
+    configure)
+        if ! getent passwd moor >/dev/null; then
+            adduser --system --group --quiet \
+                    --home /var/lib/moor \
+                    --no-create-home \
+                    --shell /usr/sbin/nologin \
+                    --gecos "MOOR overlay network" \
+                    moor
+        fi
+
+        # Data dir: keys live under keys/ at mode 0700.
+        if [ ! -d /var/lib/moor ]; then
+            install -d -o moor -g moor -m 0750 /var/lib/moor
+        fi
+        if [ ! -d /var/lib/moor/keys ]; then
+            install -d -o moor -g moor -m 0700 /var/lib/moor/keys
+        fi
+
+        # /etc/moor exists by Makefile install — make sure perms are right.
+        if [ -d /etc/moor ]; then
+            chown root:moor /etc/moor
+            chmod 0750 /etc/moor
+        fi
+
+        # Friendly first-run hint, only when no config exists yet.
+        if [ ! -f /etc/moor/moor.conf ]; then
+            cat <<'EOF'
+
+MOOR is installed but not yet configured. To finish setup:
+
+  1. Edit /etc/moor/moor.conf  (see /etc/moor/example.conf for templates,
+                                or `man moor` for the full reference)
+  2. systemctl enable --now moor
+  3. journalctl -u moor -f     (watch the bootstrap)
+
+To find your relay fingerprint after first start:
+    moor --print-fingerprint
+To verify the network sees your relay:
+    moor --check-relay <fingerprint>
+
+EOF
+        fi
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0
