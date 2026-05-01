@@ -167,6 +167,49 @@ well-known DPI fingerprints (HTTP `GET `, `SSH-2.0`, SCADA banners) and
 return rotating fake industrial-control responses. Bridge relays skip this
 so legitimate transport cover prefixes pass through.
 
+### Finding your relay fingerprint
+
+Your relay is identified by a 64-character hex Ed25519 fingerprint. Three
+ways to retrieve it, in order of how lazy you are:
+
+1. **System log on startup.** The relay prints a `relay fingerprint: <hex>`
+   line right next to the `build <id>` banner. On a systemd box that lands
+   in `journalctl -u moor` (or `/var/log/syslog` if you're on rsyslog).
+
+2. **`moor --print-fingerprint`.** Reads only the public-key file
+   (`<data-dir>/keys/identity_pk`), so it works without sudo if the file
+   is world-readable. Defaults to `/var/lib/moor`:
+
+   ```bash
+   moor --print-fingerprint
+   moor --print-fingerprint --data-dir /custom/path
+   ```
+
+3. **Web dashboard.** The DA's HTML dashboard at the DirPort lists every
+   relay in the consensus. Each relay's identity column links through to
+   `/relay.html?fp=<full-hex>` for a per-relay drilldown view, and there
+   is a search box at the top of the relay table.
+
+### Verifying your relay is reachable
+
+`moor --check-relay` answers two different questions depending on what you
+pass it:
+
+```bash
+# "Is the rest of the network seeing me?" -- queries a DA's /relay?fp= endpoint
+# for consensus presence, then live-probes the consensus address.
+moor --check-relay <64-hex-fingerprint>
+moor --check-relay <fingerprint> <da_ip:da_port>   # specific DA
+
+# "Is anything answering MOOR protocol at this socket?" -- direct PROBE/ALIVE
+# roundtrip against the relay (same liveness handshake DAs use). No DA lookup.
+moor --check-relay <addr>:<port>
+```
+
+Both forms exit non-zero on failure. The universe-mode form is the right
+one for "did my relay actually integrate into the network?" — the local
+form only proves something is answering at that socket.
+
 ---
 
 ## Directory authority
