@@ -171,7 +171,17 @@ static void print_usage(const char *prog) {
         "  --daemon              Fork to background\n"
         "  --User <name>         Drop privileges to user after binding (Unix)\n"
         "  -v                    Verbose logging\n"
-        "  -h, --help            Show this help\n",
+        "  -h, --help            Show this help\n"
+        "\n"
+        "Diagnostics (no daemon, early-exit):\n"
+        "  --print-fingerprint [--data-dir <dir>]\n"
+        "                        Print this relay/DA's Ed25519 fingerprint as 64 hex.\n"
+        "  --check-relay <fingerprint> [<da_ip:da_port>]\n"
+        "                        Ask a DA whether the relay is in current consensus\n"
+        "                        (universe-side reachability). Default DA: hardcoded.\n"
+        "  --check-relay <addr>:<port>\n"
+        "                        Local TCP probe only -- says nothing about whether\n"
+        "                        the relay is reachable from anywhere but this host.\n",
         MOOR_VERSION_STRING,
         prog, prog,
         (unsigned)MOOR_DEFAULT_SOCKS_PORT,
@@ -4258,29 +4268,188 @@ static int keygen_enclave(const char *data_dir, const char *address,
 }
 
 int main(int argc, char **argv) {
-    /* 0a. --check-relay <addr>:<port> -- TCP reachability test, early exit.
-     * For relay/bridge operators to verify their listener is reachable from
-     * this host. Doesn't perform a MOOR handshake (transports vary); a TCP
-     * accept proves the OS is forwarding traffic to the relay process. */
+    /* 0a. --check-relay <target> [<da_ip:da_port>]  (early exit, no config)
+     *
+     * Two modes, distinguished by argument shape:
+     *
+     *   1. Universe mode -- arg is a 64-hex relay fingerprint.
+     *      Asks a DA's /relay?fp=<fp> endpoint whether the relay is in the
+     *      current consensus. This is the "from the universe" view: not
+     *      whether a TCP socket on this box accepts, but whether DAs and
+     *      clients have a routable, current descriptor for the relay.
+     *      Default DA: 107.174.70.38:9030 (matches config.c hardcoded fallback).
+     *
+     *   2. Local TCP mode -- arg is <addr>:<port>.
+     *      Plain TCP connect from THIS host. Confirms the local OS forwards
+     *      to the relay; says nothing about reachability from anyone else. */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--check-relay") == 0 && i + 1 < argc) {
             const char *target = argv[i + 1];
-            char host[256] = {0};
-            uint16_t port = 0;
+
+            /* Fingerprint detection: exactly 64 chars, all hex. */
+            size_t tlen = strlen(target);
+            int looks_like_fp = (tlen == 64);
+            if (looks_like_fp) {
+                for (size_t k = 0; k < 64; k++) {
+                    char c = target[k];
+                    if (!((c >= '0' && c <= '9') ||
+                          (c >= 'a' && c <= 'f') ||
+                          (c >= 'A' && c <= 'F'))) {
+                        looks_like_fp = 0;
+                        break;
+                    }
+                }
+            }
+
+            if (looks_like_fp) {
+                /* Universe mode: query DA's /relay?fp=... endpoint */
+                const char *da_target = (i + 2 < argc && argv[i + 2][0] != '-')
+                                        ? argv[i + 2]
+                                        : "107.174.70.38:9030";
+                char da_host[256] = {0};
+                const char *cp = strrchr(da_target, ':');
+                if (!cp || cp == da_target) {
+                    fprintf(stderr,
+                        "check-relay: invalid DA address: %s\n"
+                        "  expected <da_ip>:<da_port>\n", da_target);
+                    return 2;
+                }
+                size_t hl = (size_t)(cp - da_target);
+                if (hl >= sizeof(da_host)) hl = sizeof(da_host) - 1;
+                memcpy(da_host, da_target, hl);
+                if (da_host[0] == '[' && da_host[hl - 1] == ']') {
+                    memmove(da_host, da_host + 1, hl - 2);
+                    da_host[hl - 2] = '\0';
+                }
+                int dp = atoi(cp + 1);
+                if (dp <= 0 || dp > 65535) {
+                    fprintf(stderr,
+                        "check-relay: invalid DA port: %s\n", cp + 1);
+                    return 2;
+                }
+                uint16_t da_port = (uint16_t)dp;
+
+                fprintf(stdout,
+                    "check-relay: asking DA %s:%u about fingerprint\n"
+                    "             %s ...\n",
+                    da_host, da_port, target);
+
+                int fd = moor_tcp_connect_simple(da_host, da_port);
+                if (fd < 0) {
+                    fprintf(stdout,
+                        "check-relay: cannot reach DA %s:%u (TCP failed)\n"
+                        "  - the DA itself is unreachable from this host;\n"
+                        "    your relay status could not be determined.\n"
+                        "  - try a different DA: --check-relay <fp> <da_ip:port>\n",
+                        da_host, da_port);
+                    return 1;
+                }
+                char req[256];
+                int rl = snprintf(req, sizeof(req),
+                    "GET /relay?fp=%s HTTP/1.0\r\n"
+                    "Host: %s\r\n"
+                    "Connection: close\r\n"
+                    "\r\n", target, da_host);
+                if (send(fd, req, (size_t)rl, MSG_NOSIGNAL) != rl) {
+                    fprintf(stdout,
+                        "check-relay: short send to DA %s:%u (errno=%d)\n",
+                        da_host, da_port, errno);
+                    close(fd);
+                    return 1;
+                }
+                char buf[8192];
+                size_t got = 0;
+                while (got < sizeof(buf) - 1) {
+                    ssize_t n = recv(fd, buf + got, sizeof(buf) - 1 - got, 0);
+                    if (n <= 0) break;
+                    got += (size_t)n;
+                }
+                close(fd);
+                buf[got] = 0;
+
+                int status = 0;
+                const char *sp = strchr(buf, ' ');
+                if (sp) status = atoi(sp + 1);
+                const char *body = strstr(buf, "\r\n\r\n");
+                body = body ? body + 4 : "";
+
+                if (status == 200 && strstr(body, "\"found\":true")) {
+                    char addr_v[128] = "?", nick_v[128] = "?";
+                    long or_port_v = 0, age_v = 0, published_v = 0;
+                    const char *p1;
+                    if ((p1 = strstr(body, "\"address\":\""))) {
+                        p1 += 11;
+                        const char *q = strchr(p1, '"');
+                        size_t L = q ? (size_t)(q - p1) : 0;
+                        if (L >= sizeof(addr_v)) L = sizeof(addr_v) - 1;
+                        memcpy(addr_v, p1, L); addr_v[L] = 0;
+                    }
+                    if ((p1 = strstr(body, "\"nickname\":\""))) {
+                        p1 += 12;
+                        const char *q = strchr(p1, '"');
+                        size_t L = q ? (size_t)(q - p1) : 0;
+                        if (L >= sizeof(nick_v)) L = sizeof(nick_v) - 1;
+                        memcpy(nick_v, p1, L); nick_v[L] = 0;
+                    }
+                    if ((p1 = strstr(body, "\"or_port\":")))
+                        or_port_v = atol(p1 + 10);
+                    if ((p1 = strstr(body, "\"published\":")))
+                        published_v = atol(p1 + 12);
+                    if ((p1 = strstr(body, "\"consensus_age_seconds\":")))
+                        age_v = atol(p1 + 24);
+
+                    fprintf(stdout,
+                        "check-relay: IN CONSENSUS (DA %s:%u confirms)\n"
+                        "  nickname:        %s\n"
+                        "  address:         %s:%ld\n"
+                        "  last published:  %ld (epoch)\n"
+                        "  consensus age:   %lds\n"
+                        "  Your relay is integrated into the network -- clients\n"
+                        "  fetching this consensus see your descriptor.\n",
+                        da_host, da_port, nick_v, addr_v, or_port_v,
+                        published_v, age_v);
+                    return 0;
+                }
+                if (status == 404) {
+                    fprintf(stdout,
+                        "check-relay: NOT IN CONSENSUS\n"
+                        "  DA %s:%u has no entry for %s\n"
+                        "  - hidden bridges (IsBridge 1) are unlisted by design;\n"
+                        "    not appearing here is correct for bridges.\n"
+                        "  - public relays: confirm moor reached the DA (look for\n"
+                        "    'PUBLISH ok' / Falcon signature in the relay log),\n"
+                        "    that BUILD_ID matches the fleet, and that a fresh\n"
+                        "    consensus has been signed since the relay started.\n",
+                        da_host, da_port, target);
+                    return 1;
+                }
+                fprintf(stdout,
+                    "check-relay: DA %s:%u returned HTTP %d\n"
+                    "  response (truncated): %.*s\n",
+                    da_host, da_port, status,
+                    (int)(got > 512 ? 512 : got), buf);
+                return 1;
+            }
+
+            /* Local TCP mode (legacy behavior) */
             const char *colon = strrchr(target, ':');
             if (!colon || colon == target) {
                 fprintf(stderr,
-                    "Usage: moor --check-relay <addr>:<port>\n"
-                    "  Tests TCP reachability of a MOOR relay/bridge.\n"
-                    "  Examples:\n"
-                    "    moor --check-relay 1.2.3.4:9001\n"
-                    "    moor --check-relay [2001:db8::1]:9001\n");
+                    "Usage:\n"
+                    "  moor --check-relay <fingerprint> [<da_ip:da_port>]\n"
+                    "                                  (universe view via DA)\n"
+                    "  moor --check-relay <addr>:<port>\n"
+                    "                                  (local TCP probe only)\n"
+                    "Examples:\n"
+                    "  moor --check-relay 7816dfa4...28b4\n"
+                    "  moor --check-relay 7816dfa4...28b4 1.2.3.4:9030\n"
+                    "  moor --check-relay 1.2.3.4:9001\n");
                 return 2;
             }
+            char host[256] = {0};
             size_t hlen = (size_t)(colon - target);
             if (hlen >= sizeof(host)) hlen = sizeof(host) - 1;
             memcpy(host, target, hlen);
-            /* Strip [..] for IPv6 literals */
             if (host[0] == '[' && host[hlen - 1] == ']') {
                 memmove(host, host + 1, hlen - 2);
                 host[hlen - 2] = '\0';
@@ -4290,8 +4459,14 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "check-relay: invalid port: %s\n", colon + 1);
                 return 2;
             }
-            port = (uint16_t)p;
-            fprintf(stdout, "check-relay: connecting to %s:%u ...\n", host, port);
+            uint16_t port = (uint16_t)p;
+            fprintf(stdout,
+                "check-relay (local TCP only): connecting to %s:%u ...\n"
+                "  note: local probe only proves your OS forwards to the relay;\n"
+                "        it says nothing about reachability from elsewhere on\n"
+                "        the internet. For the universe view, run again with\n"
+                "        the relay's fingerprint instead.\n",
+                host, port);
             struct timespec t0, t1;
             clock_gettime(CLOCK_MONOTONIC, &t0);
             int fd = moor_tcp_connect_simple(host, port);
@@ -4310,11 +4485,44 @@ int main(int argc, char **argv) {
             }
             close(fd);
             fprintf(stdout,
-                "check-relay: REACHABLE %s:%u (TCP accept in %.0fms)\n"
-                "  - the OS at %s is forwarding traffic and accepting on port %u.\n"
-                "  - this confirms reachability only; for full handshake validation,\n"
-                "    add a Bridge line to a client config and observe Bootstrapped 100%%.\n",
+                "check-relay: local TCP REACHABLE %s:%u (%.0fms)\n"
+                "  - the OS at %s accepts inbound on port %u from this host's\n"
+                "    vantage point only. To check whether the rest of the network\n"
+                "    can reach you, run: moor --check-relay <fingerprint>\n",
                 host, port, ms, host, port);
+            return 0;
+        }
+    }
+
+    /* 0a-bis. --print-fingerprint [--data-dir <dir>]  (early exit, no daemon)
+     * Loads the persistent identity keys and prints the Ed25519 fingerprint
+     * as 64 hex chars on stdout. For operators who can't easily grep the
+     * syslog and don't run nyx. */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--print-fingerprint") == 0) {
+            const char *data_dir = "/var/lib/moor";
+            for (int j = i + 1; j < argc; j++) {
+                if (strcmp(argv[j], "--data-dir") == 0 && j + 1 < argc)
+                    data_dir = argv[++j];
+            }
+            if (sodium_init() < 0) {
+                fprintf(stderr, "print-fingerprint: sodium_init failed\n");
+                return 1;
+            }
+            uint8_t pk[32], sk[64], opk[32], osk[32];
+            if (moor_keys_load(data_dir, pk, sk, opk, osk) != 0) {
+                fprintf(stderr,
+                    "print-fingerprint: no persistent keys at %s\n"
+                    "  Keys are written on first relay/DA startup. Run moor\n"
+                    "  once with --data-dir %s in relay or da mode first.\n",
+                    data_dir, data_dir);
+                return 1;
+            }
+            char hex[65];
+            sodium_bin2hex(hex, sizeof(hex), pk, 32);
+            fprintf(stdout, "%s\n", hex);
+            sodium_memzero(sk, sizeof(sk));
+            sodium_memzero(osk, sizeof(osk));
             return 0;
         }
     }
@@ -4580,7 +4788,18 @@ int main(int argc, char **argv) {
         build_id_str[16] = '\0';
         /* Print build_id via fprintf to bypass log-redaction (hex → [KEY]).
          * DAs enforce strict equality on this string. */
-        fprintf(stderr, "        \033[90mbuild %s\033[0m\n\n", build_id_str);
+        fprintf(stderr, "        \033[90mbuild %s\033[0m\n", build_id_str);
+        /* Identity fingerprint banner -- relay/DA only. INFO-level logs are
+         * suppressed at default log level, so operators couldn't see this
+         * without grepping the file or running at -v. */
+        if (g_mode == MOOR_MODE_RELAY || g_mode == MOOR_MODE_DA) {
+            char fp_banner[65];
+            sodium_bin2hex(fp_banner, sizeof(fp_banner), g_identity_pk, 32);
+            fprintf(stderr, "        \033[90m%s fingerprint: %s\033[0m\n",
+                    g_mode == MOOR_MODE_RELAY ? "relay" : "DA",
+                    fp_banner);
+        }
+        fprintf(stderr, "\n");
         LOG_INFO("MOOR v%s build %s running on %s with libsodium %s",
                  MOOR_VERSION_STRING, build_id_str, os, sodium_version_string());
         LOG_INFO("Operating in %s mode (PID %d)", mode_str, (int)getpid());
