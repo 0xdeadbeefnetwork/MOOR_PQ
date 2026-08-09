@@ -143,6 +143,16 @@ int moor_connection_connect(moor_connection_t *conn,
                             const moor_transport_t *transport,
                             const void *transport_params);
 
+/* Same as moor_connection_connect but skips the self-loop guard. Only the
+ * relay self-test (which connects to its own OR port intentionally) should
+ * call this. */
+int moor_connection_connect_self(moor_connection_t *conn,
+                                  const char *address, uint16_t port,
+                                  const uint8_t our_identity_pk[32],
+                                  const uint8_t our_identity_sk[64],
+                                  const moor_transport_t *transport,
+                                  const void *transport_params);
+
 /* Accept an incoming connection and complete link handshake (server side).
  * transport/transport_params may be NULL for raw connections. */
 int moor_connection_accept(moor_connection_t *conn, int listen_fd,

@@ -1177,6 +1177,24 @@ int moor_connection_connect(moor_connection_t *conn,
         return -1;
     }
 
+    return moor_connection_connect_self(conn, address, port,
+                                         our_identity_pk, our_identity_sk,
+                                         transport, transport_params);
+}
+
+/* Same as moor_connection_connect but bypasses the self-loop guard.
+ * Used by the relay self-test, which intentionally connects to the relay's
+ * own OR port to verify reachability -- without this, is_self_target()
+ * blocks the self-test and the relay can never confirm it is reachable,
+ * even when it is. */
+int moor_connection_connect_self(moor_connection_t *conn,
+                                  const char *address, uint16_t port,
+                                  const uint8_t our_identity_pk[32],
+                                  const uint8_t our_identity_sk[64],
+                                  const moor_transport_t *transport,
+                                  const void *transport_params) {
+    ensure_wsa();
+
     int fd = moor_tcp_connect_simple(address, port);
     if (fd < 0) {
         LOG_ERROR("connect to %s:%u failed", address, port);

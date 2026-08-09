@@ -76,12 +76,15 @@
 #define MOOR_DOS_CELL_RATE_PER_CONN     1000    /* Cells/sec per connection */
 #define MOOR_DOS_CELL_BURST_PER_CONN    2000    /* Burst per connection */
 /* F-05: was 8 bits (~256 Argon2id evaluations per identity) -- typo-level
- * anti-flood value that makes bulk Sybil registration near-free. 20 bits is
- * ~1M evaluations per identity; combined with the per-identity epoch salt
- * (pow.c:288-290) that forces a fresh solve per Sybil, this makes registering
- * thousands of relays expensive enough to deter the guard/exit capture attack
- * described in F-05. Tune upward on commodity hardware as needed. */
-#define MOOR_POW_DEFAULT_DIFFICULTY     20      /* PoW leading zero bits (Argon2id) */
+ * anti-flood value that makes bulk Sybil registration near-free. 12 bits is
+ * ~4096 evaluations per identity (~4s at the 256KB Argon2id memlimit), a 16x
+ * increase over the original. Honest relays solve in seconds; an attacker
+ * registering N Sybils pays N x ~4s of pure Argon2id compute, and the per-
+ * identity epoch salt (pow.c) forces a fresh solve per Sybil. Hardened
+ * deployments can raise this; each +2 bits is ~4x cost (~4s@12, ~16s@14,
+ * ~65s@16). The hidden-service intro-flood PoW (hs_pow_difficulty) defaults
+ * higher because intro flooding is high-rate and worth the extra cost. */
+#define MOOR_POW_DEFAULT_DIFFICULTY     12      /* PoW leading zero bits (Argon2id) */
 #define MOOR_POW_TIMESTAMP_WINDOW       300     /* PoW validity (5min, was 1h -- see CWE-330 fix) */
 #define MOOR_POW_MEMLIMIT_DEFAULT       (256U * 1024U)  /* Argon2id memory: 256 KB */
 #define MOOR_POW_MEMLIMIT_MIN           (8U * 1024U)

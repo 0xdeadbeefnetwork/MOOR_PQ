@@ -157,15 +157,26 @@ static int desc_has_falcon(const moor_node_descriptor_t *desc) {
     return 0;
 }
 
-/* Compute wire features: auto-set FAMILY/NICKNAME/BUILD_ID/FALCON bits to match serialization */
+/* Compute wire features: auto-set FAMILY/NICKNAME/BUILD_ID/FALCON bits to
+ * match serialization EXACTLY. This must mirror the conditional structure of
+ * moor_node_descriptor_serialize, which forces V4 (and thus FAMILY+NICKNAME)
+ * whenever V5/V7 are present, because those extensions are appended after V4
+ * and require the V4 block + V3 header to be present. A previous version
+ * computed these bits inconsistently with the serializer, so the signed
+ * feature set (0x71) differed from the wire feature set (0x77) and every
+ * descriptor failed Ed25519 verification on the DA. */
 static uint32_t desc_wire_features(const moor_node_descriptor_t *desc) {
     uint32_t f = desc->features;
     int is_v3 = (desc->num_family_members > 0);
     int has_v4 = (desc->nickname[0] != '\0' || desc->onion_key_version > 0);
+    int has_v5 = (desc->contact_info[0] != '\0');
     int has_v7 = (desc->build_id[0] != '\0');
     int has_v8 = desc_has_falcon(desc);
+    /* Serializer forces V4 when V5/V7 present (they append after V4). */
+    if (has_v5 || has_v7) has_v4 = 1;
     if (is_v3 || has_v4) f |= NODE_FEATURE_FAMILY;
     if (has_v4)           f |= NODE_FEATURE_NICKNAME;
+    if (has_v5)           f |= NODE_FEATURE_CONTACT;
     if (has_v7)           f |= NODE_FEATURE_BUILD_ID;
     if (has_v8)           f |= NODE_FEATURE_FALCON;
     return f;
@@ -195,21 +206,41 @@ static size_t desc_sign_serialize(uint8_t *buf, const moor_node_descriptor_t *de
     buf[off++] = (uint8_t)(desc->features >> 16);
     buf[off++] = (uint8_t)(desc->features >> 8);
     buf[off++] = (uint8_t)(desc->features);
-    /* V3/V4 fields — must be signed to prevent forgery (#207).
-     * family_id is excluded: it's DA-computed (not relay-declared). */
-    uint8_t nfm = desc->num_family_members;
-    if (nfm > 8) nfm = 8;
-    buf[off++] = nfm;
-    for (int i = 0; i < nfm; i++) {
-        memcpy(buf + off, desc->family_members[i], 32); off += 32;
+
+    /* V3/V4/V5/V7 fields — gated by the SAME feature bits that the wire
+     * serializer uses to decide whether to emit them. The previous code wrote
+     * these unconditionally, which meant the signed body length always
+     * included nickname/address6/build_id even when the wire omitted them;
+     * the DA then reconstructed a buffer of a different length than the relay
+     * signed, and Ed25519 verification failed for every descriptor. Each block
+     * is emitted iff the corresponding feature bit is set in desc->features,
+     * matching moor_node_descriptor_serialize exactly. */
+    if (desc->features & (NODE_FEATURE_FAMILY | NODE_FEATURE_NICKNAME)) {
+        /* V3 header: family member count + members (family_id is DA-computed,
+         * never signed). */
+        uint8_t nfm = desc->num_family_members;
+        if (nfm > 8) nfm = 8;
+        buf[off++] = nfm;
+        for (int i = 0; i < nfm; i++) {
+            memcpy(buf + off, desc->family_members[i], 32); off += 32;
+        }
+        /* V4: nickname + IPv6 + key rotation */
+        if (desc->features & NODE_FEATURE_NICKNAME) {
+            memcpy(buf + off, desc->nickname, 32); off += 32;
+            memcpy(buf + off, desc->address6, 64); off += 64;
+            memcpy(buf + off, desc->prev_onion_pk, 32); off += 32;
+            for (int i = 3; i >= 0; i--) buf[off++] = (uint8_t)(desc->onion_key_version >> (i * 8));
+            for (int i = 7; i >= 0; i--) buf[off++] = (uint8_t)(desc->onion_key_published >> (i * 8));
+            /* V5: contact info */
+            if (desc->features & NODE_FEATURE_CONTACT) {
+                memcpy(buf + off, desc->contact_info, 128); off += 128;
+            }
+        }
     }
-    memcpy(buf + off, desc->nickname, 32); off += 32;
-    memcpy(buf + off, desc->address6, 64); off += 64;
-    memcpy(buf + off, desc->prev_onion_pk, 32); off += 32;
-    for (int i = 3; i >= 0; i--) buf[off++] = (uint8_t)(desc->onion_key_version >> (i * 8));
-    for (int i = 7; i >= 0; i--) buf[off++] = (uint8_t)(desc->onion_key_published >> (i * 8));
-    /* V7: build_id must be signed so a MITM can't strip it and bypass DA gating */
-    memcpy(buf + off, desc->build_id, 16); off += 16;
+    /* V7: build_id — signed iff the BUILD_ID feature bit is set (matches wire). */
+    if (desc->features & NODE_FEATURE_BUILD_ID) {
+        memcpy(buf + off, desc->build_id, 16); off += 16;
+    }
     /* V8: Falcon identity pk — only included if descriptor has Falcon.
      * Gating on the pk content (rather than the feature bit) matches
      * desc_wire_features which sets the bit iff falcon_pk is non-zero,

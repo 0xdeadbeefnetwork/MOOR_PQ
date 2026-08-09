@@ -2123,9 +2123,14 @@ static int da_dispatch_request(int client_fd, moor_da_config_t *config,
                     return 0;
                 }
             }
-            /* Verify PoW -- always required (minimum = default difficulty) */
+            /* Verify PoW -- always required.
+             * Use the DA's configured difficulty when the operator set one
+             * explicitly (>0); otherwise fall back to the compile-time default.
+             * The previous '>= DEFAULT' gate ignored any operator override
+             * below the default, so a DA started with --pow-difficulty 8 still
+             * demanded 12 and rejected every relay that solved at 8. */
             size_t remaining = len - (size_t)desc_len;
-            int pow_diff = config->pow_difficulty >= MOOR_POW_DEFAULT_DIFFICULTY ?
+            int pow_diff = config->pow_difficulty > 0 ?
                            config->pow_difficulty : MOOR_POW_DEFAULT_DIFFICULTY;
             if (remaining < 16) {
                 LOG_WARN("DA: rejecting relay with missing PoW data");

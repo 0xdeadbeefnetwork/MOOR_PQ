@@ -3949,7 +3949,9 @@ int moor_relay_self_test(const moor_relay_config_t *config) {
             nanosleep(&ts, NULL);
         }
 
-        /* Connect to our own OR port via Noise_IK handshake */
+        /* Connect to our own OR port via Noise_IK handshake.
+         * Uses moor_connection_connect_self to bypass the self-loop guard
+         * (is_self_target) -- the self-test is the one intentional self-loop. */
         moor_connection_t *conn = moor_connection_alloc();
         if (!conn) continue;
 
@@ -3957,7 +3959,7 @@ int moor_relay_self_test(const moor_relay_config_t *config) {
          * to ourselves, so set our own identity_pk as the peer */
         memcpy(conn->peer_identity, config->identity_pk, 32);
 
-        if (moor_connection_connect(conn, addr, port,
+        if (moor_connection_connect_self(conn, addr, port,
                                      config->identity_pk,
                                      config->identity_sk,
                                      NULL, NULL) != 0) {
