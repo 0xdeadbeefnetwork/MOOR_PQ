@@ -21,40 +21,51 @@ int moor_consensus_init(moor_consensus_t *cons, uint32_t capacity) {
 }
 
 void moor_consensus_cleanup(moor_consensus_t *cons) {
-    if (cons->relays) {
-        free(cons->relays);
-        cons->relays = NULL;
-    }
-    cons->relay_capacity = 0;
+    /* F-02: free the array last, after zeroing the count, so a concurrent
+     * reader that observed num_relays > 0 cannot pair it with a NULL/freed
+     * relays pointer. The previous order (NULL relays, then zero num_relays)
+     * let readers observe relays==NULL with num_relays>0 and NULL-deref. */
+    uint32_t old_num = cons->num_relays;
     cons->num_relays = 0;
+    cons->relay_capacity = 0;
+    moor_node_descriptor_t *old = cons->relays;
+    cons->relays = NULL;
+    if (old) free(old);
+    (void)old_num;
 }
 
 int moor_consensus_copy(moor_consensus_t *dst, const moor_consensus_t *src) {
-    /* Free old relay array if present */
-    if (dst->relays) free(dst->relays);
+    /* F-02: build into a fresh array and publish it together with the new
+     * count, freeing the old array only afterward. The previous code freed
+     * dst->relays and left it dangling for ~10 field assignments plus a
+     * calloc, and refreshed num_relays inside that window -- any concurrent
+     * reader indexed freed heap. This new order removes the dangling window;
+     * combined with the readers taking the consensus rwlock (see dht.c,
+     * socks5.c, main.c HS refresh) it makes the operation safe. */
+    uint32_t cap = src->num_relays > 0 ? src->num_relays : 1;
+    moor_node_descriptor_t *nr = calloc(cap, sizeof(*nr));
+    if (!nr) {
+        return -1;
+    }
+    if (src->num_relays > 0 && src->relays) {
+        memcpy(nr, src->relays, src->num_relays * sizeof(*nr));
+    }
 
-    /* Copy fixed fields */
+    /* Install fixed fields + new array + count atomically with respect to the
+     * pointer/count pair a reader sees. */
     dst->valid_after = src->valid_after;
     dst->fresh_until = src->fresh_until;
     dst->valid_until = src->valid_until;
-    dst->num_relays = src->num_relays;
     dst->num_da_sigs = src->num_da_sigs;
     memcpy(dst->da_sigs, src->da_sigs, sizeof(dst->da_sigs));
     memcpy(dst->srv_current, src->srv_current, 32);
     memcpy(dst->srv_previous, src->srv_previous, 32);
 
-    /* Allocate and copy relay array */
-    uint32_t cap = src->num_relays > 0 ? src->num_relays : 1;
-    dst->relays = calloc(cap, sizeof(moor_node_descriptor_t));
-    if (!dst->relays) {
-        dst->num_relays = 0;
-        dst->relay_capacity = 0;
-        return -1;
-    }
+    moor_node_descriptor_t *old = dst->relays;
+    dst->relays = nr;
     dst->relay_capacity = cap;
-    if (src->num_relays > 0 && src->relays)
-        memcpy(dst->relays, src->relays,
-               src->num_relays * sizeof(moor_node_descriptor_t));
+    dst->num_relays = src->num_relays;
+    if (old) free(old);
     return 0;
 }
 
@@ -736,21 +747,28 @@ int moor_consensus_serialize(uint8_t *out, size_t out_len,
         /* k <b64(kem_pk)> -- only if PQ-capable */
         if (d->features & NODE_FEATURE_PQ) {
             char *kem_b64 = malloc(sodium_base64_ENCODED_LEN(1184, sodium_base64_VARIANT_ORIGINAL));
-            if (kem_b64) {
-                b64enc(kem_b64,
-                       sodium_base64_ENCODED_LEN(1184, sodium_base64_VARIANT_ORIGINAL),
-                       d->kem_pk, 1184);
-                size_t klen = strlen(kem_b64);
-                /* "k " + b64 + "\n" */
-                if (off + 2 + klen + 1 <= out_len) {
-                    out[off++] = 'k';
-                    out[off++] = ' ';
-                    memcpy(out + off, kem_b64, klen);
-                    off += klen;
-                    out[off++] = '\n';
-                }
-                free(kem_b64);
+            if (!kem_b64) {
+                /* F-07: was silently skipped on allocation failure, which
+                 * could emit a relay advertising NODE_FEATURE_PQ in the w
+                 * line with no k line -- clients then see a PQ-capable relay
+                 * with an all-zero kem_pk and CREATE_PQ fails. Abort instead. */
+                return -1;
             }
+            b64enc(kem_b64,
+                   sodium_base64_ENCODED_LEN(1184, sodium_base64_VARIANT_ORIGINAL),
+                   d->kem_pk, 1184);
+            /* F-07: this line is ~1583 bytes and is the first thing that
+             * overflows a tight buffer. The previous code silently skipped it
+             * when it did not fit, producing a subtly wrong document. Every
+             * other field uses bcat() which returns -1 on overflow; this one
+             * must do the same so the caller grows/retries instead of serving
+             * a document missing the KEM key. */
+            out[off++] = 'k';
+            out[off++] = ' ';
+            if (bcat(out, out_len, &off, kem_b64) < 0) { free(kem_b64); return -1; }
+            if (off + 1 > out_len) { free(kem_b64); return -1; }
+            out[off++] = '\n';
+            free(kem_b64);
         }
 
         /* s Flag1 Flag2 ... (alphabetical) */
@@ -980,11 +998,23 @@ int moor_consensus_deserialize(moor_consensus_t *cons,
         else if (strncmp(line, "known-flags ", 12) == 0) {
             continue; /* informational */
         }
-        else if (strncmp(line, "shared-rand-current-value ", 25) == 0) {
-            b64dec(cons->srv_current, 32, line + 25, strlen(line + 25));
+        else if (strncmp(line, "shared-rand-current-value ", 26) == 0) {
+            /* F-04: the literal "shared-rand-current-value " is 26 bytes
+             * including the trailing space; the previous length of 25 left
+             * line+26 pointing at the space, which libsodium rejects, so
+             * srv_current parsed as all-zero network-wide and the HSDIR ring
+             * became predictable. The sibling "previous-value" line below
+             * already used the correct 27. */
+            if (b64dec(cons->srv_current, 32, line + 26, strlen(line + 26)) == 0) {
+                LOG_WARN("consensus: malformed shared-rand-current-value -- rejected");
+                return -1;
+            }
         }
         else if (strncmp(line, "shared-rand-previous-value ", 27) == 0) {
-            b64dec(cons->srv_previous, 32, line + 27, strlen(line + 27));
+            if (b64dec(cons->srv_previous, 32, line + 27, strlen(line + 27)) == 0) {
+                LOG_WARN("consensus: malformed shared-rand-previous-value -- rejected");
+                return -1;
+            }
         }
         /* Relay entry start: "n <nickname> <b64(id)> <time> <IP> <ORport> <DirPort>" */
         else if (line[0] == 'n' && line[1] == ' ' && !in_footer) {
@@ -1106,12 +1136,28 @@ int moor_consensus_deserialize(moor_consensus_t *cons,
         /* DA Ed25519 signature: "directory-signature <b64(pk)> <b64(sig)>" */
         else if (strncmp(line, "directory-signature ", 19) == 0 && in_footer) {
             if (cons->num_da_sigs >= MOOR_MAX_DA_AUTHORITIES) continue;
-            uint32_t si = cons->num_da_sigs++;
-
             char pk_b64[64], sig_b64[128];
             if (sscanf(line + 19, "%63s %127s", pk_b64, sig_b64) >= 2) {
-                b64dec(cons->da_sigs[si].identity_pk, 32,
-                       pk_b64, strlen(pk_b64));
+                uint8_t pk[32];
+                b64dec(pk, 32, pk_b64, strlen(pk_b64));
+                /* F-03: reject duplicate DA identity — a single authority's
+                 * signature must not be counted more than once toward the
+                 * majority threshold. Drop repeats silently (they are either
+                 * a malformed consensus or a deliberate threshold-attack). */
+                int dup = 0;
+                for (uint32_t k = 0; k < cons->num_da_sigs; k++) {
+                    if (sodium_memcmp(cons->da_sigs[k].identity_pk, pk, 32) == 0) {
+                        dup = 1;
+                        break;
+                    }
+                }
+                if (dup) {
+                    LOG_WARN("consensus: duplicate directory-signature for "
+                             "identity pk %02x%02x... -- dropped", pk[0], pk[1]);
+                    continue;
+                }
+                uint32_t si = cons->num_da_sigs++;
+                memcpy(cons->da_sigs[si].identity_pk, pk, 32);
                 b64dec(cons->da_sigs[si].signature, 64,
                        sig_b64, strlen(sig_b64));
                 cons->da_sigs[si].has_pq = 0;
@@ -1641,19 +1687,24 @@ const moor_node_descriptor_t *moor_node_select_relay_pq(
 }
 
 size_t moor_consensus_wire_size(const moor_consensus_t *cons) {
-    /* Text format: generous upper bound.
-     * Header: ~512 bytes
-     * Per relay: n(200) + o(50) + k(1600) + s(100) + w(50) + g(20) + f(50) + p(100) ≈ 2200
-     * Per DA sig: directory-signature(200) + pq-directory-signature(8192) ≈ 8400
-     * Footer: 32 */
-    size_t sz = 512;
-    sz += (size_t)cons->num_relays * 2200;
+    /* F-07: the previous estimate (2200/relay, k budgeted at 1600) was an
+     * under-bound. The k line alone is a base64 ML-KEM-768 pk:
+     *   sodium_base64_ENCODED_LEN(1184, ORIGINAL) = 1580 chars + "k " + "\n" = 1583
+     * which already consumes the 1600 allowance and must also cover every
+     * other field's shortfall. Worst case from the serializer with all
+     * optional fields at full width is ~2306 bytes/relay:
+     *   n(175) o(47) a(66) k(1583) s(68) w(83) g(16) f(47) p(91) c(130)
+     * Round up generously and add per-relay margin so a fully-populated
+     * network cannot freeze the published snapshot (an oversized serialize
+     * otherwise fails and the DA keeps serving stale consensus forever). */
+    size_t sz = 512 + 64; /* header + bandwidth-weights line + footer */
+    sz += (size_t)cons->num_relays * 2400;
     for (uint32_t i = 0; i < cons->num_da_sigs && i < MOOR_MAX_DA_AUTHORITIES; i++) {
         sz += 256; /* directory-signature line */
         if (cons->da_sigs[i].has_pq)
             sz += 8192; /* PQ pk + sig in base64 */
     }
-    sz += 64; /* footer + slack */
+    sz += 256; /* slack */
     return sz;
 }
 

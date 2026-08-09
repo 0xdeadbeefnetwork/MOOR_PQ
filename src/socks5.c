@@ -36,6 +36,12 @@
 static moor_socks5_config_t g_socks5_config;
 static moor_socks5_client_t g_socks5_clients[MAX_SOCKS5_CLIENTS];
 static moor_consensus_t g_client_consensus = {0};
+/* F-02(b): rwlock mirroring the relay consensus lock. The client consensus
+ * is mutated from the detached client_consensus_refresh_thread (main.c) and
+ * read on the main thread by circuit building / path selection / the HS
+ * connect worker. Readers take the read lock for the duration of any
+ * dereference of g_client_consensus.relays[] or num_relays. */
+static pthread_rwlock_t g_client_consensus_lock = PTHREAD_RWLOCK_INITIALIZER;
 
 /* Bridge mode globals (defined in main.c) */
 extern int g_use_bridges;
@@ -363,9 +369,24 @@ static int g_consecutive_build_failures = 0;
 
 static prebuilt_entry_t *prebuilt_pop(void); /* forward decl */
 
-/* No locking needed -- everything is single-threaded now */
+/* F-02(b): the client consensus is written from client_consensus_refresh_thread
+ * (a detached background thread, main.c) and read on the main thread. The
+ * previous "No locking needed -- everything is single-threaded now" comment
+ * was stale the moment that thread was introduced. moor_consensus_copy() now
+ * builds-then-swaps, so a racy reader cannot see a dangling relays pointer,
+ * but it could still observe a torn num_relays / relays pair unless we lock. */
+void moor_socks5_consensus_rdlock(void) {
+    pthread_rwlock_rdlock(&g_client_consensus_lock);
+}
+void moor_socks5_consensus_unlock(void) {
+    pthread_rwlock_unlock(&g_client_consensus_lock);
+}
+
 int moor_socks5_update_consensus(const moor_consensus_t *fresh) {
-    return moor_consensus_copy(&g_client_consensus, fresh);
+    pthread_rwlock_wrlock(&g_client_consensus_lock);
+    int ret = moor_consensus_copy(&g_client_consensus, fresh);
+    pthread_rwlock_unlock(&g_client_consensus_lock);
+    return ret;
 }
 
 /* Assign prebuilt circuits to BUILDING clearnet clients */
@@ -507,19 +528,36 @@ static void prebuilt_build_complete(moor_circuit_t *circ, int status, void *arg)
 static void prebuilt_timer_cb(void *arg) {
     (void)arg;
 
-    if (g_client_consensus.num_relays < 3) return;
-    if (g_inflight_builds >= MAX_CONCURRENT_BUILDS) return;
+    /* F-02(b): take the read lock for the num_relays check AND the subsequent
+     * build, so the consensus cannot be swapped out from under the build
+     * function while it is mid-path-selection. */
+    moor_socks5_consensus_rdlock();
+    if (g_client_consensus.num_relays < 3) {
+        moor_socks5_consensus_unlock();
+        return;
+    }
+    if (g_inflight_builds >= MAX_CONCURRENT_BUILDS) {
+        moor_socks5_consensus_unlock();
+        return;
+    }
     /* Tor-aligned: keep PREEMPTIVE_MIN clean circuits, not a hard max.
      * The pool CAN grow beyond this if on-demand builds push into it,
      * but the timer only proactively builds to maintain the minimum. */
-    if (g_prebuilt_pool_count + g_inflight_builds >= MOOR_PREEMPTIVE_MIN) return;
-    if (g_prebuilt_pool_count >= PREBUILT_POOL_SIZE) return; /* OOM safety */
+    if (g_prebuilt_pool_count + g_inflight_builds >= MOOR_PREEMPTIVE_MIN) {
+        moor_socks5_consensus_unlock();
+        return;
+    }
+    if (g_prebuilt_pool_count >= PREBUILT_POOL_SIZE) { /* OOM safety */
+        moor_socks5_consensus_unlock();
+        return;
+    }
 
     moor_connection_t *conn = moor_connection_alloc();
     moor_circuit_t *circ = moor_circuit_alloc();
     if (!conn || !circ) {
         if (conn) moor_connection_free(conn);
         if (circ) moor_circuit_free(circ);
+        moor_socks5_consensus_unlock();
         return;
     }
 
@@ -532,6 +570,7 @@ static void prebuilt_timer_cb(void *arg) {
             LOG_WARN("bridge build already in progress, skipping to avoid event loop stacking");
             moor_circuit_free(circ);
             moor_connection_free(conn);
+            moor_socks5_consensus_unlock();
             return;
         }
         g_bridge_build_in_progress = 1;
@@ -542,6 +581,7 @@ static void prebuilt_timer_cb(void *arg) {
             g_bridge_build_in_progress = 0;
             moor_circuit_free(circ);
             moor_connection_free(conn);
+            moor_socks5_consensus_unlock();
             /* Track failure for backoff */
             g_consecutive_build_failures++;
             prebuilt_adjust_interval();
@@ -558,9 +598,11 @@ static void prebuilt_timer_cb(void *arg) {
                                       prebuilt_build_complete, NULL) != 0) {
             moor_circuit_free(circ);
             moor_connection_free(conn);
+            moor_socks5_consensus_unlock();
             return;
         }
     }
+    moor_socks5_consensus_unlock();
 
     g_inflight_builds++;
 }
@@ -1071,39 +1113,44 @@ static circuit_cache_entry_t *get_circuit_for_domain(const char *domain,
     /* Pool empty -- return NULL so caller enters SOCKS5_STATE_BUILDING.
      * The prebuilt timer will fill the pool asynchronously.  Kick an
      * immediate build to minimize wait time for the first request. */
-    if (g_inflight_builds < MAX_CONCURRENT_BUILDS &&
-        g_client_consensus.num_relays >= 3) {
-        moor_connection_t *bc = moor_connection_alloc();
-        moor_circuit_t *bcirc = moor_circuit_alloc();
-        if (bc && bcirc) {
-            int built = 0;
-            if (g_use_bridges && g_config.num_bridges > 0) {
-                if (moor_circuit_build_bridge(bcirc, bc, &g_client_consensus,
-                                               g_socks5_config.identity_pk,
-                                               g_socks5_config.identity_sk,
-                                               &g_config.bridges[0], 0) == 0) {
-                    prebuilt_build_complete(bcirc, 0, NULL);
-                    built = 1;
+    if (g_inflight_builds < MAX_CONCURRENT_BUILDS) {
+        /* F-02(b): hold the read lock across the num_relays check and the
+         * build call so the consensus cannot be swapped mid-build. */
+        moor_socks5_consensus_rdlock();
+        if (g_client_consensus.num_relays >= 3) {
+            moor_connection_t *bc = moor_connection_alloc();
+            moor_circuit_t *bcirc = moor_circuit_alloc();
+            if (bc && bcirc) {
+                int built = 0;
+                if (g_use_bridges && g_config.num_bridges > 0) {
+                    if (moor_circuit_build_bridge(bcirc, bc, &g_client_consensus,
+                                                   g_socks5_config.identity_pk,
+                                                   g_socks5_config.identity_sk,
+                                                   &g_config.bridges[0], 0) == 0) {
+                        prebuilt_build_complete(bcirc, 0, NULL);
+                        built = 1;
+                    }
+                } else {
+                    if (moor_circuit_build_async(bcirc, bc, &g_client_consensus,
+                                                  g_socks5_config.identity_pk,
+                                                  g_socks5_config.identity_sk,
+                                                  prebuilt_build_complete, NULL) == 0) {
+                        built = 1;
+                    }
+                }
+                if (built) {
+                    g_inflight_builds++;
+                    LOG_INFO("on-demand async circuit build started");
+                } else {
+                    moor_circuit_free(bcirc);
+                    moor_connection_free(bc);
                 }
             } else {
-                if (moor_circuit_build_async(bcirc, bc, &g_client_consensus,
-                                              g_socks5_config.identity_pk,
-                                              g_socks5_config.identity_sk,
-                                              prebuilt_build_complete, NULL) == 0) {
-                    built = 1;
-                }
+                if (bc) moor_connection_free(bc);
+                if (bcirc) moor_circuit_free(bcirc);
             }
-            if (built) {
-                g_inflight_builds++;
-                LOG_INFO("on-demand async circuit build started");
-            } else {
-                moor_circuit_free(bcirc);
-                moor_connection_free(bc);
-            }
-        } else {
-            if (bc) moor_connection_free(bc);
-            if (bcirc) moor_circuit_free(bcirc);
         }
+        moor_socks5_consensus_unlock();
     }
     return NULL;  /* caller sets SOCKS5_STATE_BUILDING */
 }
@@ -2187,7 +2234,12 @@ int moor_socks5_handle_request(moor_socks5_client_t *client,
                 snprintf(w->da_address, sizeof(w->da_address), "%s", g_socks5_config.da_address);
                 w->da_port = g_socks5_config.da_port;
                 memset(&w->cons, 0, sizeof(w->cons));
-                if (moor_consensus_copy(&w->cons, &g_client_consensus) != 0) {
+                /* F-02(b): snapshot the consensus under the read lock so the
+                 * background refresh thread cannot swap it mid-copy. */
+                moor_socks5_consensus_rdlock();
+                int cc = moor_consensus_copy(&w->cons, &g_client_consensus);
+                moor_socks5_consensus_unlock();
+                if (cc != 0) {
                     LOG_WARN("HS: consensus copy failed for %s", client->target_addr);
                     moor_consensus_cleanup(&w->cons);
                     free(w);

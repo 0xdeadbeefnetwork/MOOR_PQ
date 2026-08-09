@@ -75,12 +75,25 @@
 #define MOOR_DOS_CELL_BURST_PER_CIRCUIT 200     /* Burst per circuit */
 #define MOOR_DOS_CELL_RATE_PER_CONN     1000    /* Cells/sec per connection */
 #define MOOR_DOS_CELL_BURST_PER_CONN    2000    /* Burst per connection */
-#define MOOR_POW_DEFAULT_DIFFICULTY     8       /* PoW leading zero bits (Argon2id) */
+/* F-05: was 8 bits (~256 Argon2id evaluations per identity) -- typo-level
+ * anti-flood value that makes bulk Sybil registration near-free. 20 bits is
+ * ~1M evaluations per identity; combined with the per-identity epoch salt
+ * (pow.c:288-290) that forces a fresh solve per Sybil, this makes registering
+ * thousands of relays expensive enough to deter the guard/exit capture attack
+ * described in F-05. Tune upward on commodity hardware as needed. */
+#define MOOR_POW_DEFAULT_DIFFICULTY     20      /* PoW leading zero bits (Argon2id) */
 #define MOOR_POW_TIMESTAMP_WINDOW       300     /* PoW validity (5min, was 1h -- see CWE-330 fix) */
 #define MOOR_POW_MEMLIMIT_DEFAULT       (256U * 1024U)  /* Argon2id memory: 256 KB */
 #define MOOR_POW_MEMLIMIT_MIN           (8U * 1024U)
 #define MOOR_POW_MEMLIMIT_MAX           (64U * 1024U * 1024U)  /* 64 MB */
 #define MOOR_POW_OPSLIMIT              1       /* Argon2id ops (1 pass) */
+
+/* F-05: bandwidth cap applied to unmeasured relays (measured == 0). A fresh
+ * relay could previously claim any self-reported bandwidth and be weighted
+ * heavily in path selection. The cap is low (100 KB/s) so unmeasured relays
+ * cannot dominate selection but remain usable while the DA prioritizes
+ * measuring them. Mirrors Tor's floor for unmeasured relays. */
+#define MOOR_DA_UNMEASURED_BW_CAP      (100U * 1024U)  /* 100 KB/s */
 
 /* ===== INTERNAL -- OOM (soft threshold, never blocks allocation) ===== */
 #define MOOR_MAX_PQ_EXTEND_INFLIGHT 4   /* Max concurrent EXTEND_PQ operations */

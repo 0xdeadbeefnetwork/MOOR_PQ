@@ -874,25 +874,53 @@ static int mirage_server_handshake(int fd, const void *params,
 
     /* Replay cache: reject replayed ClientHello ephemeral keys (CWE-294).
      * Without this, an attacker can record a valid ClientHello and replay
-     * it to confirm the server is a MOOR relay. */
+     * it to confirm the server is a MOOR relay.
+     * F-10: eviction is now age-based, not index-based. The previous ring
+     * buffer overwrote entries in insertion order, so 256 fresh connections
+     * (seconds of work, no crypto) flushed any captured ClientHello and the
+     * replay then succeeded. We now reuse the oldest expired slot, and if
+     * none has expired we fail closed -- degrading availability under flood
+     * rather than silently dropping the security property. */
     {
         #define MIRAGE_REPLAY_CACHE_SIZE 256
         #define MIRAGE_REPLAY_TTL_SECS   600
         static struct { uint8_t key[32]; uint64_t timestamp; } replay_cache[MIRAGE_REPLAY_CACHE_SIZE];
-        static int replay_idx = 0;
         static pthread_mutex_t replay_mutex = PTHREAD_MUTEX_INITIALIZER;
         pthread_mutex_lock(&replay_mutex);
         uint64_t now = (uint64_t)time(NULL);
+        int expired_slot = -1;
+        uint64_t oldest_ts = now;
+        int oldest_slot = 0;
         for (int r = 0; r < MIRAGE_REPLAY_CACHE_SIZE; r++) {
-            if (now - replay_cache[r].timestamp < MIRAGE_REPLAY_TTL_SECS &&
+            if (replay_cache[r].timestamp != 0 &&
+                now - replay_cache[r].timestamp < MIRAGE_REPLAY_TTL_SECS &&
                 sodium_memcmp(replay_cache[r].key, client_eph_pk, 32) == 0) {
                 pthread_mutex_unlock(&replay_mutex);
                 return -1; /* replay detected */
             }
+            /* Prefer a genuinely expired slot (timestamp==0 counts as empty). */
+            if (replay_cache[r].timestamp == 0 ||
+                now - replay_cache[r].timestamp >= MIRAGE_REPLAY_TTL_SECS) {
+                expired_slot = r;
+                break;
+            }
+            if (replay_cache[r].timestamp < oldest_ts) {
+                oldest_ts = replay_cache[r].timestamp;
+                oldest_slot = r;
+            }
         }
-        memcpy(replay_cache[replay_idx].key, client_eph_pk, 32);
-        replay_cache[replay_idx].timestamp = now;
-        replay_idx = (replay_idx + 1) % MIRAGE_REPLAY_CACHE_SIZE;
+        int slot = expired_slot;
+        if (slot < 0) {
+            /* Cache full of live entries: fail closed. Rejecting the handshake
+             * under sustained flood is the correct trade -- it costs the
+             * attacker continuous work to keep the cache full, and never
+             * lets a replay through. */
+            pthread_mutex_unlock(&replay_mutex);
+            return -1;
+        }
+        (void)oldest_slot; (void)oldest_ts;
+        memcpy(replay_cache[slot].key, client_eph_pk, 32);
+        replay_cache[slot].timestamp = now;
         pthread_mutex_unlock(&replay_mutex);
     }
 

@@ -335,9 +335,14 @@ static void upstream_dispatch(dns_conn_t *c) {
     /* Build upstream query with randomized TXID + stripped ECS. */
     size_t qlen = c->cbuf_have - 2;
     uint8_t *q = c->cbuf + 2;
-    /* Randomize upstream TXID (16 bits). */
-    unsigned long r = (unsigned long)rand();
-    c->up_txid = (uint16_t)((r ^ (r >> 16)) & 0xFFFF);
+    /* Randomize upstream TXID (16 bits).
+     * F-08: was (unsigned long)rand() with no srand() anywhere in the tree,
+     * so the sequence was srand(1) -- identical on every node and every run,
+     * which fingerprints MOOR instances and lets an on-path injector predict
+     * the TXID for forged responses. Draw from libsodium instead. */
+    uint16_t txid;
+    moor_crypto_random((uint8_t *)&txid, sizeof(txid));
+    c->up_txid = txid;
     q[0] = (uint8_t)(c->up_txid >> 8);
     q[1] = (uint8_t)(c->up_txid);
     strip_ecs(q, &qlen);

@@ -37,8 +37,13 @@ void moor_bw_auth_cleanup(moor_bw_auth_state_t *state) {
 }
 
 uint64_t moor_bw_auth_effective(uint64_t self_reported, uint64_t measured) {
-    if (measured == 0)
-        return self_reported;
+    if (measured == 0) {
+        /* F-05: cap unmeasured relays so a fresh relay cannot claim an
+         * arbitrarily large bandwidth and dominate bandwidth-weighted path
+         * selection. Returns min(self_reported, DA_UNMEASURED_BW_CAP). */
+        return self_reported < MOOR_DA_UNMEASURED_BW_CAP
+                   ? self_reported : MOOR_DA_UNMEASURED_BW_CAP;
+    }
 
     uint64_t cap = (uint64_t)((double)measured * MOOR_BW_TOLERANCE);
     if (self_reported <= cap)

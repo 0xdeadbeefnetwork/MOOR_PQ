@@ -2075,8 +2075,18 @@ static uint16_t find_relay_dir_port(const moor_consensus_t *cons,
  * our IP to arbitrary relays.  Falls back to any running guard with
  * dir_port if the client has no established guards yet. */
 static int fetch_consensus_via_dir_guard(moor_consensus_t *fresh) {
+    /* F-02(b): hold the client consensus read lock across all dereferences of
+     * `current`. This function runs on client_consensus_refresh_thread, which
+     * is also the writer -- but the wrlock (in moor_socks5_update_consensus)
+     * is only taken after this function returns, so no self-deadlock. */
+    extern void moor_socks5_consensus_rdlock(void);
+    extern void moor_socks5_consensus_unlock(void);
+    moor_socks5_consensus_rdlock();
     moor_consensus_t *current = moor_socks5_get_consensus();
-    if (!current || current->num_relays == 0) return -1;
+    if (!current || current->num_relays == 0) {
+        moor_socks5_consensus_unlock();
+        return -1;
+    }
 
     /* Prefer microdesc if the client bootstrapped via it. Mirrors that run
      * this codebase serve both CONSENSUS and MICRODESC from the same cache. */
@@ -2092,6 +2102,7 @@ static int fetch_consensus_via_dir_guard(moor_consensus_t *fresh) {
             char addr[64];
             uint16_t dp = find_relay_dir_port(current, g->identity_pk, addr, sizeof(addr));
             if (dp == 0) continue;
+            moor_socks5_consensus_unlock();
             int rc = md
                 ? moor_client_fetch_consensus_via_microdesc(fresh, addr, dp)
                 : moor_client_fetch_consensus(fresh, addr, dp);
@@ -2100,6 +2111,10 @@ static int fetch_consensus_via_dir_guard(moor_consensus_t *fresh) {
                          addr, dp, md ? "microdesc" : "full");
                 return 0;
             }
+            moor_socks5_consensus_rdlock();
+            /* Re-validate current after re-lock -- it may have been swapped. */
+            current = moor_socks5_get_consensus();
+            if (!current) { moor_socks5_consensus_unlock(); return -1; }
         }
         for (int c = 0; c < gs->num_confirmed; c++) {
             int idx = gs->confirmed_indices[c];
@@ -2108,6 +2123,7 @@ static int fetch_consensus_via_dir_guard(moor_consensus_t *fresh) {
             char addr[64];
             uint16_t dp = find_relay_dir_port(current, g->identity_pk, addr, sizeof(addr));
             if (dp == 0) continue;
+            moor_socks5_consensus_unlock();
             int rc = md
                 ? moor_client_fetch_consensus_via_microdesc(fresh, addr, dp)
                 : moor_client_fetch_consensus(fresh, addr, dp);
@@ -2116,6 +2132,9 @@ static int fetch_consensus_via_dir_guard(moor_consensus_t *fresh) {
                          addr, dp, md ? "microdesc" : "full");
                 return 0;
             }
+            moor_socks5_consensus_rdlock();
+            current = moor_socks5_get_consensus();
+            if (!current) { moor_socks5_consensus_unlock(); return -1; }
         }
     }
 
@@ -2127,15 +2146,23 @@ static int fetch_consensus_via_dir_guard(moor_consensus_t *fresh) {
         if (!(r->flags & NODE_FLAG_RUNNING)) continue;
         if (r->dir_port == 0) continue;
 
+        char addr[64];
+        snprintf(addr, sizeof(addr), "%s", r->address);
+        uint16_t dport = r->dir_port;
+        moor_socks5_consensus_unlock();
         int rc = md
-            ? moor_client_fetch_consensus_via_microdesc(fresh, r->address, r->dir_port)
-            : moor_client_fetch_consensus(fresh, r->address, r->dir_port);
+            ? moor_client_fetch_consensus_via_microdesc(fresh, addr, dport)
+            : moor_client_fetch_consensus(fresh, addr, dport);
         if (rc == 0) {
             LOG_INFO("consensus fetched via directory guard %s:%u (%s)",
-                     r->address, r->dir_port, md ? "microdesc" : "full");
+                     addr, dport, md ? "microdesc" : "full");
             return 0;
         }
+        moor_socks5_consensus_rdlock();
+        current = moor_socks5_get_consensus();
+        if (!current) { moor_socks5_consensus_unlock(); return -1; }
     }
+    moor_socks5_consensus_unlock();
     return -1;
 }
 
@@ -2219,10 +2246,17 @@ static void consensus_refresh_cb(void *arg) {
     /* Schedule next refresh based on fresh_until — don't wait a fixed hour.
      * Fetch new consensus at 75% of remaining freshness, minimum 30s.
      * This prevents the "fetched at :58, stale at :00" problem. */
+    /* F-02(b): snapshot the freshness fields under the read lock. */
+    extern void moor_socks5_consensus_rdlock(void);
+    extern void moor_socks5_consensus_unlock(void);
+    moor_socks5_consensus_rdlock();
     moor_consensus_t *live = moor_socks5_get_consensus();
+    uint64_t live_fresh = live ? live->fresh_until : 0;
+    uint64_t live_valid = live ? live->valid_until : 0;
+    moor_socks5_consensus_unlock();
     if (live && g_consensus_timer_id >= 0) {
         uint64_t now = (uint64_t)time(NULL);
-        uint64_t upper = live->fresh_until > 0 ? live->fresh_until : live->valid_until;
+        uint64_t upper = live_fresh > 0 ? live_fresh : live_valid;
         uint64_t next_ms;
         if (now >= upper) {
             /* Already stale — retry fast */
@@ -2266,11 +2300,17 @@ static int run_client(void) {
      * On first run, samples fresh guards.  On restart, preserves
      * existing guards and only fills gaps. */
     {
+        /* F-02(b): guard sampling iterates the consensus relays; hold the
+         * read lock across moor_guard_sample so the array stays valid. */
+        extern void moor_socks5_consensus_rdlock(void);
+        extern void moor_socks5_consensus_unlock(void);
+        moor_socks5_consensus_rdlock();
         const moor_consensus_t *cons = moor_socks5_get_consensus();
         if (cons && cons->num_relays > 0) {
             moor_guard_sample(moor_pathbias_get_state(), cons);
             moor_guard_update_primary(moor_pathbias_get_state());
         }
+        moor_socks5_consensus_unlock();
     }
 
     /* Auto-discover local CDN domains for ShitStorm/Mirage SNI pool.
@@ -2314,12 +2354,20 @@ static int run_client(void) {
 
     /* Periodic consensus refresh — schedule based on fresh_until, not fixed.
      * Fetches at 75% of remaining freshness to always stay ahead of expiry. */
-    g_live_consensus = moor_socks5_get_consensus();
+    g_live_consensus = moor_socks5_get_consensus();  /* set once at startup; used as a non-NULL flag elsewhere */
     {
+        /* F-02(b): snapshot fresh_until under the read lock rather than
+         * dereferencing the pointer after unlock. */
+        extern void moor_socks5_consensus_rdlock(void);
+        extern void moor_socks5_consensus_unlock(void);
+        moor_socks5_consensus_rdlock();
+        uint64_t cons_fresh = (g_live_consensus) ? g_live_consensus->fresh_until : 0;
+        moor_socks5_consensus_unlock();
+
         uint64_t first_ms = MOOR_CONSENSUS_INTERVAL * 1000;  /* fallback */
-        if (g_live_consensus && g_live_consensus->fresh_until > 0) {
+        if (cons_fresh > 0) {
             uint64_t now = (uint64_t)time(NULL);
-            uint64_t upper = g_live_consensus->fresh_until;
+            uint64_t upper = cons_fresh;
             if (now >= upper)
                 first_ms = 30000;  /* already stale, fetch immediately-ish */
             else {
@@ -3227,14 +3275,24 @@ static void *hs_consensus_refresh_thread(void *arg) {
     moor_consensus_t *fresh = calloc(1, sizeof(moor_consensus_t));
     if (!fresh) { __sync_lock_release(&g_hs_cons_refresh_running); return NULL; }
     if (moor_client_fetch_consensus_multi(fresh, g_da_list, g_num_das) == 0) {
-        moor_consensus_cleanup(g_hs_consensus);
-        memcpy(g_hs_consensus, fresh, sizeof(*fresh));
-        fresh->relays = NULL;
-        LOG_INFO("HS: consensus refreshed (%u relays)", g_hs_consensus->num_relays);
+        /* F-02: copy into the live object in one swap. moor_consensus_copy()
+         * now builds the new relay array first and publishes array+count
+         * together, freeing the old array afterward. The previous code did
+         * cleanup() (free + NULL relays, leaving num_relays stale) followed
+         * by a memcpy, which let main-thread intro-point/RP readers observe
+         * an empty consensus mid-refresh and NULL-deref. */
+        if (moor_consensus_copy(g_hs_consensus, fresh) != 0) {
+            LOG_ERROR("HS: consensus copy failed on refresh -- keeping previous");
+        } else {
+            LOG_INFO("HS: consensus refreshed (%u relays)", g_hs_consensus->num_relays);
+        }
         if (g_config.data_dir[0])
             moor_consensus_cache_save(g_hs_consensus, g_config.data_dir);
         for (int h = 0; h < g_config.num_hidden_services || h < 1; h++)
             g_hs_configs[h].cached_consensus = g_hs_consensus;
+        /* moor_consensus_copy built its own array; free the one the fetch
+         * populated before dropping the temporary struct. */
+        moor_consensus_cleanup(fresh);
     } else {
         moor_consensus_cleanup(fresh);
     }
@@ -4413,12 +4471,17 @@ int main(int argc, char **argv) {
 
     if (g_verbose) {
         moor_log_set_level(MOOR_LOG_DEBUG);
+        /* F-09: safe mode is now on by default (log.c), so -v no longer
+         * toggles it on. Keep the explicit call for clarity and in case a
+         * future --unsafe-logging opt-out was applied earlier in parsing. */
         moor_log_set_safe_mode(1);
         fprintf(stderr,
             "\n"
             "  *** WARNING: VERBOSE LOGGING ENABLED ***\n"
-            "  IP addresses and key material are always redacted.\n"
-            "  DO NOT use -v in production.\n"
+            "  IP addresses, key material and .moor targets are redacted by\n"
+            "  default at all log levels. Verbose mode additionally emits\n"
+            "  DEBUG lines which may reveal topology and timing; do not use\n"
+            "  -v in production.\n"
             "\n");
     }
 

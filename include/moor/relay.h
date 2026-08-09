@@ -125,4 +125,13 @@ void moor_relay_cleanup_exit_fds(const moor_circuit_t *circ);
 const uint8_t *moor_relay_get_identity_pk(void);
 const moor_consensus_t *moor_relay_get_consensus(void);
 
+/* F-02: consensus is replaced from a background thread. Callers that deref
+ * the pointer returned by moor_relay_get_consensus() (i.e. anything reading
+ * relays[], srv_current/srv_previous, num_relays) MUST hold the read lock for
+ * the duration of the dereference, so the writer cannot free the old array
+ * out from under them. moor_relay_get_consensus() itself does not take the
+ * lock (the has_consensus flag check is safe without it). */
+void moor_relay_consensus_rdlock(void);
+void moor_relay_consensus_unlock(void);
+
 #endif /* MOOR_RELAY_H */

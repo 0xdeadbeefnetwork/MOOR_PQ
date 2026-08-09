@@ -6,7 +6,11 @@
 #include <ctype.h>
 
 static moor_log_level_t g_log_level = MOOR_LOG_WARN;
-static int g_log_safe_mode = 0; /* 1 = redact IPs and sensitive metadata */
+/* F-09: redaction is on by default. The previous default of 0 meant IP
+ * addresses and .moor targets were emitted unredacted in every production
+ * run (only -v turned safe mode on, inverting the banner's promise). Safe
+ * mode is now opt-out via --unsafe-logging. */
+static int g_log_safe_mode = 1; /* 1 = redact IPs and sensitive metadata */
 
 static const char *level_names[] = {
     "DEBUG", "INFO", "WARN", "ERROR", "FATAL"

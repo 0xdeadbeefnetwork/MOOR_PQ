@@ -87,8 +87,16 @@ int moor_is_moor_address(const char *addr);
 /* Check if address is a Tor .onion address (unsupported by MOOR). */
 int moor_is_tor_onion(const char *addr);
 
-/* Get pointer to client consensus (for direct read on main thread) */
+/* Get pointer to client consensus (for direct read on main thread).
+ * F-02(b): callers that deref the returned pointer's fields (relays[],
+ * num_relays, srv_*) MUST hold the read lock for the duration of the
+ * dereference -- the consensus is refreshed from a background thread. */
 moor_consensus_t *moor_socks5_get_consensus(void);
+
+/* Read/write lock helpers for g_client_consensus. Pair every deref of the
+ * pointer from moor_socks5_get_consensus() with rdlock...unlock. */
+void moor_socks5_consensus_rdlock(void);
+void moor_socks5_consensus_unlock(void);
 
 /* Thread-safe consensus update (locks consensus mutex for builder thread) */
 int moor_socks5_update_consensus(const moor_consensus_t *fresh);

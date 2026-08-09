@@ -929,6 +929,11 @@ int moor_circuit_create(moor_circuit_t *circ,
          * onion_pk — the one we were given might be wrong. */
         int found_alt = 0;
         extern moor_consensus_t *moor_socks5_get_consensus(void);
+        extern void moor_socks5_consensus_rdlock(void);
+        extern void moor_socks5_consensus_unlock(void);
+        /* F-02(b): the consensus can be swapped by the client refresh thread
+         * while we iterate relays[]. Hold the read lock across the loop. */
+        moor_socks5_consensus_rdlock();
         moor_consensus_t *cons = moor_socks5_get_consensus();
         if (cons && cons->relays) {
             for (uint32_t ri = 0; ri < cons->num_relays; ri++) {
@@ -959,6 +964,7 @@ int moor_circuit_create(moor_circuit_t *circ,
                 break;
             }
         }
+        moor_socks5_consensus_unlock();
         if (!found_alt) {
             LOG_ERROR("CKE: auth tag mismatch -- relay identity not proven");
             moor_crypto_wipe(eph_sk, 32);
