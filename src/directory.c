@@ -501,29 +501,67 @@ static int da_add_relay_unlocked(moor_da_config_t *config,
         }
     }
 
+    /* F-05: strip every DA-assigned role flag from the descriptor before it
+     * enters the consensus. Previously a relay set Running/Guard/Exit/Stable/
+     * Fast/BadExit/Authority from its own config and the DA copied the flags
+     * wholesale, so an attacker could self-declare Guard|Exit|Running with a
+     * large bandwidth and be selected for both ends of every circuit. Now only
+     * the self-declared EXIT and MIDDLEONLY bits survive ingest (Exit because
+     * exit-policy verification is a separate larger item; MiddleOnly because it
+     * is an opt-in restriction, not a privilege). Guard is preserved through
+     * the directory.c flag-assignment pass, which already strips it below the
+     * 100-relay threshold. RUNNING and AUTHORITY are never taken from the wire:
+     * RUNNING is set exclusively from probe results, AUTHORITY is a DA-only
+     * role. Fast/Stable/BadExit are recomputed by moor_da_compute_flags_statistical. */
+    moor_node_descriptor_t desc_local = *desc;
+    const uint32_t DA_STRIP_MASK =
+        NODE_FLAG_RUNNING | NODE_FLAG_AUTHORITY | NODE_FLAGS_DA_ASSIGNED;
+    if (desc_local.flags & DA_STRIP_MASK) {
+        LOG_INFO("DA: stripped self-declared role flags 0x%x from %s "
+                 "(Running/Auth/Fast/Stable/BadExit are DA-assigned)",
+                 desc_local.flags & DA_STRIP_MASK, desc_local.nickname);
+    }
+    desc_local.flags &= ~DA_STRIP_MASK;
+    /* From here on, use the sanitized copy (desc_san) instead of the wire
+     * descriptor, so the stripped flags never reach the consensus array. */
+    const moor_node_descriptor_t *desc_san = &desc_local;
+
     /* Check if we already have this relay (update if so) */
     for (uint32_t i = 0; i < config->consensus.num_relays; i++) {
         if (sodium_memcmp(config->consensus.relays[i].identity_pk,
-                         desc->identity_pk, 32) == 0) {
+                         desc_san->identity_pk, 32) == 0) {
             uint64_t saved_first_seen = config->consensus.relays[i].first_seen;
             uint8_t saved_probe_failures = config->consensus.relays[i].probe_failures;
             uint64_t saved_vbw = config->consensus.relays[i].verified_bandwidth;
-            memcpy(&config->consensus.relays[i], desc, sizeof(*desc));
+            uint32_t saved_flags = config->consensus.relays[i].flags;
+            memcpy(&config->consensus.relays[i], desc_san, sizeof(*desc_san));
             config->consensus.relays[i].first_seen = saved_first_seen;
             config->consensus.relays[i].probe_failures = saved_probe_failures;
             config->consensus.relays[i].verified_bandwidth = saved_vbw;
+            /* Preserve previously DA-assigned flags (Running from probes,
+             * Fast/Stable from bandwidth measurement, Guard from the flag
+             * pass, Authority) across a descriptor refresh. Exit follows the
+             * relay's current self-declaration: a relay that drops --exit
+             * already lost the Exit bit when DA_STRIP_MASK was applied above
+             * only to the re-introduced self-declared bits -- since Exit is
+             * NOT in DA_STRIP_MASK, desc_san preserves the relay's current
+             * Exit bit, so nothing extra to do here. */
+            uint32_t keep = saved_flags & (NODE_FLAG_RUNNING | NODE_FLAG_FAST |
+                                           NODE_FLAG_STABLE | NODE_FLAG_BADEXIT |
+                                           NODE_FLAG_GUARD | NODE_FLAG_AUTHORITY);
+            config->consensus.relays[i].flags |= keep;
             /* Track when relay last registered (DA-local, for stale reaper).
-             * Do NOT overwrite desc->published — it's part of the relay's
+             * Do NOT overwrite desc_san->published — it's part of the relay's
              * Ed25519 signature and must be preserved for DA-to-DA sync. */
             config->consensus.relays[i].last_registered = (uint64_t)time(NULL);
             if (g_da_geoip) {
-                const moor_geoip_entry_t *ge = moor_geoip_lookup(g_da_geoip, desc->address);
+                const moor_geoip_entry_t *ge = moor_geoip_lookup(g_da_geoip, desc_san->address);
                 if (ge) {
                     config->consensus.relays[i].country_code = ge->country_code;
                     config->consensus.relays[i].as_number = ge->as_number;
-                } else if (desc->address6[0]) {
+                } else if (desc_san->address6[0]) {
                     /* Fallback: try IPv6 address for country */
-                    uint16_t cc6 = moor_geoip_country_for_addr(g_da_geoip, desc->address6);
+                    uint16_t cc6 = moor_geoip_country_for_addr(g_da_geoip, desc_san->address6);
                     if (cc6) config->consensus.relays[i].country_code = cc6;
                 }
             }
@@ -531,13 +569,13 @@ static int da_add_relay_unlocked(moor_da_config_t *config,
             return 0;
         }
         /* Replace stale entry at same address:port (relay restarted with new keys) */
-        if (strcmp(config->consensus.relays[i].address, desc->address) == 0 &&
-            config->consensus.relays[i].or_port == desc->or_port) {
-            memcpy(&config->consensus.relays[i], desc, sizeof(*desc));
+        if (strcmp(config->consensus.relays[i].address, desc_san->address) == 0 &&
+            config->consensus.relays[i].or_port == desc_san->or_port) {
+            memcpy(&config->consensus.relays[i], desc_san, sizeof(*desc_san));
             config->consensus.relays[i].first_seen = (uint64_t)time(NULL);
             config->consensus.relays[i].last_registered = (uint64_t)time(NULL);
             LOG_INFO("DA: replaced stale relay at %s:%u (new identity key)",
-                     desc->address, desc->or_port);
+                     desc_san->address, desc_san->or_port);
             return 0;
         }
     }
@@ -562,18 +600,18 @@ static int da_add_relay_unlocked(moor_da_config_t *config,
     }
 
     uint32_t idx = config->consensus.num_relays++;
-    memcpy(&config->consensus.relays[idx], desc, sizeof(*desc));
+    memcpy(&config->consensus.relays[idx], desc_san, sizeof(*desc_san));
     config->consensus.relays[idx].first_seen = (uint64_t)time(NULL);
     config->consensus.relays[idx].last_registered = (uint64_t)time(NULL);
 
     /* GeoIP lookup for new relay: try IPv4 first, fall back to IPv6 */
     if (g_da_geoip) {
-        const moor_geoip_entry_t *ge = moor_geoip_lookup(g_da_geoip, desc->address);
+        const moor_geoip_entry_t *ge = moor_geoip_lookup(g_da_geoip, desc_san->address);
         if (ge) {
             config->consensus.relays[idx].country_code = ge->country_code;
             config->consensus.relays[idx].as_number = ge->as_number;
-        } else if (desc->address6[0]) {
-            uint16_t cc6 = moor_geoip_country_for_addr(g_da_geoip, desc->address6);
+        } else if (desc_san->address6[0]) {
+            uint16_t cc6 = moor_geoip_country_for_addr(g_da_geoip, desc_san->address6);
             if (cc6) config->consensus.relays[idx].country_code = cc6;
         }
     }
@@ -1121,10 +1159,18 @@ int moor_consensus_verify_hybrid(const moor_consensus_t *cons,
     size_t body_len = 0;
 
     int verified = 0;
-    int majority = (num_trusted <= 2) ? 1 : (num_trusted / 2) + 1;
+    /* F-03: require a genuine majority of distinct authorities. The previous
+     * "(num_trusted <= 2) ? 1 : ..." exemption collapsed the trust model to a
+     * single authority for the shipped 2-DA config. Two authorities cannot
+     * provide Byzantine fault tolerance regardless, but accepting 1-of-N
+     * means compromise of one host is the whole trust root. */
+    int majority = (num_trusted / 2) + 1;
+    uint8_t counted[MOOR_MAX_DA_AUTHORITIES];
+    memset(counted, 0, sizeof(counted));
 
     for (uint32_t i = 0; i < cons->num_da_sigs; i++) {
         for (int j = 0; j < num_trusted; j++) {
+            if (counted[j]) continue;  /* each trusted key credited at most once */
             if (sodium_memcmp(cons->da_sigs[i].identity_pk,
                              trusted_keys[j].ed25519_pk, 32) == 0) {
                 /* Step 1: Ed25519 verify (cheap, ~10us) */
@@ -1167,6 +1213,7 @@ int moor_consensus_verify_hybrid(const moor_consensus_t *cons,
                 }
 
                 verified++;
+                counted[j] = 1;  /* F-03: don't credit this authority again */
                 break;
             }
         }
@@ -3151,7 +3198,7 @@ int moor_da_probe_relays(moor_da_config_t *config) {
     if (num > MOOR_MAX_RELAYS) num = MOOR_MAX_RELAYS;
 
     typedef struct { char addr[64]; uint16_t port; uint64_t bandwidth;
-                     uint8_t identity_pk[32]; } probe_target_t;
+                     uint8_t identity_pk[32]; int is_exit; } probe_target_t;
     probe_target_t *targets = calloc(num, sizeof(probe_target_t));
     if (!targets) { da_unlock(config); return 0; }
     for (uint32_t i = 0; i < num; i++) {
@@ -3159,12 +3206,15 @@ int moor_da_probe_relays(moor_da_config_t *config) {
                  config->consensus.relays[i].address);
         targets[i].port = config->consensus.relays[i].or_port;
         targets[i].bandwidth = config->consensus.relays[i].bandwidth;
+        targets[i].is_exit =
+            (config->consensus.relays[i].flags & NODE_FLAG_EXIT) != 0;
         memcpy(targets[i].identity_pk, config->consensus.relays[i].identity_pk, 32);
     }
     da_unlock(config);
 
     /* Probe without holding the lock */
-    typedef struct { int alive; uint8_t failures; uint64_t measured_bw; } probe_result_t;
+    typedef struct { int alive; uint8_t failures; uint64_t measured_bw;
+                     int exit_verified; } probe_result_t;
     probe_result_t *results = calloc(num, sizeof(probe_result_t));
     if (!results) { free(targets); return 0; }
 
@@ -3192,6 +3242,33 @@ int moor_da_probe_relays(moor_da_config_t *config) {
                 results[i].measured_bw = bw.measured_bw;
                 measured++;
             }
+            /* F-05: active exit verification. A relay that self-declares Exit
+             * must actually be running the mandatory exit-notice HTTP server
+             * on port 80 (README: "every exit relay serves an HTTP notice on
+             * :80"). If the notice port is unreachable, the relay is either
+             * misconfigured, not actually an exit, or hostile -- in all cases
+             * it must not be selected as an exit. We connect and read a byte;
+             * any HTTP response (begins "HTTP") counts as verified. This is a
+             * lighter-weight stand-in for a full Tor-style exit canary scan,
+             * which requires DA circuit-building capability not yet present. */
+            if (targets[i].is_exit) {
+                int nfd = moor_tcp_connect_simple(targets[i].addr, 80);
+                if (nfd >= 0) {
+                    moor_setsockopt_timeo(nfd, SO_SNDTIMEO, 3);
+                    moor_setsockopt_timeo(nfd, SO_RCVTIMEO, 3);
+                    send(nfd, "GET / HTTP/1.0\r\n\r\n", 18, MSG_NOSIGNAL);
+                    char nbuf[16];
+                    ssize_t nn = recv(nfd, nbuf, sizeof(nbuf), 0);
+                    close(nfd);
+                    if (nn >= 5 && memcmp(nbuf, "HTTP/", 5) == 0)
+                        results[i].exit_verified = 1;
+                }
+                if (!results[i].exit_verified) {
+                    LOG_WARN("DA probe: exit relay %s:%u did not serve the "
+                             "mandatory exit-notice on :80 -- will be flagged "
+                             "BadExit", targets[i].addr, targets[i].port);
+                }
+            }
         }
     }
 
@@ -3204,6 +3281,24 @@ int moor_da_probe_relays(moor_da_config_t *config) {
             continue;
         if (results[i].alive) {
             relay->probe_failures = 0;
+            /* F-05: RUNNING is DA-assigned, set from probe success. It was
+             * previously taken straight from the relay's self-declared
+             * descriptor, so any fresh relay could claim it. */
+            relay->flags |= NODE_FLAG_RUNNING;
+            /* F-05: an Exit relay that did not pass exit-notice verification
+             * is flagged BadExit and loses the Exit bit, so it cannot be
+             * selected for the exit position. Exit is now earned by active
+             * verification, not self-declaration. */
+            if (relay->flags & NODE_FLAG_EXIT) {
+                if (results[i].exit_verified) {
+                    relay->flags &= ~NODE_FLAG_BADEXIT;
+                } else {
+                    relay->flags |= NODE_FLAG_BADEXIT;
+                    relay->flags &= ~NODE_FLAG_EXIT;
+                    LOG_WARN("DA probe: %s:%u stripped Exit (notice port :80 "
+                             "unreachable)", relay->address, relay->or_port);
+                }
+            }
             if (results[i].measured_bw > 0) {
                 uint64_t cap = relay->bandwidth * 2;
                 if (cap < 1000000) cap = 1000000;
@@ -3216,6 +3311,11 @@ int moor_da_probe_relays(moor_da_config_t *config) {
             }
         } else {
             relay->probe_failures++;
+            /* Clear RUNNING as soon as a probe fails; a relay that is not
+             * reachable must not be selected for path-building. The previous
+             * code only evicted after 3 consecutive failures, leaving the
+             * self-declared RUNNING bit intact in the meantime. */
+            relay->flags &= ~NODE_FLAG_RUNNING;
             if (relay->probe_failures >= 3) {
                 LOG_WARN("DA probe: relay %s:%u unreachable (%u consecutive failures), evicting",
                          relay->address, relay->or_port, relay->probe_failures);
@@ -4212,6 +4312,15 @@ static int cmp_u64_dir(const void *a, const void *b) {
 /* Guard: minimum time-known (8 days, Tor's AuthDirVoteGuardGuaranteeTimeKnown) */
 #define DA_GUARD_MIN_TIME_KNOWN  (8 * 86400U)
 
+/* F-05: absolute Guard time-known floor applied to ALL networks, including
+ * small/bootstrapping ones. The previous code preserved self-declared Guard
+ * unconditionally whenever n_active < 100, which let a fresh Sybil relay
+ * claim Guard instantly. 24h is short enough not to block a genuine operator
+ * yet long enough that an attacker must keep a relay alive and observed for a
+ * full day before it can be selected as a guard. Mature networks (>= 100
+ * relays) still require the full 8-day floor. */
+#define DA_GUARD_BOOTSTRAP_TIME_KNOWN  (24 * 3600U)
+
 void moor_da_compute_flags_statistical(moor_da_config_t *config) {
     if (!config) return;
     uint32_t n = config->consensus.num_relays;
@@ -4282,16 +4391,19 @@ void moor_da_compute_flags_statistical(moor_da_config_t *config) {
     else
         guard_bw_threshold = bws[n_active / 2]; /* fallback to overall median */
 
-    /* Guard time-known: 12.5th percentile.
-     * Tor uses 8 days as floor for 6000+ relay networks.  For networks
-     * under 100 relays, trust self-declared Guard flags — stripping them
-     * based on uptime would kill all guards when crossing the 20-relay
-     * threshold (every relay restarts with fresh uptime).  The 8-day
-     * floor only kicks in at 100+ relays where the anonymity set is
-     * large enough that uptime-based Guard selection matters. */
+    /* Guard time-known: 12.5th percentile, with an absolute floor.
+     * F-05: previously the floor only applied at n_active >= 100, and below
+     * that the self-declared Guard bit was preserved verbatim. Now every
+     * network requires at least DA_GUARD_BOOTSTRAP_TIME_KNOWN (24h); mature
+     * networks (>= 100 relays) still require the full 8-day floor. */
     uint64_t guard_tk = time_knowns[n_active / 8];
-    if (n_active >= 100 && guard_tk < DA_GUARD_MIN_TIME_KNOWN)
-        guard_tk = DA_GUARD_MIN_TIME_KNOWN;
+    if (n_active >= 100) {
+        if (guard_tk < DA_GUARD_MIN_TIME_KNOWN)
+            guard_tk = DA_GUARD_MIN_TIME_KNOWN;
+    } else {
+        if (guard_tk < DA_GUARD_BOOTSTRAP_TIME_KNOWN)
+            guard_tk = DA_GUARD_BOOTSTRAP_TIME_KNOWN;
+    }
 
     /* --- Assign flags --- */
     for (uint32_t i = 0; i < n; i++) {
@@ -4317,21 +4429,22 @@ void moor_da_compute_flags_statistical(moor_da_config_t *config) {
             r->flags &= ~NODE_FLAG_STABLE;
 
         /* Guard: requires Fast + Stable + sufficient BW + time-known.
-         * On small networks (<20 relays): trust self-declared Guard flag
-         * immediately. Without this, fresh networks can't build circuits
-         * because nobody has uptime to earn Guard. */
-        if (n_active < 100) {
-            /* Growing network (<100 relays): preserve self-declared Guard.
-             * The 20-relay threshold that enables guard pinning must not
-             * simultaneously strip all guards via uptime requirements. */
-        } else if ((r->flags & NODE_FLAG_GUARD) &&
+         * F-05: the previous n_active < 100 branch preserved self-declared
+         * Guard unconditionally. Now Guard is always earned: a relay must be
+         * Fast + Stable + meet the bandwidth threshold + have been observed
+         * for at least guard_tk (24h on small networks, 8 days on mature
+         * ones). A fresh Sybil can no longer claim Guard instantly. If a
+         * small network genuinely has no relay meeting the floor, operators
+         * should seed DA config with pinned guards rather than trusting
+         * self-declaration. */
+        if ((r->flags & NODE_FLAG_GUARD) &&
             (r->flags & NODE_FLAG_FAST) &&
             (r->flags & NODE_FLAG_STABLE) &&
             eff_bw >= guard_bw_threshold &&
             uptime >= guard_tk) {
-            /* Large network: keep Guard if criteria met */
+            /* Keep Guard: all criteria met */
         } else if (r->flags & NODE_FLAG_GUARD) {
-            /* Large network: strip if criteria not met */
+            /* Strip Guard: criteria not met */
             r->flags &= ~NODE_FLAG_GUARD;
         }
 

@@ -141,6 +141,9 @@ TEST_MLDSA_SRC = tests/test_mldsa.c
 TEST_PATHBIAS_SRC = tests/test_pathbias.c
 TEST_KYBER_KAT_SRC = tests/test_kyber_kat.c
 TEST_MLDSA_KAT_SRC = tests/test_mldsa_kat.c
+# Audit remediation tests (F-03 signature dedup, F-07 serialize round-trip)
+TEST_CONSENSUS_SRC = tests/test_consensus.c
+TEST_SERIALIZE_SRC = tests/test_serialize.c
 TEST_CRYPTO_TARGET = $(BUILDDIR)/test_crypto
 TEST_CELL_TARGET = $(BUILDDIR)/test_cell
 TEST_CIRCUIT_TARGET = $(BUILDDIR)/test_circuit
@@ -173,6 +176,8 @@ TEST_MLDSA_TARGET = $(BUILDDIR)/test_mldsa
 TEST_PATHBIAS_TARGET = $(BUILDDIR)/test_pathbias
 TEST_KYBER_KAT_TARGET = $(BUILDDIR)/test_kyber_kat
 TEST_MLDSA_KAT_TARGET = $(BUILDDIR)/test_mldsa_kat
+TEST_CONSENSUS_TARGET = $(BUILDDIR)/test_consensus
+TEST_SERIALIZE_TARGET = $(BUILDDIR)/test_serialize
 
 .PHONY: all clean tests tools test check install uninstall distclean static-analysis asan-test tsan-test fuzz-build fuzz fuzz-clean coverage infer kat dudect cbmc build-moor-top
 
@@ -188,9 +193,35 @@ $(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # build_id.o is always rebuilt so the baked-in git hash matches current HEAD.
-# MOOR_BUILD_ID can be overridden from the command line (e.g. by deploy scripts
-# that build on machines without a git repo). Falls back to git, then "unknown".
-MOOR_BUILD_ID ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || cat BUILD_ID 2>/dev/null || echo unknown)
+# F-06: build_id is an operational/advisory identifier, NOT a security control
+# -- a self-asserted string a relay writes into its own descriptor cannot
+# attest to binary integrity (anyone can pass MOOR_BUILD_ID=<the DA's hash>).
+# Protocol/feature compatibility is enforced separately via MOOR_MIN_PROTOCOL_VERSION.
+#
+# The wire field is 16 bytes; a 12-char abbreviated hash fits cleanly. We use
+# git rev-parse --short=12 for the committed hash (deterministic length) and
+# fail the build if the working tree is dirty, rather than silently emitting a
+# truncated/misleading id. git rev-parse reports HEAD even on a dirty tree,
+# which previously let a locally-patched binary claim the upstream hash.
+MOOR_BUILD_ID ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || cat BUILD_ID 2>/dev/null)
+# Fail loudly if no build id can be determined instead of emitting "unknown"
+# (which the DA's exact-equality gate would treat as a distinct fleet and
+# silently partition tarball builds from git builds).
+ifeq ($(strip $(MOOR_BUILD_ID)),)
+$(error cannot determine MOOR_BUILD_ID: run from a git checkout, or provide BUILD_ID or MOOR_BUILD_ID=...)
+endif
+# Detect a dirty working tree and refuse to build: a patched binary must not
+# inherit the committed hash. Skipped when MOOR_BUILD_ID was set explicitly on
+# the command line or environment (origin "command line" / "environment") --
+# an operator who sets it explicitly is taking responsibility for the id and
+# is allowed to build a local fork from a dirty tree.
+ifeq ($(filter command line environment,$(origin MOOR_BUILD_ID)),)
+ifeq ($(shell git rev-parse --is-inside-work-tree 2>/dev/null),true)
+ifneq ($(shell git status --porcelain 2>/dev/null),)
+$(error refusing to build: working tree is dirty (build_id would misreport HEAD); commit/stash changes or set MOOR_BUILD_ID explicitly)
+endif
+endif
+endif
 .PHONY: $(OBJDIR)/build_id.o
 $(OBJDIR)/build_id.o: $(SRCDIR)/build_id.c | $(OBJDIR)
 	$(CC) $(CFLAGS) -DMOOR_BUILD_ID="\"$(MOOR_BUILD_ID)\"" -c $< -o $@
@@ -220,7 +251,7 @@ $(MOOR_TOP_TARGET): $(MOOR_TOP_SRC)
 build-moor-top: $(MOOR_TOP_TARGET)
 
 # Tests
-tests: $(TEST_CRYPTO_TARGET) $(TEST_CELL_TARGET) $(TEST_CIRCUIT_TARGET) $(TEST_CONFIG_TARGET) $(TEST_TRANSPORT_TARGET) $(TEST_KEM_TARGET) $(TEST_FRAGMENT_TARGET) $(TEST_PQ_CIRCUIT_TARGET) $(TEST_POW_TARGET) $(TEST_GEOIP_TARGET) $(TEST_PADDING_ADV_TARGET) $(TEST_BW_AUTH_TARGET) $(TEST_CONFLUX_TARGET) $(TEST_RATELIMIT_TARGET) $(TEST_CONSENSUS_CACHE_TARGET) $(TEST_SCHEDULER_TARGET) $(TEST_MONITOR_TARGET) $(TEST_CKE_TARGET) $(TEST_NOISE_TARGET) $(TEST_SOCKS_TARGET) $(TEST_OB_TARGET) $(TEST_BRIDGEDB_TARGET) $(TEST_DNS_CACHE_TARGET) $(TEST_SHADE_TARGET) $(TEST_EXIT_SLA_TARGET) $(TEST_CC_TARGET) $(TEST_FEATURES2_TARGET) $(TEST_INFRA_TARGET) $(TEST_DHT_TARGET) $(TEST_MLDSA_TARGET) $(TEST_PATHBIAS_TARGET)
+tests: $(TEST_CRYPTO_TARGET) $(TEST_CELL_TARGET) $(TEST_CIRCUIT_TARGET) $(TEST_CONFIG_TARGET) $(TEST_TRANSPORT_TARGET) $(TEST_KEM_TARGET) $(TEST_FRAGMENT_TARGET) $(TEST_PQ_CIRCUIT_TARGET) $(TEST_POW_TARGET) $(TEST_GEOIP_TARGET) $(TEST_PADDING_ADV_TARGET) $(TEST_BW_AUTH_TARGET) $(TEST_CONFLUX_TARGET) $(TEST_RATELIMIT_TARGET) $(TEST_CONSENSUS_CACHE_TARGET) $(TEST_SCHEDULER_TARGET) $(TEST_MONITOR_TARGET) $(TEST_CKE_TARGET) $(TEST_NOISE_TARGET) $(TEST_SOCKS_TARGET) $(TEST_OB_TARGET) $(TEST_BRIDGEDB_TARGET) $(TEST_DNS_CACHE_TARGET) $(TEST_SHADE_TARGET) $(TEST_EXIT_SLA_TARGET) $(TEST_CC_TARGET) $(TEST_FEATURES2_TARGET) $(TEST_INFRA_TARGET) $(TEST_DHT_TARGET) $(TEST_MLDSA_TARGET) $(TEST_PATHBIAS_TARGET) $(TEST_CONSENSUS_TARGET) $(TEST_SERIALIZE_TARGET)
 
 $(TEST_CRYPTO_TARGET): $(TEST_CRYPTO_SRC) $(ALL_OBJECTS)
 	$(CC) $(CFLAGS) $< $(ALL_OBJECTS) -o $@ $(LDFLAGS)
@@ -321,6 +352,12 @@ $(TEST_KYBER_KAT_TARGET): $(TEST_KYBER_KAT_SRC) $(ALL_OBJECTS)
 $(TEST_MLDSA_KAT_TARGET): $(TEST_MLDSA_KAT_SRC) $(ALL_OBJECTS)
 	$(CC) $(CFLAGS) $< $(ALL_OBJECTS) -o $@ $(LDFLAGS)
 
+$(TEST_CONSENSUS_TARGET): $(TEST_CONSENSUS_SRC) $(ALL_OBJECTS)
+	$(CC) $(CFLAGS) $< $(ALL_OBJECTS) -o $@ $(LDFLAGS)
+
+$(TEST_SERIALIZE_TARGET): $(TEST_SERIALIZE_SRC) $(ALL_OBJECTS)
+	$(CC) $(CFLAGS) $< $(ALL_OBJECTS) -o $@ $(LDFLAGS)
+
 test: tests
 	@echo "=== Running tests ==="
 	./$(TEST_CRYPTO_TARGET)
@@ -354,6 +391,8 @@ test: tests
 	./$(TEST_DHT_TARGET)
 	./$(TEST_MLDSA_TARGET)
 	./$(TEST_PATHBIAS_TARGET)
+	./$(TEST_CONSENSUS_TARGET)
+	./$(TEST_SERIALIZE_TARGET)
 	@echo "=== All tests passed ==="
 
 clean:
@@ -366,6 +405,7 @@ clean:
 	rm -f $(TEST_SCHEDULER_TARGET) $(TEST_MONITOR_TARGET)
 	rm -f $(TEST_CKE_TARGET) $(TEST_NOISE_TARGET) $(TEST_SOCKS_TARGET) $(TEST_OB_TARGET) $(TEST_BRIDGEDB_TARGET) $(TEST_DNS_CACHE_TARGET) $(TEST_SHADE_TARGET) $(TEST_EXIT_SLA_TARGET) $(TEST_CC_TARGET) $(TEST_FEATURES2_TARGET) $(TEST_INFRA_TARGET) $(TEST_DHT_TARGET) $(TEST_MLDSA_TARGET) $(TEST_PATHBIAS_TARGET)
 	rm -f $(TEST_KYBER_KAT_TARGET) $(TEST_MLDSA_KAT_TARGET) $(BUILDDIR)/dudect_crypto
+	rm -f $(TEST_CONSENSUS_TARGET) $(TEST_SERIALIZE_TARGET)
 	rm -rf obj_cov coverage_report
 	rm -f *.exe
 
@@ -472,7 +512,8 @@ TEST_SOURCES = $(TEST_CRYPTO_SRC) $(TEST_CELL_SRC) $(TEST_CIRCUIT_SRC) \
                $(TEST_BRIDGEDB_SRC) $(TEST_DNS_CACHE_SRC) $(TEST_SHADE_SRC) \
                $(TEST_EXIT_SLA_SRC) $(TEST_CC_SRC) \
                $(TEST_FEATURES2_SRC) $(TEST_INFRA_SRC) $(TEST_DHT_SRC) \
-               $(TEST_MLDSA_SRC) $(TEST_PATHBIAS_SRC)
+	               $(TEST_MLDSA_SRC) $(TEST_PATHBIAS_SRC) \
+	               $(TEST_CONSENSUS_SRC) $(TEST_SERIALIZE_SRC)
 
 ASAN_TEST_TARGETS = $(patsubst tests/%.c,asan_%,$(TEST_SOURCES))
 

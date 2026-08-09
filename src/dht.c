@@ -426,6 +426,13 @@ int moor_dht_handle_store(moor_circuit_t *circ,
      * in case handle_store is reached via another code path. */
     {
         const uint8_t *our_pk = moor_relay_get_identity_pk();
+        /* F-02: the consensus is replaced from a background thread by
+         * moor_relay_set_consensus(). Holding the read lock across the
+         * responsibility check keeps the returned pointer's relays[] array
+         * alive for the duration of the dereference -- the writer takes the
+         * write lock in moor_relay_set_consensus() and only frees the old
+         * array after publishing the new one. */
+        moor_relay_consensus_rdlock();
         const moor_consensus_t *cons = moor_relay_get_consensus();
         if (our_pk && cons && cons->num_relays > 0) {
             uint64_t tp = (uint64_t)time(NULL) / MOOR_TIME_PERIOD_SECS;
@@ -438,10 +445,12 @@ int moor_dht_handle_store(moor_circuit_t *circ,
                                         cons->srv_current,
                                         tp > 0 ? tp - 1 : 0);
             if (!responsible) {
+                moor_relay_consensus_unlock();
                 LOG_WARN("DHT STORE: rejected in dht.c -- not a responsible replica");
                 return -1;
             }
         }
+        moor_relay_consensus_unlock();
     }
 
     /* Rate limit: prevent descriptor flooding */

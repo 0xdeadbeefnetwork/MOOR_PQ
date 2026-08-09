@@ -236,6 +236,16 @@ static void *extend_worker_func(void *arg) {
         return (val); \
     } while(0)
 
+    /* F-01: this worker handles attacker-supplied RELAY_EXTEND / EXTEND2 /
+     * EXTEND_PQ cells and must run fully isolated from the main thread's
+     * event loop. moor_worker_isolate() makes moor_connection_alloc() return
+     * a heap object outside g_conn_pool, skips the g_conn_ht publish, and
+     * dup's the socket to fd >= 256 to dodge stale libevent registrations.
+     * Without it, the worker mutates main-thread structures (pool slots, the
+     * identity hash, event registrations) and races the event loop. */
+    extern void moor_worker_isolate(void);
+    moor_worker_isolate();
+
     moor_connection_t *conn = moor_connection_alloc();
     if (!conn) {
         w->result = -1;

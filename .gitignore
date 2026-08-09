@@ -4,13 +4,18 @@ obj_afl/
 /moor.exe
 moor_keygen
 moor-top
-test_*
+# test_* build artifacts (binaries placed in BUILDDIR=. by default).
+# Negate tests/*.c so test SOURCES are tracked -- without this the pattern
+# also hides tests/test_consensus.c, tests/test_serialize.c, etc.
+/test_*
+asan_test_*
+tsan_test_*
+cov_test_*
+!tests/test_*.c
 *.o
 coverage_report/
 obj_cov/
 dudect_crypto
-asan_test_*
-tsan_test_*
 .audit-snapshot
 audit/
 fuzz/afl_out/

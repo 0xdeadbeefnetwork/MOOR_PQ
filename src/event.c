@@ -5,10 +5,19 @@
  * All existing call sites remain unchanged.
  */
 #include "moor/moor.h"
+#include "moor/debug.h"
 #include <signal.h>
 #include <event2/event.h>
 #include <string.h>
 #include <time.h>
+
+/* F-01: the event API is not thread-safe. evthread_use_pthreads() is never
+ * called, so libevent's internal structures and the g_entries[] table below
+ * must only be touched from the main thread. Worker threads that need to
+ * interact with the loop hand results back over a pipe (see extend_push_result
+ * in relay.c, hs_connect in socks5.c) and the main thread performs the actual
+ * event_add/remove. This declaration lets us assert that contract. */
+extern int moor_is_worker(void);  /* connection.c */
 
 #ifdef _WIN32
 #include <windows.h>
@@ -105,6 +114,11 @@ int moor_event_init(void) {
 
 /* ---- FD events ---- */
 int moor_event_add(int fd, int events, moor_event_cb callback, void *arg) {
+    /* F-01: only the main thread may touch the event loop. A worker calling
+     * this would race the loop's poll of g_entries[] and corrupt libevent's
+     * min-heap / fd map. */
+    MOOR_ASSERT_MSG(!moor_is_worker(),
+                    "moor_event_add called from worker thread (fd=%d)", fd);
     /* Check if fd already registered — update */
     for (int i = 0; i < g_num_entries; i++) {
         if (g_entries[i].active && g_entries[i].fd == fd) {
@@ -169,6 +183,8 @@ int moor_event_modify(int fd, int events) {
 }
 
 int moor_event_remove(int fd) {
+    MOOR_ASSERT_MSG(!moor_is_worker(),
+                    "moor_event_remove called from worker thread (fd=%d)", fd);
     for (int i = 0; i < g_num_entries; i++) {
         if (g_entries[i].active && g_entries[i].fd == fd) {
             if (g_entries[i].ev) {
