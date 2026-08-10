@@ -1233,6 +1233,14 @@ static uint64_t g_selftest_bw_snapshot = 0;
 
 static void *relay_selftest_thread(void *arg) {
     (void)arg;
+    /* N-03: this thread touches the shared connection pool, the identity hash
+     * table, and (via moor_connection_free) the socks5/hs nullify paths.
+     * moor_worker_isolate() makes moor_connection_alloc() return a heap object
+     * outside the pool, skips the g_conn_ht publish, and dup's the fd to >=256
+     * -- the same isolation the EXTEND and HS-connect workers already use.
+     * Without it, this thread races the event loop on every shared structure. */
+    extern void moor_worker_isolate(void);
+    moor_worker_isolate();
     if (moor_relay_self_test(&g_relay_cfg) != 0)
         return NULL;
 
@@ -1902,6 +1910,13 @@ static int run_relay(void) {
         } else {
             LOG_WARN("relay: failed to fetch initial consensus");
         }
+    }
+
+    /* N-04: kick off the background PoW solver now (before registration) so a
+     * 16-bit (~65s) Argon2id solve runs concurrently with consensus fetch and
+     * listener setup, rather than blocking the first register call. */
+    if (!g_is_bridge) {
+        moor_relay_pow_solve_start(&g_relay_cfg);
     }
 
     /* Now register with DAs (listener is already up for probe-back).

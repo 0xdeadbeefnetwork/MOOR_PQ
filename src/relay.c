@@ -3803,6 +3803,73 @@ static uint16_t relay_lookup_country(const char *public_ip) {
     return moor_geoip_pack_country(cc);
 }
 
+/* N-04: asynchronous PoW solving. Registration no longer blocks on Argon2id --
+ * a background thread solves at startup and caches (nonce, timestamp). The
+ * solver is keyed by identity_pk + epoch, so the solution is valid for the
+ * whole MOOR_POW_TIMESTAMP_WINDOW. moor_relay_register waits on the cache
+ * (short) rather than solving inline (minutes at difficulty 16+). */
+static uint64_t g_pow_cache_nonce = 0;
+static uint64_t g_pow_cache_ts = 0;
+static volatile int g_pow_cache_ready = 0;
+static volatile int g_pow_cache_failed = 0;
+static pthread_mutex_t g_pow_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_pow_cache_cond = PTHREAD_COND_INITIALIZER;
+
+/* Spawned early at relay startup (moor_relay_pow_solve_start) to pre-solve. */
+static void *relay_pow_solve_thread(void *arg) {
+    moor_relay_config_t *cfg = (moor_relay_config_t *)arg;
+    int pow_diff = cfg->pow_difficulty > 0 ?
+                   cfg->pow_difficulty : MOOR_POW_DEFAULT_DIFFICULTY;
+    uint64_t nonce = 0, ts = 0;
+    int rc = moor_pow_solve(&nonce, &ts, cfg->identity_pk, pow_diff,
+                            cfg->pow_memlimit);
+    pthread_mutex_lock(&g_pow_cache_mutex);
+    if (rc == 0) {
+        g_pow_cache_nonce = nonce;
+        g_pow_cache_ts = ts;
+        g_pow_cache_ready = 1;
+        LOG_INFO("PoW solved in background (difficulty %d)", pow_diff);
+    } else {
+        g_pow_cache_failed = 1;
+        LOG_ERROR("PoW background solve failed (difficulty %d)", pow_diff);
+    }
+    pthread_cond_broadcast(&g_pow_cache_cond);
+    pthread_mutex_unlock(&g_pow_cache_mutex);
+    return NULL;
+}
+
+void moor_relay_pow_solve_start(moor_relay_config_t *cfg) {
+    pthread_t t;
+    if (pthread_create(&t, NULL, relay_pow_solve_thread, cfg) == 0)
+        pthread_detach(t);
+    else
+        LOG_WARN("PoW: could not spawn background solver, will solve inline");
+}
+
+/* Wait up to timeout_ms for the cached PoW; return 0 and fill nonce/ts if
+ * ready, -1 if not ready in time (caller falls back to inline solve). */
+static int pow_cache_wait(uint64_t *nonce, uint64_t *ts, int timeout_ms) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += timeout_ms / 1000;
+    deadline.tv_nsec += (timeout_ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+    pthread_mutex_lock(&g_pow_cache_mutex);
+    int rc = 0;
+    if (!g_pow_cache_ready && !g_pow_cache_failed) {
+        rc = pthread_cond_timedwait(&g_pow_cache_cond, &g_pow_cache_mutex, &deadline);
+    }
+    if (g_pow_cache_ready) {
+        *nonce = g_pow_cache_nonce;
+        *ts = g_pow_cache_ts;
+        rc = 0;
+    } else {
+        rc = -1;
+    }
+    pthread_mutex_unlock(&g_pow_cache_mutex);
+    return rc;
+}
+
 int moor_relay_register(const moor_relay_config_t *config) {
     const char *advertise = config->advertise_addr[0] ?
                             config->advertise_addr : config->bind_addr;
@@ -3887,15 +3954,22 @@ int moor_relay_register(const moor_relay_config_t *config) {
     WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif
 
-    /* Solve PoW once (tied to identity_pk, not DA) */
+    /* N-04: PoW. Prefer the background-solved cache (moor_relay_pow_solve_start
+     * runs at relay startup); wait briefly for it. Fall back to an inline
+     * solve only if the cache isn't ready (e.g. solver thread failed to spawn
+     * or this is a re-register after the window expired). This keeps a 16-bit
+     * (~65s) solve off the registration critical path. */
     uint64_t pow_nonce = 0, pow_timestamp = 0;
-    int pow_diff = g_relay_config.pow_difficulty > 0 ?
-                   g_relay_config.pow_difficulty : MOOR_POW_DEFAULT_DIFFICULTY;
-    if (moor_pow_solve(&pow_nonce, &pow_timestamp,
-                        config->identity_pk, pow_diff,
-                        config->pow_memlimit) != 0) {
-        LOG_ERROR("PoW solve failed");
-        return -1;
+    int pow_diff = config->pow_difficulty > 0 ?
+                   config->pow_difficulty : MOOR_POW_DEFAULT_DIFFICULTY;
+    if (pow_cache_wait(&pow_nonce, &pow_timestamp, 120000) != 0) {
+        LOG_INFO("PoW cache not ready, solving inline (difficulty %d)", pow_diff);
+        if (moor_pow_solve(&pow_nonce, &pow_timestamp,
+                            config->identity_pk, pow_diff,
+                            config->pow_memlimit) != 0) {
+            LOG_ERROR("PoW solve failed");
+            return -1;
+        }
     }
     LOG_INFO("PoW solved (difficulty %d)", pow_diff);
 
@@ -3983,7 +4057,7 @@ int moor_relay_self_test(const moor_relay_config_t *config) {
 
         if (moor_connection_send_cell(conn, &create_cell) != 0) {
             LOG_WARN("self-test: failed to send CREATE");
-            moor_connection_free(conn);
+            moor_connection_close(conn);  /* N-06: close fd + free, not free alone */
             continue;
         }
 
@@ -3992,12 +4066,12 @@ int moor_relay_self_test(const moor_relay_config_t *config) {
         if (wait_for_readable(conn->fd, 10000) <= 0 ||
             moor_connection_recv_cell(conn, &resp) != 1) {
             LOG_WARN("self-test: no CREATED response");
-            moor_connection_free(conn);
+            moor_connection_close(conn);  /* N-06 */
             continue;
         }
 
         int ok = (resp.command == CELL_CREATED);
-        moor_connection_free(conn);
+        moor_connection_close(conn);  /* N-06: close so the peer sees EOF */
         sodium_memzero(eph_sk, 32);
 
         if (ok) {

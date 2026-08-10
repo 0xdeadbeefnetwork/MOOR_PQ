@@ -10,14 +10,31 @@
 #include <event2/event.h>
 #include <string.h>
 #include <time.h>
+#include <pthread.h>
 
-/* F-01: the event API is not thread-safe. evthread_use_pthreads() is never
- * called, so libevent's internal structures and the g_entries[] table below
- * must only be touched from the main thread. Worker threads that need to
- * interact with the loop hand results back over a pipe (see extend_push_result
- * in relay.c, hs_connect in socks5.c) and the main thread performs the actual
- * event_add/remove. This declaration lets us assert that contract. */
-extern int moor_is_worker(void);  /* connection.c */
+/* F-01 / N-03: the event API is not thread-safe. evthread_use_pthreads() is
+ * never called, so libevent's internal structures and the g_entries[] table
+ * below must only be touched from the event-loop thread. Worker threads that
+ * need to interact with the loop hand results back over a pipe (see
+ * extend_push_result in relay.c, hs_connect in socks5.c) and the loop thread
+ * performs the actual event_add/remove.
+ *
+ * N-03 (audit2): the previous guard asserted !moor_is_worker(), which only
+ * catches the two threads that called moor_worker_isolate() -- every other
+ * off-loop thread passed it silently, giving false assurance. We now record
+ * the event-loop thread identity at init and assert against it directly, so
+ * ANY thread other than the loop thread (worker or not) is caught. */
+static pthread_t g_event_thread;
+static int g_event_thread_set = 0;
+
+/* Returns 1 if the calling thread is NOT the event-loop thread.
+ * Used by the assertions in moor_event_add / moor_event_remove. */
+static int not_event_thread(void) {
+    if (!g_event_thread_set) return 0; /* not initialized yet -- allow */
+    return !pthread_equal(pthread_self(), g_event_thread);
+}
+
+extern int moor_is_worker(void);  /* connection.c, retained for callers */
 
 #ifdef _WIN32
 #include <windows.h>
@@ -97,6 +114,10 @@ int moor_event_init(void) {
     memset(g_timers, 0, sizeof(g_timers));
     g_num_entries = 0;
     g_running = 0;
+    /* N-03: record the thread that initializes the event loop (the main
+     * thread). All event_add/remove/modify calls must come from this thread. */
+    g_event_thread = pthread_self();
+    g_event_thread_set = 1;
 
     if (g_base) {
         event_base_free(g_base);
@@ -114,11 +135,13 @@ int moor_event_init(void) {
 
 /* ---- FD events ---- */
 int moor_event_add(int fd, int events, moor_event_cb callback, void *arg) {
-    /* F-01: only the main thread may touch the event loop. A worker calling
-     * this would race the loop's poll of g_entries[] and corrupt libevent's
-     * min-heap / fd map. */
-    MOOR_ASSERT_MSG(!moor_is_worker(),
-                    "moor_event_add called from worker thread (fd=%d)", fd);
+    /* F-01 / N-03: only the event-loop thread may touch the event loop. Any
+     * other thread calling this races the loop's poll of g_entries[] and
+     * corrupts libevent's min-heap / fd map. The guard asserts against the
+     * recorded loop thread, so it catches ALL off-loop callers (workers and
+     * non-workers alike), not just isolated ones. */
+    MOOR_ASSERT_MSG(!not_event_thread(),
+                    "moor_event_add called off the event-loop thread (fd=%d)", fd);
     /* Check if fd already registered — update */
     for (int i = 0; i < g_num_entries; i++) {
         if (g_entries[i].active && g_entries[i].fd == fd) {
@@ -183,8 +206,8 @@ int moor_event_modify(int fd, int events) {
 }
 
 int moor_event_remove(int fd) {
-    MOOR_ASSERT_MSG(!moor_is_worker(),
-                    "moor_event_remove called from worker thread (fd=%d)", fd);
+    MOOR_ASSERT_MSG(!not_event_thread(),
+                    "moor_event_remove called off the event-loop thread (fd=%d)", fd);
     for (int i = 0; i < g_num_entries; i++) {
         if (g_entries[i].active && g_entries[i].fd == fd) {
             if (g_entries[i].ev) {

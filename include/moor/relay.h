@@ -86,6 +86,10 @@ int moor_relay_exit_read(moor_circuit_t *circ, moor_stream_t *stream);
 /* Register relay with directory authority */
 int moor_relay_register(const moor_relay_config_t *config);
 
+/* N-04: start the background PoW solver so registration doesn't block on
+ * Argon2id. Call once at relay startup, before the first moor_relay_register. */
+void moor_relay_pow_solve_start(moor_relay_config_t *cfg);
+
 /* Periodic tasks: re-register, rotate keys */
 void moor_relay_periodic(void);
 

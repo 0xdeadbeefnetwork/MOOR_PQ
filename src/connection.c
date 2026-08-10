@@ -1763,9 +1763,14 @@ void moor_connection_close(moor_connection_t *conn) {
     moor_circuit_nullify_conn(conn);
     /* Remove from event loop BEFORE close() to prevent fd-reuse race:
      * close() frees the fd number, a new socket() can reuse it, then
-     * event_remove would accidentally deregister the new socket. */
+     * event_remove would accidentally deregister the new socket.
+     * N-03: worker/heap connections are never registered with the event loop
+     * (isolation keeps them out of g_entries), so skip the remove -- calling
+     * moor_event_remove from a worker thread would trip the event-thread
+     * assertion in event.c and is a no-op anyway (fd not in the table). */
     if (conn->fd >= 0) {
-        moor_event_remove(conn->fd);
+        if (!moor_is_worker())
+            moor_event_remove(conn->fd);
         close(conn->fd);
     }
     moor_connection_free(conn);

@@ -119,8 +119,19 @@ extern const char moor_build_id[MOOR_BUILD_ID_LEN];
  * descriptor storage, so no HSDir role exists). Don't reuse without a wire bump. */
 
 /* Flags assigned by DA (not signed by relay) — must be stripped for sig verify
- * and excluded from consensus body hash (so all DAs produce identical hashes) */
-#define NODE_FLAGS_DA_ASSIGNED  (NODE_FLAG_FAST | NODE_FLAG_STABLE | NODE_FLAG_BADEXIT)
+ * and excluded from consensus body hash (so all DAs produce identical hashes).
+ *
+ * N-01 (audit2): this set MUST cover every flag the DA mutates on its stored
+ * copy of a descriptor, otherwise DA-to-DA sync re-serializes the mutated
+ * flags under the relay's original signature and verification fails, breaking
+ * multi-DA consensus. The DA sets/clears RUNNING (probe), GUARD (uptime
+ * floor), AUTHORITY (never from wire), FAST/STABLE (bandwidth), and BADEXIT
+ * (exit verification). EXIT and MIDDLEONLY stay signed -- they are genuine
+ * self-declarations that survive ingest unchanged, and "exit rejected" is
+ * expressed via BADEXIT (already in this mask) rather than clearing EXIT. */
+#define NODE_FLAGS_DA_ASSIGNED  (NODE_FLAG_FAST | NODE_FLAG_STABLE | \
+                                 NODE_FLAG_BADEXIT | NODE_FLAG_RUNNING | \
+                                 NODE_FLAG_GUARD | NODE_FLAG_AUTHORITY)
 
 /* Defaults */
 #define MOOR_DEFAULT_SOCKS_PORT     9050

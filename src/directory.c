@@ -514,11 +514,16 @@ static int da_add_relay_unlocked(moor_da_config_t *config,
      * RUNNING is set exclusively from probe results, AUTHORITY is a DA-only
      * role. Fast/Stable/BadExit are recomputed by moor_da_compute_flags_statistical. */
     moor_node_descriptor_t desc_local = *desc;
-    const uint32_t DA_STRIP_MASK =
-        NODE_FLAG_RUNNING | NODE_FLAG_AUTHORITY | NODE_FLAGS_DA_ASSIGNED;
+    /* N-01: strip every DA-assigned flag from the wire descriptor before it
+     * enters the consensus. NODE_FLAGS_DA_ASSIGNED now covers all bits the DA
+     * computes (Running/Guard/Auth/Fast/Stable/BadExit); only Exit and
+     * MiddleOnly survive as genuine self-declarations. All stripped bits are
+     * excluded from the descriptor signature (signed_flags mask), so this
+     * mutation is signature-safe on DA-to-DA sync. */
+    const uint32_t DA_STRIP_MASK = NODE_FLAGS_DA_ASSIGNED;
     if (desc_local.flags & DA_STRIP_MASK) {
         LOG_INFO("DA: stripped self-declared role flags 0x%x from %s "
-                 "(Running/Auth/Fast/Stable/BadExit are DA-assigned)",
+                 "(Running/Guard/Auth/Fast/Stable/BadExit are DA-assigned)",
                  desc_local.flags & DA_STRIP_MASK, desc_local.nickname);
     }
     desc_local.flags &= ~DA_STRIP_MASK;
@@ -2124,13 +2129,13 @@ static int da_dispatch_request(int client_fd, moor_da_config_t *config,
                 }
             }
             /* Verify PoW -- always required.
-             * Use the DA's configured difficulty when the operator set one
-             * explicitly (>0); otherwise fall back to the compile-time default.
-             * The previous '>= DEFAULT' gate ignored any operator override
-             * below the default, so a DA started with --pow-difficulty 8 still
-             * demanded 12 and rejected every relay that solved at 8. */
+             * N-04/N-07: the floor is upward-only. An operator can raise the
+             * difficulty (hardening) but cannot lower it below the default
+             * except via the explicit --pow-difficulty-unsafe escape hatch,
+             * which logs a loud warning at startup. This prevents a DA from
+             * being silently configured down to a near-free Sybil cost. */
             size_t remaining = len - (size_t)desc_len;
-            int pow_diff = config->pow_difficulty > 0 ?
+            int pow_diff = (config->pow_difficulty >= MOOR_POW_DEFAULT_DIFFICULTY) ?
                            config->pow_difficulty : MOOR_POW_DEFAULT_DIFFICULTY;
             if (remaining < 16) {
                 LOG_WARN("DA: rejecting relay with missing PoW data");
@@ -2158,7 +2163,14 @@ static int da_dispatch_request(int client_fd, moor_da_config_t *config,
                                      pow_data[15];
                 if (moor_pow_verify(desc.identity_pk, pow_nonce,
                                      pow_ts, pow_diff, 0) != 0) {
-                    LOG_WARN("DA: rejecting relay with invalid PoW");
+                    /* N-07: include the required difficulty so operators can
+                     * diagnose a relay solving at the wrong level. The relay's
+                     * offered difficulty isn't on the wire (only nonce+ts), so
+                     * we state what we require. */
+                    LOG_WARN("DA: rejecting %s -- PoW invalid (DA requires "
+                             "difficulty %d, %d-bit Argon2id); solve at "
+                             "--pow-difficulty %d", desc.address, pow_diff,
+                             pow_diff, pow_diff);
                     send(client_fd, "ERR\n", 4, MSG_NOSIGNAL);
                     free(desc_buf);
                     return 0;
@@ -3290,18 +3302,21 @@ int moor_da_probe_relays(moor_da_config_t *config) {
              * previously taken straight from the relay's self-declared
              * descriptor, so any fresh relay could claim it. */
             relay->flags |= NODE_FLAG_RUNNING;
-            /* F-05: an Exit relay that did not pass exit-notice verification
-             * is flagged BadExit and loses the Exit bit, so it cannot be
-             * selected for the exit position. Exit is now earned by active
-             * verification, not self-declaration. */
+            /* F-05 / N-01: an Exit relay that did not pass exit-notice
+             * verification is flagged BadExit. EXIT itself is a signed,
+             * self-declared bit and must NOT be mutated by the DA (doing so
+             * invalidates the descriptor signature on DA-to-DA sync). Path
+             * selection already excludes NODE_FLAG_BADEXIT relays from the
+             * exit position (node.c), so marking BadExit is sufficient to
+             * keep an unverified exit from being selected. */
             if (relay->flags & NODE_FLAG_EXIT) {
                 if (results[i].exit_verified) {
                     relay->flags &= ~NODE_FLAG_BADEXIT;
                 } else {
                     relay->flags |= NODE_FLAG_BADEXIT;
-                    relay->flags &= ~NODE_FLAG_EXIT;
-                    LOG_WARN("DA probe: %s:%u stripped Exit (notice port :80 "
-                             "unreachable)", relay->address, relay->or_port);
+                    LOG_WARN("DA probe: %s:%u flagged BadExit (notice port :80 "
+                             "unreachable) -- EXIT bit preserved for sig integrity",
+                             relay->address, relay->or_port);
                 }
             }
             if (results[i].measured_bw > 0) {
@@ -4453,11 +4468,17 @@ void moor_da_compute_flags_statistical(moor_da_config_t *config) {
             r->flags &= ~NODE_FLAG_GUARD;
         }
 
-        /* Exit: relay must self-declare --exit. DA preserves it. */
+        /* Exit: relay must self-declare --exit. DA preserves it.
+         * N-01: EXIT is a signed bit; the DA must never clear it directly
+         * (that breaks the descriptor signature on DA-to-DA sync). */
 
-        /* MiddleOnly: strip Guard/Exit */
-        if (r->flags & NODE_FLAG_MIDDLEONLY)
-            r->flags &= ~(NODE_FLAG_GUARD | NODE_FLAG_EXIT);
+        /* MiddleOnly: suppress Guard and Exit selection. GUARD is a DA-assigned
+         * bit (sig-safe to clear). EXIT is signed, so suppress exit selection
+         * via BADEXIT (also DA-assigned) rather than clearing EXIT. */
+        if (r->flags & NODE_FLAG_MIDDLEONLY) {
+            r->flags &= ~NODE_FLAG_GUARD;
+            r->flags |= NODE_FLAG_BADEXIT;
+        }
     }
 
     free(bws);
