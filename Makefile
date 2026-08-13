@@ -39,7 +39,8 @@ SRCDIR = src
 OBJDIR = obj
 BUILDDIR = .
 
-SOURCES = $(SRCDIR)/log.c \
+SOURCES = $(SRCDIR)/compat_win.c \
+          $(SRCDIR)/log.c \
           $(SRCDIR)/build_id.c \
           $(SRCDIR)/crypto.c \
           $(SRCDIR)/cell.c \

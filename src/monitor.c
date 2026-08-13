@@ -29,7 +29,6 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 typedef int socklen_t;
-#define close closesocket
 #define MSG_NOSIGNAL 0
 #else
 #include <unistd.h>

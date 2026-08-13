@@ -41,7 +41,6 @@ void moor_set_trusted_da_keys(const moor_da_entry_t *da_list, int num_das) {
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#define close closesocket
 #define MSG_NOSIGNAL 0
 #else
 #include <unistd.h>

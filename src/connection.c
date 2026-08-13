@@ -25,9 +25,7 @@ int moor_is_worker(void) {
 #include <ws2tcpip.h>
 #include <windows.h>
 typedef int socklen_t;
-#define close closesocket
 #define MSG_NOSIGNAL 0
-#define poll WSAPoll
 static int g_wsa_initialized = 0;
 static void ensure_wsa(void) {
     if (!g_wsa_initialized) {

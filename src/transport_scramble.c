@@ -26,7 +26,6 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #define MSG_NOSIGNAL 0
-#define poll WSAPoll
 #else
 #include <sys/socket.h>
 #include <poll.h>

@@ -11,7 +11,6 @@
 #include <sys/stat.h>
 #include <windows.h>
 #include <sddl.h>
-#define mkdir(p, m) _mkdir(p)
 /* M7: Create key files with owner-only DACL on Windows */
 static FILE *secure_fopen_crypto(const char *path, const char *mode) {
     (void)mode;

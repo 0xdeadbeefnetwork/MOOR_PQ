@@ -38,8 +38,6 @@
 #else
 #include <winsock2.h>
 #define MSG_NOSIGNAL_VAL 0
-#define close closesocket
-#define poll WSAPoll
 #endif
 
 /* MC protocol version 769 = Minecraft 1.21.4 */

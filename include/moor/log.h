@@ -17,7 +17,9 @@ moor_log_level_t moor_log_get_level(void);
 void moor_log_set_safe_mode(int enabled);
 void moor_log_impl(moor_log_level_t level, const char *file, int line,
                    const char *fmt, ...)
-#ifdef __GNUC__
+#if defined(__MINGW32__) && !defined(__clang__)
+    __attribute__((format(gnu_printf, 4, 5)))
+#elif defined(__GNUC__)
     __attribute__((format(printf, 4, 5)))
 #endif
     ;

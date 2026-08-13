@@ -15,10 +15,7 @@
 #include <fcntl.h>
 #include <share.h>
 #include <sys/stat.h>
-#define close closesocket
 #define MSG_NOSIGNAL 0
-#define poll WSAPoll
-#define mkdir(p, m) _mkdir(p)
 /* Windows: _sopen_s with _S_IREAD|_S_IWRITE (no group/other bits) */
 static FILE *secure_fopen(const char *path, const char *mode) {
     (void)mode;
