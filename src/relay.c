@@ -3803,11 +3803,10 @@ static uint16_t relay_lookup_country(const char *public_ip) {
     return moor_geoip_pack_country(cc);
 }
 
-/* N-04: asynchronous PoW solving. Registration no longer blocks on Argon2id --
- * a background thread solves at startup and caches one (nonce, timestamp).
- * Each solution is one-shot because DAs maintain a nonce replay cache.
- * moor_relay_register consumes the cached solution and immediately starts
- * solving the next one in the background. */
+/* N-04: asynchronous PoW solving. A background thread solves at startup or on
+ * demand and caches one (nonce, timestamp). Each solution is one-shot because
+ * DAs maintain a nonce replay cache. Cached solutions are discarded when they
+ * no longer satisfy the same freshness rules enforced by a DA. */
 static uint64_t g_pow_cache_nonce = 0;
 static uint64_t g_pow_cache_ts = 0;
 static volatile int g_pow_cache_ready = 0;
@@ -3825,7 +3824,8 @@ static void *relay_pow_solve_thread(void *arg) {
     int rc = moor_pow_solve(&nonce, &ts, cfg->identity_pk, pow_diff,
                             cfg->pow_memlimit);
     pthread_mutex_lock(&g_pow_cache_mutex);
-    if (rc == 0) {
+    if (rc == 0 &&
+        moor_pow_timestamp_is_fresh(ts, (uint64_t)time(NULL))) {
         g_pow_cache_nonce = nonce;
         g_pow_cache_ts = ts;
         g_pow_cache_ready = 1;
@@ -3833,7 +3833,8 @@ static void *relay_pow_solve_thread(void *arg) {
         LOG_INFO("PoW solved in background (difficulty %d)", pow_diff);
     } else {
         g_pow_cache_failed = 1;
-        LOG_ERROR("PoW background solve failed (difficulty %d)", pow_diff);
+        LOG_ERROR("PoW background solve failed or expired (difficulty %d)",
+                  pow_diff);
     }
     g_pow_cache_solving = 0;
     pthread_cond_broadcast(&g_pow_cache_cond);
@@ -3843,6 +3844,12 @@ static void *relay_pow_solve_thread(void *arg) {
 
 void moor_relay_pow_solve_start(const moor_relay_config_t *cfg) {
     pthread_mutex_lock(&g_pow_cache_mutex);
+    if (g_pow_cache_ready &&
+        !moor_pow_timestamp_is_fresh(g_pow_cache_ts,
+                                     (uint64_t)time(NULL))) {
+        g_pow_cache_ready = 0;
+        LOG_INFO("PoW: discarded expired cached solution");
+    }
     if (g_pow_cache_ready || g_pow_cache_solving) {
         pthread_mutex_unlock(&g_pow_cache_mutex);
         return;
@@ -3876,6 +3883,12 @@ static int pow_cache_wait(uint64_t *nonce, uint64_t *ts, int timeout_ms) {
     int rc = 0;
     if (!g_pow_cache_ready && !g_pow_cache_failed) {
         rc = pthread_cond_timedwait(&g_pow_cache_cond, &g_pow_cache_mutex, &deadline);
+    }
+    if (g_pow_cache_ready &&
+        !moor_pow_timestamp_is_fresh(g_pow_cache_ts,
+                                     (uint64_t)time(NULL))) {
+        g_pow_cache_ready = 0;
+        LOG_INFO("PoW: cached solution expired while waiting");
     }
     if (g_pow_cache_ready) {
         *nonce = g_pow_cache_nonce;
@@ -3973,14 +3986,13 @@ int moor_relay_register(const moor_relay_config_t *config) {
     WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif
 
-    /* N-04: PoW. Prefer the background-solved cache (moor_relay_pow_solve_start
-     * runs at relay startup); wait briefly for it. Fall back to an inline
-     * solve only if the cache isn't ready (e.g. solver thread failed to spawn
-     * or this is a re-register after the window expired). This keeps a 16-bit
-     * (~65s) solve off the registration critical path. */
+    /* N-04: PoW. Use the startup cache for the first registration and start a
+     * fresh solve on demand for later registrations. Fall back to an inline
+     * solve if the worker fails or exceeds the wait deadline. */
     uint64_t pow_nonce = 0, pow_timestamp = 0;
     int pow_diff = config->pow_difficulty > 0 ?
                    config->pow_difficulty : MOOR_POW_DEFAULT_DIFFICULTY;
+    moor_relay_pow_solve_start(config);
     if (pow_cache_wait(&pow_nonce, &pow_timestamp, 120000) != 0) {
         LOG_INFO("PoW cache not ready, solving inline (difficulty %d)", pow_diff);
         if (moor_pow_solve(&pow_nonce, &pow_timestamp,
@@ -3990,9 +4002,11 @@ int moor_relay_register(const moor_relay_config_t *config) {
             return -1;
         }
     }
-    /* Keep the next registration off the critical path. The current solution
-     * is retained locally for every configured DA in this registration call. */
-    moor_relay_pow_solve_start(config);
+    if (!moor_pow_timestamp_is_fresh(pow_timestamp,
+                                     (uint64_t)time(NULL))) {
+        LOG_ERROR("PoW solution expired before registration");
+        return -1;
+    }
     LOG_INFO("PoW solved (difficulty %d)", pow_diff);
 
     /* Register with all configured DAs (flooding handles the rest) */

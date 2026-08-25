@@ -66,6 +66,18 @@ int main(void) {
     CHECK("MiddleOnly relay is not granted Guard",
           middle != UINT32_MAX && !(middle & NODE_FLAG_GUARD));
 
+    uint64_t now = (uint64_t)time(NULL);
+    CHECK("current PoW timestamp is fresh",
+          moor_pow_timestamp_is_fresh(now, now));
+    CHECK("PoW timestamp at validity boundary is fresh",
+          moor_pow_timestamp_is_fresh(
+              now - MOOR_POW_TIMESTAMP_WINDOW, now));
+    CHECK("expired PoW timestamp is rejected",
+          !moor_pow_timestamp_is_fresh(
+              now - MOOR_POW_TIMESTAMP_WINDOW - 1, now));
+    CHECK("PoW timestamp beyond clock-skew allowance is rejected",
+          !moor_pow_timestamp_is_fresh(now + 61, now));
+
     uint8_t identity_pk[32];
     randombytes_buf(identity_pk, sizeof(identity_pk));
     uint64_t nonce1 = 0, nonce2 = 0, timestamp1 = 0, timestamp2 = 0;
