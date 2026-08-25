@@ -229,7 +229,10 @@ int moor_pow_solve(uint64_t *nonce_out, uint64_t *timestamp_out,
     memcpy(passwd + 8, &timestamp, 8);
 
     uint8_t hash[32];
-    uint64_t nonce = 0;
+    /* Two solves during the same timestamp second must not deterministically
+     * rediscover the same tuple: DAs correctly reject nonce replays. */
+    uint64_t nonce;
+    randombytes_buf(&nonce, sizeof(nonce));
     int shift = (difficulty < 24) ? difficulty + 4 : 28;
     if (shift < 0) shift = 0;
     if (shift > 63) shift = 63;

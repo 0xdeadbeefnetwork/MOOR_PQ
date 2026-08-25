@@ -3804,20 +3804,21 @@ static uint16_t relay_lookup_country(const char *public_ip) {
 }
 
 /* N-04: asynchronous PoW solving. Registration no longer blocks on Argon2id --
- * a background thread solves at startup and caches (nonce, timestamp). The
- * solver is keyed by identity_pk + epoch, so the solution is valid for the
- * whole MOOR_POW_TIMESTAMP_WINDOW. moor_relay_register waits on the cache
- * (short) rather than solving inline (minutes at difficulty 16+). */
+ * a background thread solves at startup and caches one (nonce, timestamp).
+ * Each solution is one-shot because DAs maintain a nonce replay cache.
+ * moor_relay_register consumes the cached solution and immediately starts
+ * solving the next one in the background. */
 static uint64_t g_pow_cache_nonce = 0;
 static uint64_t g_pow_cache_ts = 0;
 static volatile int g_pow_cache_ready = 0;
 static volatile int g_pow_cache_failed = 0;
+static volatile int g_pow_cache_solving = 0;
 static pthread_mutex_t g_pow_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_pow_cache_cond = PTHREAD_COND_INITIALIZER;
 
 /* Spawned early at relay startup (moor_relay_pow_solve_start) to pre-solve. */
 static void *relay_pow_solve_thread(void *arg) {
-    moor_relay_config_t *cfg = (moor_relay_config_t *)arg;
+    const moor_relay_config_t *cfg = (const moor_relay_config_t *)arg;
     int pow_diff = cfg->pow_difficulty > 0 ?
                    cfg->pow_difficulty : MOOR_POW_DEFAULT_DIFFICULTY;
     uint64_t nonce = 0, ts = 0;
@@ -3828,22 +3829,39 @@ static void *relay_pow_solve_thread(void *arg) {
         g_pow_cache_nonce = nonce;
         g_pow_cache_ts = ts;
         g_pow_cache_ready = 1;
+        g_pow_cache_failed = 0;
         LOG_INFO("PoW solved in background (difficulty %d)", pow_diff);
     } else {
         g_pow_cache_failed = 1;
         LOG_ERROR("PoW background solve failed (difficulty %d)", pow_diff);
     }
+    g_pow_cache_solving = 0;
     pthread_cond_broadcast(&g_pow_cache_cond);
     pthread_mutex_unlock(&g_pow_cache_mutex);
     return NULL;
 }
 
-void moor_relay_pow_solve_start(moor_relay_config_t *cfg) {
+void moor_relay_pow_solve_start(const moor_relay_config_t *cfg) {
+    pthread_mutex_lock(&g_pow_cache_mutex);
+    if (g_pow_cache_ready || g_pow_cache_solving) {
+        pthread_mutex_unlock(&g_pow_cache_mutex);
+        return;
+    }
+    g_pow_cache_failed = 0;
+    g_pow_cache_solving = 1;
+    pthread_mutex_unlock(&g_pow_cache_mutex);
+
     pthread_t t;
-    if (pthread_create(&t, NULL, relay_pow_solve_thread, cfg) == 0)
+    if (pthread_create(&t, NULL, relay_pow_solve_thread, (void *)cfg) == 0)
         pthread_detach(t);
-    else
+    else {
+        pthread_mutex_lock(&g_pow_cache_mutex);
+        g_pow_cache_solving = 0;
+        g_pow_cache_failed = 1;
+        pthread_cond_broadcast(&g_pow_cache_cond);
+        pthread_mutex_unlock(&g_pow_cache_mutex);
         LOG_WARN("PoW: could not spawn background solver, will solve inline");
+    }
 }
 
 /* Wait up to timeout_ms for the cached PoW; return 0 and fill nonce/ts if
@@ -3862,6 +3880,7 @@ static int pow_cache_wait(uint64_t *nonce, uint64_t *ts, int timeout_ms) {
     if (g_pow_cache_ready) {
         *nonce = g_pow_cache_nonce;
         *ts = g_pow_cache_ts;
+        g_pow_cache_ready = 0; /* one-shot: DA rejects nonce replays */
         rc = 0;
     } else {
         rc = -1;
@@ -3971,6 +3990,9 @@ int moor_relay_register(const moor_relay_config_t *config) {
             return -1;
         }
     }
+    /* Keep the next registration off the critical path. The current solution
+     * is retained locally for every configured DA in this registration call. */
+    moor_relay_pow_solve_start(config);
     LOG_INFO("PoW solved (difficulty %d)", pow_diff);
 
     /* Register with all configured DAs (flooding handles the rest) */
