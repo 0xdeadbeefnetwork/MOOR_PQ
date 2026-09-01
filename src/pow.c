@@ -178,6 +178,18 @@ static uint32_t resolve_memlimit(uint32_t memlimit) {
     return memlimit;
 }
 
+int moor_pow_timestamp_is_fresh(uint64_t timestamp, uint64_t now) {
+    if (timestamp > now && timestamp - now > 60)
+        return 0;
+    if (now > timestamp && now - timestamp > MOOR_POW_TIMESTAMP_WINDOW)
+        return 0;
+
+    uint64_t solution_epoch = timestamp / MOOR_POW_TIMESTAMP_WINDOW;
+    uint64_t current_epoch = now / MOOR_POW_TIMESTAMP_WINDOW;
+    return solution_epoch == current_epoch ||
+           (current_epoch > 0 && solution_epoch == current_epoch - 1);
+}
+
 /*
  * Relay PoW:
  *   epoch = floor(timestamp / MOOR_POW_TIMESTAMP_WINDOW)
@@ -229,7 +241,10 @@ int moor_pow_solve(uint64_t *nonce_out, uint64_t *timestamp_out,
     memcpy(passwd + 8, &timestamp, 8);
 
     uint8_t hash[32];
-    uint64_t nonce = 0;
+    /* Two solves during the same timestamp second must not deterministically
+     * rediscover the same tuple: DAs correctly reject nonce replays. */
+    uint64_t nonce;
+    randombytes_buf(&nonce, sizeof(nonce));
     int shift = (difficulty < 24) ? difficulty + 4 : 28;
     if (shift < 0) shift = 0;
     if (shift > 63) shift = 63;
@@ -268,22 +283,13 @@ int moor_pow_verify(const uint8_t identity_pk[32],
 
     /* Check timestamp freshness */
     uint64_t now = (uint64_t)time(NULL);
-    if (timestamp > now + 60)
-        return -1;
-    if (now > timestamp && (now - timestamp) > MOOR_POW_TIMESTAMP_WINDOW)
+    if (!moor_pow_timestamp_is_fresh(timestamp, now))
         return -1;
 
     /* Fix CWE-330: Derive epoch-bound salt from the solution's timestamp.
      * The epoch is floor(timestamp / WINDOW), so the salt changes every epoch.
-     * Accept both current and previous epoch to handle boundary transitions
-     * (client solves near end of epoch N, server verifies in epoch N+1). */
+     * moor_pow_timestamp_is_fresh accepted the current or previous epoch. */
     uint64_t solution_epoch = timestamp / MOOR_POW_TIMESTAMP_WINDOW;
-    uint64_t current_epoch  = now / MOOR_POW_TIMESTAMP_WINDOW;
-
-    /* Only accept solution's epoch if it matches current or previous epoch */
-    if (solution_epoch != current_epoch && solution_epoch + 1 != current_epoch) {
-        return -1; /* epoch too old */
-    }
 
     uint8_t salt_full[32];
     uint8_t salt[crypto_pwhash_SALTBYTES];

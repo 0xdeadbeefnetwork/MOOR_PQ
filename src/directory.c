@@ -4448,23 +4448,18 @@ void moor_da_compute_flags_statistical(moor_da_config_t *config) {
         else
             r->flags &= ~NODE_FLAG_STABLE;
 
-        /* Guard: requires Fast + Stable + sufficient BW + time-known.
-         * F-05: the previous n_active < 100 branch preserved self-declared
-         * Guard unconditionally. Now Guard is always earned: a relay must be
-         * Fast + Stable + meet the bandwidth threshold + have been observed
-         * for at least guard_tk (24h on small networks, 8 days on mature
-         * ones). A fresh Sybil can no longer claim Guard instantly. If a
-         * small network genuinely has no relay meeting the floor, operators
-         * should seed DA config with pinned guards rather than trusting
-         * self-declaration. */
-        if ((r->flags & NODE_FLAG_GUARD) &&
+        /* Guard: assign from DA-observed eligibility, never from the relay's
+         * self-declared bit (which is stripped at descriptor admission).
+         * A relay must be Fast + Stable + meet the bandwidth threshold + have
+         * been observed for at least guard_tk (24h on small networks, 8 days
+         * on mature ones). A fresh Sybil cannot claim Guard instantly. */
+        if (active &&
             (r->flags & NODE_FLAG_FAST) &&
             (r->flags & NODE_FLAG_STABLE) &&
             eff_bw >= guard_bw_threshold &&
             uptime >= guard_tk) {
-            /* Keep Guard: all criteria met */
-        } else if (r->flags & NODE_FLAG_GUARD) {
-            /* Strip Guard: criteria not met */
+            r->flags |= NODE_FLAG_GUARD;
+        } else {
             r->flags &= ~NODE_FLAG_GUARD;
         }
 

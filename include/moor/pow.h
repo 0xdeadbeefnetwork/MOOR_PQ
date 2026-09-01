@@ -16,6 +16,10 @@ int moor_pow_solve(uint64_t *nonce_out, uint64_t *timestamp_out,
                    const uint8_t identity_pk[32], int difficulty,
                    uint32_t memlimit);
 
+/* Return 1 when timestamp is acceptable at now under the relay-admission
+ * freshness and epoch rules, otherwise 0. */
+int moor_pow_timestamp_is_fresh(uint64_t timestamp, uint64_t now);
+
 /*
  * Verify a PoW solution.
  * memlimit: must match the value used by the solver.
