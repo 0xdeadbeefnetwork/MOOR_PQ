@@ -740,7 +740,7 @@ $(FUZZ_OBJDIR)/kyber/%.o: $(SRCDIR)/kyber/%.c | $(FUZZ_OBJDIR)/kyber
 $(FUZZ_OBJDIR)/dilithium/%.o: $(SRCDIR)/dilithium/%.c | $(FUZZ_OBJDIR)/dilithium
 	$(FUZZ_CC) $(FUZZ_LIB_CFLAGS) -c $< -o $@
 
-fuzz/fuzz_%: fuzz/fuzz_%.c $(FUZZ_ALL_OBJECTS) | $(FUZZ_OBJDIR) $(FUZZ_OBJDIR)/kyber $(FUZZ_OBJDIR)/dilithium
+fuzz/fuzz_%: fuzz/fuzz_%.c fuzz/fuzz_stubs.h $(FUZZ_ALL_OBJECTS) | $(FUZZ_OBJDIR) $(FUZZ_OBJDIR)/kyber $(FUZZ_OBJDIR)/dilithium
 	$(FUZZ_CC) $(FUZZ_HARNESS_CFLAGS) $< $(FUZZ_ALL_OBJECTS) -o $@ $(FUZZ_LDFLAGS)
 
 fuzz-build: $(FUZZ_OBJDIR) $(FUZZ_OBJDIR)/kyber $(FUZZ_OBJDIR)/dilithium $(FUZZ_ALL_OBJECTS) $(FUZZ_HARNESSES)
