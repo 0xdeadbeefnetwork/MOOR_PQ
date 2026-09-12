@@ -40,7 +40,9 @@ curl -x socks5h://127.0.0.1:9050 http://example.com
 One-command relay setup:
 
 ```bash
-curl -sL https://raw.githubusercontent.com/0xdeadbeefnetwork/MOOR_PQ/main/setup.sh | sudo bash
+git clone https://github.com/0xdeadbeefnetwork/MOOR_PQ && cd MOOR_PQ
+# read setup.sh first -- it runs as root
+sudo ./setup.sh
 ```
 
 ## Hidden services

@@ -120,14 +120,23 @@ command: installs dependencies, builds from source, creates a system user,
 writes a config file, and starts a systemd service.
 
 ```
-curl -sL https://raw.githubusercontent.com/0xdeadbeefnetwork/MOOR_PQ/main/setup.sh | sudo bash
+git clone https://github.com/0xdeadbeefnetwork/MOOR_PQ && cd MOOR_PQ
+# read setup.sh first -- it runs as root
+sudo ./setup.sh
 ```
 
 Or non-interactively:
 
 ```
-curl -sL .../setup.sh | sudo bash -s -- --role exit --nickname MYRELAY --ip 1.2.3.4
+sudo ./setup.sh --role exit --nickname MYRELAY --ip 1.2.3.4
 ```
+
+The script builds the checkout it is run from, so what you read is what gets
+installed. Piping it from a URL is no longer supported. If there is no checkout
+on the box, `sudo ./setup.sh --fetch <full 40-hex commit id>` clones and
+refuses to build anything but that exact commit. The GeoIP database comes from
+the distro's `tor-geoipdb` package (verified by apt, extracted without
+installing tor), not from a download.
 
 The script supports Debian/Ubuntu (apt), Fedora (dnf), Arch (pacman), and
 Alpine (apk). If the system's libsodium is older than 1.0.18, it automatically
