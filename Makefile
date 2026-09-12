@@ -59,6 +59,7 @@ SOURCES = $(SRCDIR)/log.c \
           $(SRCDIR)/fragment.c \
           $(SRCDIR)/pow.c \
           $(SRCDIR)/geoip.c \
+          $(SRCDIR)/randombytes_moor.c \
           $(SRCDIR)/bw_auth.c \
           $(SRCDIR)/conflux.c \
           $(SRCDIR)/ratelimit.c \
@@ -86,7 +87,13 @@ SOURCES = $(SRCDIR)/log.c \
           $(SRCDIR)/dns_server.c \
           $(SRCDIR)/exit_notice.c
 
-PQCLEAN_SOURCES = $(wildcard $(SRCDIR)/pqclean/common/*.c) \
+# F-14: PQClean leaves randombytes() to the integrator. MOOR supplies it in
+# src/randombytes_moor.c (fail-closed: aborts rather than hand back weak or
+# uninitialised bytes), so upstream's src/pqclean/common/randombytes.c is
+# excluded from the build. The file stays in the tree unmodified -- the
+# vendored PQClean is byte-identical to upstream and is meant to remain so.
+PQCLEAN_SOURCES = $(filter-out $(SRCDIR)/pqclean/common/randombytes.c, \
+                      $(wildcard $(SRCDIR)/pqclean/common/*.c)) \
                   $(wildcard $(SRCDIR)/pqclean/ml_kem_768/*.c) \
                   $(wildcard $(SRCDIR)/pqclean/falcon_512/*.c) \
                   $(wildcard $(SRCDIR)/pqclean/ml_dsa_65/*.c)

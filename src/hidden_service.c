@@ -265,8 +265,10 @@ int moor_hs_save_keys(const moor_hs_config_t *config) {
         return -1;
     }
 
-    /* Create directory */
-    mkdir(config->hs_dir, 0700);
+    /* Create directory. F-18: verify the mode on an existing one -- a
+     * world-readable hidden_service/ leaks the file names, and for a hidden
+     * service the file names are the service. */
+    if (moor_secure_mkdir(config->hs_dir, 0700) != 0) return -1;
 
     char path[512];
 
@@ -2526,7 +2528,7 @@ int moor_hs_decode_address(uint8_t identity_pk[32], const char *address) {
 int moor_hs_save_auth_clients(const moor_hs_config_t *config) {
     char dir[512];
     snprintf(dir, sizeof(dir), "%s/clients", config->hs_dir);
-    mkdir(dir, 0700);
+    if (moor_secure_mkdir(dir, 0700) != 0) return -1;   /* F-18 */
 
     for (int i = 0; i < config->num_auth_clients; i++) {
         char path[576];

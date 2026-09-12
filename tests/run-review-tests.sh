@@ -9,7 +9,8 @@
 #
 # Covers: F-01/F-03/F-04 (path diversity), F-05/F-26 (PQ + upgrade floor),
 #         F-15 (ML-KEM-768 and ML-DSA-65 against NIST vectors),
-#         F-06 (seccomp arch gate), F-10/F-11/F-19 (log redaction).
+#         F-06 (seccomp arch gate), F-10/F-11/F-19 (log redaction),
+#         F-09/F-18 (key store), F-20/F-21/F-27 (descriptor + consensus bounds).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
@@ -44,7 +45,7 @@ WARN="-Wall -Wextra -O2"
 CORE="src/node.c src/crypto.c src/geoip.c src/falcon.c src/kem.c src/log.c
       src/pqclean/falcon_512/*.c
       src/pqclean/common/fips202.c src/pqclean/common/sha2.c
-      src/pqclean/common/aes.c src/pqclean/common/randombytes.c
+      src/pqclean/common/aes.c src/randombytes_moor.c
       src/pqclean/ml_kem_768/*.c"
 LIBS="$SOD_LIB $Z_LIB -lm -lpthread"
 
@@ -79,13 +80,22 @@ run test_pq_mandatory   tests/test_pq_mandatory.c   $CORE $LIBS
 # F-15: the PQ primitives against NIST's own vectors. These are the tests that
 # say the post-quantum claim is true, so they run even though they are slower.
 KEM_SRC="src/kem.c src/log.c src/pqclean/common/fips202.c
-         src/pqclean/common/randombytes.c src/pqclean/ml_kem_768/*.c"
+         src/randombytes_moor.c src/pqclean/ml_kem_768/*.c"
 DSA_SRC="src/sig.c src/log.c src/pqclean/common/fips202.c
-         src/pqclean/common/randombytes.c src/pqclean/ml_dsa_65/*.c"
+         src/randombytes_moor.c src/pqclean/ml_dsa_65/*.c"
 # shellcheck disable=SC2086
 run test_kyber_kat tests/test_kyber_kat.c $KEM_SRC $SOD_LIB -lm
 # shellcheck disable=SC2086
 run test_mldsa_kat tests/test_mldsa_kat.c $DSA_SRC $SOD_LIB -lm
+
+# F-09/F-18: key-store hardening, against real files in a scratch dir.
+KS_SRC="src/crypto.c src/log.c src/kem.c src/sig.c src/falcon.c
+        src/randombytes_moor.c src/pqclean/common/fips202.c
+        src/pqclean/common/sha2.c src/pqclean/common/aes.c
+        src/pqclean/ml_kem_768/*.c src/pqclean/ml_dsa_65/*.c
+        src/pqclean/falcon_512/*.c"
+# shellcheck disable=SC2086
+run test_keystore tests/test_keystore.c $KS_SRC $SOD_LIB -lm
 
 # F-20/F-21/F-27: needs the whole library, so it links the built objects rather
 # than a source subset. Requires `make` to have run; skipped with a note if not.

@@ -4266,10 +4266,14 @@ static int keygen_enclave(const char *data_dir, const char *address,
     /* Ensure data dir exists */
     char keys_dir[512];
     snprintf(keys_dir, sizeof(keys_dir), "%s/keys", data_dir);
-#ifndef _WIN32
-    mkdir(data_dir, 0700);
-    mkdir(keys_dir, 0700);
-#endif
+    /* F-18: mkdir alone leaves an already-existing directory at whatever
+     * mode it has. Key files are 0600, but a readable keys/ leaks the
+     * listing. */
+    if (moor_secure_mkdir(data_dir, 0700) != 0 ||
+        moor_secure_mkdir(keys_dir, 0700) != 0) {
+        fprintf(stderr, "FATAL: cannot secure %s\n", data_dir);
+        return 1;
+    }
 
     /* Generate Ed25519 identity keypair (signing) */
     uint8_t pk[32], sk[64];
