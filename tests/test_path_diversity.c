@@ -55,6 +55,7 @@ static moor_consensus_t *build_consensus(void) {
          * candidate set and the measurements would be about the wrong thing. */
         r->features |= NODE_FEATURE_PQ;
         memset(r->kem_pk, 0xA5, 1184);
+        r->protocol_version = MOOR_PROTOCOL_VERSION;   /* F-26 upgrade floor */
 
         if (evil) {
             memcpy(r->family_id, evil_family, 32);
@@ -191,6 +192,7 @@ static void test_f04(void) {
         r->flags = NODE_FLAG_RUNNING | NODE_FLAG_VALID;
         r->features |= NODE_FEATURE_PQ;
         memset(r->kem_pk, 0xA5, 1184);
+        r->protocol_version = MOOR_PROTOCOL_VERSION;
         memcpy(r->family_id, fam, 32);       /* every relay, one family */
         snprintf(r->nickname, sizeof(r->nickname), "fam%d", i);
     }
@@ -227,6 +229,7 @@ static void test_f04_no_false_negative(void) {
         r->flags = NODE_FLAG_RUNNING | NODE_FLAG_VALID;
         r->features |= NODE_FEATURE_PQ;
         memset(r->kem_pk, 0xA5, 1184);
+        r->protocol_version = MOOR_PROTOCOL_VERSION;
         if (i < 11) {                 /* 11 relays, one family, huge bandwidth */
             memcpy(r->family_id, big, 32);
             r->bandwidth = 1000000000ULL;

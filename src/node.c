@@ -1324,6 +1324,25 @@ const moor_node_descriptor_t *moor_node_select_relay(
         if (g_require_pq && !node_has_pq(r))
             continue;
 
+        /* F-26: enforce the upgrade floor client-side as well as at the DA.
+         *
+         * directory.c already rejects descriptors below
+         * MOOR_MIN_PROTOCOL_VERSION -- "Relays must upgrade to join the
+         * network." But that ran only on the authority, and the client used
+         * whatever the consensus contained without ever reading the field it
+         * was handed. On a network whose trust root is a small number of
+         * authorities, making them the only thing standing between a client
+         * and an out-of-date relay puts the whole upgrade policy behind a
+         * single compromise. A relay running old code is by definition
+         * carrying whatever the upgrade fixed, so the client refuses it
+         * independently.
+         *
+         * protocol_version is a V6 descriptor extension: it reads 0 on a
+         * descriptor that predates the field, which is itself below the floor
+         * and correctly rejected. */
+        if (r->protocol_version < MOOR_MIN_PROTOCOL_VERSION)
+            continue;
+
         /* Check exclusion list */
         int excluded = 0;
         if (exclude_ids) {

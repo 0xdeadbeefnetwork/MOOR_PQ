@@ -202,9 +202,8 @@ static void apply_config_to_globals(const moor_config_t *cfg) {
     if (cfg->exit) g_relay_flags |= NODE_FLAG_EXIT;
     if (cfg->middle_only) g_relay_flags |= NODE_FLAG_MIDDLEONLY;
     g_padding = cfg->padding;
-    /* F-05: PQ-hybrid policy into the circuit and node layers. */
-    moor_circuit_set_require_pq(cfg->require_pq);
-    moor_node_set_require_pq(cfg->require_pq);
+    /* F-05: hybrid PQ is mandatory and has no config path to disable it.
+     * Both modules default to on; the setters exist for tests only. */
     g_verbose = cfg->verbose;
     g_is_bridge = cfg->is_bridge;
     g_use_bridges = cfg->use_bridges;

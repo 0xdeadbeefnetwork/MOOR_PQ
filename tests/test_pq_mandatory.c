@@ -61,6 +61,8 @@ static moor_consensus_t *build_mixed_consensus(void) {
         r->as_number    = (uint32_t)(3000 + i);
         snprintf(r->address, sizeof(r->address), "192.0.2.%d", i + 1);
 
+        r->protocol_version = MOOR_PROTOCOL_VERSION;  /* current: at the floor */
+
         if (i < N_PQ) {
             r->features |= NODE_FEATURE_PQ;
             memset(r->kem_pk, 0xA5, 1184);          /* plausible ML-KEM pk */
@@ -256,6 +258,59 @@ static void test_gate_predicate(void) {
     else bad("expected classical extend for a fully non-PQ relay");
 }
 
+/* ---- F-26: the upgrade floor is enforced client-side, not only at the DA -- */
+
+static void test_protocol_floor(void) {
+    printf("\n== F-26: relays below MOOR_MIN_PROTOCOL_VERSION are not selected ==\n");
+    note("directory.c rejects these at descriptor admission -- 'Relays must");
+    note("upgrade to join the network'. But that is the authority's check.");
+    note("A client must not depend on the DA to have done it.");
+
+    moor_consensus_t *c = build_mixed_consensus();
+    /* Make every relay PQ-capable so PQ is not what excludes them, then age
+     * half of them below the floor. */
+    for (int i = 0; i < N_RELAYS; i++) {
+        c->relays[i].features |= NODE_FEATURE_PQ;
+        memset(c->relays[i].kem_pk, 0xA5, 1184);
+        if (i >= N_RELAYS / 2) {
+            c->relays[i].protocol_version = MOOR_MIN_PROTOCOL_VERSION - 1;
+            snprintf(c->relays[i].nickname, sizeof(c->relays[i].nickname), "old%d", i);
+        }
+    }
+
+    int stale_selected = 0, total = 0;
+    for (int t = 0; t < TRIALS; t++) {
+        uint8_t ex[1][32];
+        const moor_node_descriptor_t *r =
+            moor_node_select_relay(c, NODE_FLAG_RUNNING, (const uint8_t *)ex, 0);
+        if (!r) continue;
+        total++;
+        if (r->protocol_version < MOOR_MIN_PROTOCOL_VERSION) stale_selected++;
+    }
+    free_consensus(c);
+
+    char buf[192];
+    snprintf(buf, sizeof(buf),
+             "out-of-date relay selected %d/%d times (floor: protocol v%u)",
+             stale_selected, total, (unsigned)MOOR_MIN_PROTOCOL_VERSION);
+    if (stale_selected == 0) ok(buf); else bad(buf);
+
+    /* A descriptor predating the V6 protocol_version field reads 0, which is
+     * below the floor and must also be refused. */
+    moor_consensus_t *d = build_mixed_consensus();
+    for (int i = 0; i < N_RELAYS; i++) {
+        d->relays[i].features |= NODE_FEATURE_PQ;
+        memset(d->relays[i].kem_pk, 0xA5, 1184);
+        d->relays[i].protocol_version = 0;      /* field absent on the wire */
+    }
+    uint8_t ex[1][32];
+    const moor_node_descriptor_t *any =
+        moor_node_select_relay(d, NODE_FLAG_RUNNING, (const uint8_t *)ex, 0);
+    free_consensus(d);
+    if (!any) ok("a consensus of pre-V6 descriptors yields no candidate at all");
+    else bad("a pre-V6 descriptor (protocol_version 0) was selected");
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (sodium_init() < 0) { fprintf(stderr, "sodium_init failed\n"); return 2; }
@@ -265,6 +320,7 @@ int main(void) {
     test_require_pq_all_pq_network();
     test_pq_selector_works_but_is_unused();
     test_gate_predicate();
+    test_protocol_floor();
 
     printf("\n%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
