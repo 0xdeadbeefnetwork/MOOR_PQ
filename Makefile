@@ -699,7 +699,7 @@ FUZZ_LIB_CFLAGS = -Wall -Wextra -O1 -g -fno-strict-aliasing \
                   -DMOOR_SYSCONFDIR='"$(SYSCONFDIR)/moor"' \
                   $(SODIUM_CFLAGS) $(LIBEVENT_CFLAGS) $(ZLIB_CFLAGS)
 # Harness files: add -fsanitize=fuzzer for LLVMFuzzerTestOneInput linkage
-FUZZ_HARNESS_CFLAGS = $(FUZZ_LIB_CFLAGS) -fsanitize=fuzzer
+FUZZ_HARNESS_CFLAGS = $(FUZZ_LIB_CFLAGS) -Ifuzz -fsanitize=fuzzer
 FUZZ_LDFLAGS = -fsanitize=fuzzer,address,undefined \
                $(SODIUM_LIBS) $(LIBEVENT_LIBS) -lm -lpthread $(ZLIB_LIBS)
 

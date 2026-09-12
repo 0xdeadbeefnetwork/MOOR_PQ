@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <string.h>
 #include "moor/moor.h"
+#include "fuzz_stubs.h"
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (size < 1) return 0;

@@ -13,6 +13,7 @@
 #include <string.h>
 #include <sodium.h>
 #include "moor/moor.h"
+#include "fuzz_stubs.h"
 
 int LLVMFuzzerInitialize(int *argc, char ***argv) {
     (void)argc; (void)argv;

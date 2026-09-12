@@ -32,6 +32,7 @@ hs_keys/
 site/
 fuzz/*
 !fuzz/fuzz_*.c
+!fuzz/fuzz_stubs.h
 deploy.sh
 deploy-debug.sh
 fuzzer.sh
