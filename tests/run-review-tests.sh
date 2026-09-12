@@ -3,7 +3,7 @@
 #
 # These need libsodium + zlib headers. If they are not installed system-wide,
 # this script fetches the distro packages and unpacks them into a local prefix
-# -- no root, nothing installed on the system.
+# under ~/.cache/moor-review-tests -- no root, nothing installed on the system.
 #
 #   ./tests/run-review-tests.sh
 #
@@ -14,7 +14,10 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
-WORK=${MOOR_TEST_WORK:-/tmp/moor-review-tests}
+# The prefix below holds fetched .debs and unpacked headers/archives -- it is
+# expensive to rebuild (needs network + apt-get download) and must survive a
+# reboot, so it lives in the XDG cache, not /tmp. Override with MOOR_TEST_WORK.
+WORK=${MOOR_TEST_WORK:-${XDG_CACHE_HOME:-$HOME/.cache}/moor-review-tests}
 mkdir -p "$WORK"
 
 # ---- dependency prefix ------------------------------------------------

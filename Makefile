@@ -18,6 +18,7 @@ EXTRA_LDFLAGS ?=
 
 CFLAGS = -Wall -Wextra -O2 -g3 -fno-strict-aliasing -fstack-protector-strong \
          -fno-omit-frame-pointer \
+         -ffile-prefix-map=$(CURDIR)=. \
          -D_FORTIFY_SOURCE=2 -Iinclude \
          -Isrc/pqclean -Isrc/pqclean/common \
          -fPIE -Wformat -Wformat-security \
@@ -190,7 +191,7 @@ TEST_SERIALIZE_TARGET = $(BUILDDIR)/test_serialize
 TEST_DESCRIPTOR_TARGET = $(BUILDDIR)/test_descriptor
 TEST_PRODUCTION_REGRESSIONS_TARGET = $(BUILDDIR)/test_production_regressions
 
-.PHONY: all clean tests tools test check test-production-regressions install uninstall distclean static-analysis asan-test tsan-test fuzz-build fuzz fuzz-clean coverage infer kat dudect cbmc build-moor-top
+.PHONY: all release clean tests tools test check test-production-regressions install uninstall distclean static-analysis asan-test tsan-test fuzz-build fuzz fuzz-clean coverage infer kat dudect cbmc build-moor-top
 
 all: $(OBJDIR) $(OBJDIR)/pqclean $(TARGET)
 
@@ -417,8 +418,17 @@ test: tests
 	./$(TEST_PRODUCTION_REGRESSIONS_TARGET)
 	@echo "=== All tests passed ==="
 
+# Release: the installable binary with its debug info split out rather than
+# thrown away -- moor.debug stays beside it so a crash off a live relay can
+# still be read. Same dirty-tree guard as any build (build_id).
+release: all
+	objcopy --only-keep-debug $(TARGET) $(TARGET).debug
+	objcopy --strip-debug --strip-unneeded --add-gnu-debuglink=$(TARGET).debug $(TARGET)
+	chmod 644 $(TARGET).debug
+	@echo "Release: $(TARGET) (symbols in $(TARGET).debug)"
+
 clean:
-	rm -rf $(OBJDIR) $(TARGET) $(KEYGEN_TARGET) $(MOOR_TOP_TARGET)
+	rm -rf $(OBJDIR) $(TARGET) $(TARGET).debug $(KEYGEN_TARGET) $(MOOR_TOP_TARGET)
 	rm -f $(TEST_CRYPTO_TARGET) $(TEST_CELL_TARGET) $(TEST_CIRCUIT_TARGET) $(TEST_CONFIG_TARGET)
 	rm -f $(TEST_TRANSPORT_TARGET) $(TEST_KEM_TARGET)
 	rm -f $(TEST_FRAGMENT_TARGET) $(TEST_PQ_CIRCUIT_TARGET) $(TEST_POW_TARGET) $(TEST_GEOIP_TARGET)
