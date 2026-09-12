@@ -137,6 +137,14 @@ static moor_ctrl_client_t *ctrl_client_find(int fd) {
     return NULL;
 }
 
+/* F-17: process-wide authentication failure counter. Deliberately not part of
+ * moor_ctrl_client_t -- a per-connection counter is reset by reconnecting,
+ * which is not a rate limit. */
+#define MOOR_CTRL_MAX_AUTH_FAILURES 5
+#define MOOR_CTRL_AUTH_LOCKOUT_MS   60000
+static int      g_auth_fail_count = 0;
+static uint64_t g_auth_fail_time  = 0;
+
 /* Auth is ALWAYS required on the control port */
 static int auth_required(void) {
     return 1;
@@ -218,25 +226,39 @@ static void handle_ctrl_command(moor_ctrl_client_t *client, const char *cmd) {
             clean_token[tlen - 2] = '\0';
         }
 
-        /* Rate limit: max 5 failures per 60 seconds */
-        if (client->auth_fail_count >= 5) {
-            if (moor_time_ms() - client->auth_fail_time < 60000) {
+        /* F-17: the limiter is process-wide, not per-connection.
+         *
+         * It used to count failures on the client struct, which is freed when
+         * the socket closes -- so five guesses, reconnect, five more, with no
+         * limit at all. The control port is loopback-only so the attacker is
+         * already local, but "already local" is exactly the position a
+         * password is supposed to survive: another user on the box, or any
+         * process that can open a loopback socket. The counter now lives
+         * outside the connection, so closing it buys nothing. */
+        if (g_auth_fail_count >= MOOR_CTRL_MAX_AUTH_FAILURES) {
+            uint64_t since = moor_time_ms() - g_auth_fail_time;
+            if (since < MOOR_CTRL_AUTH_LOCKOUT_MS) {
+                LOG_WARN("control port: authentication locked out for another "
+                         "%llu s after %d failures",
+                         (unsigned long long)((MOOR_CTRL_AUTH_LOCKOUT_MS - since) / 1000),
+                         g_auth_fail_count);
                 ctrl_send(client->fd, "515 Too many attempts\r\n", 23);
                 return;
             }
-            /* Window expired — reset for a fresh batch of attempts */
-            client->auth_fail_count = 0;
-            client->auth_fail_time = 0;
+            g_auth_fail_count = 0;
+            g_auth_fail_time = 0;
         }
 
         if (!auth_required() || verify_auth(clean_token)) {
             client->authenticated = 1;
-            client->auth_fail_count = 0;
-            client->auth_fail_time = 0;
+            g_auth_fail_count = 0;
+            g_auth_fail_time = 0;
             ctrl_send(client->fd, "250 OK\r\n", 8);
         } else {
-            client->auth_fail_count++;
-            client->auth_fail_time = moor_time_ms();
+            g_auth_fail_count++;
+            g_auth_fail_time = moor_time_ms();
+            LOG_WARN("control port: failed authentication (%d/%d before lockout)",
+                     g_auth_fail_count, MOOR_CTRL_MAX_AUTH_FAILURES);
             ctrl_send(client->fd, "515 Bad authentication\r\n", 24);
         }
         return;

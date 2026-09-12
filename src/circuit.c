@@ -246,11 +246,75 @@ static const char *destroy_reason_str(uint8_t reason) {
     }
 }
 
-/* Global GeoIP database for diverse path selection (NULL if not loaded) */
+/* Global GeoIP database. Since F-01 this only enriches the best-effort
+ * country/AS checks -- family and IP-prefix diversity no longer depend on it. */
 static moor_geoip_db_t *g_geoip_db = NULL;
 
 void moor_circuit_set_geoip(moor_geoip_db_t *db) {
     g_geoip_db = db;
+}
+
+/* F-05: when set, every hop must offer hybrid PQ or the circuit is not built.
+ * Defaults to 1 so a build that never calls the setter still refuses
+ * downgrades -- failing closed is the behaviour the README already claims. */
+static int g_require_pq = 1;
+
+void moor_circuit_set_require_pq(int require) {
+    g_require_pq = require ? 1 : 0;
+    if (!g_require_pq)
+        LOG_WARN("circuit: RequirePQ disabled -- classical-only hops permitted");
+}
+
+int moor_circuit_require_pq(void) {
+    return g_require_pq;
+}
+
+/* The single hop-eligibility predicate. Both the selection flags and the
+ * extend decision derive from this, so they can no longer disagree. */
+static int hop_has_pq(const moor_node_descriptor_t *r) {
+    return (r->features & NODE_FEATURE_PQ) && !sodium_is_zero(r->kem_pk, 1184);
+}
+
+/*
+ * F-05: extend one hop, refusing a classical downgrade.
+ *
+ * The old code had this decision open-coded at four sites: if the hop offered
+ * PQ it extended with PQ, otherwise it extended classically and logged a
+ * warning -- but only when kem_pk was non-zero, so a relay that never
+ * advertised PQ was downgraded in total silence. Measured on a half-PQ
+ * consensus, 95.1% of circuits carried at least one classical hop while the
+ * README said "PQ hybrid is mandatory. There is no downgrade path."
+ *
+ * Now: with RequirePQ (the default) a hop without PQ is a hard failure. The
+ * circuit is abandoned and the caller picks a different path rather than
+ * quietly giving the user X25519-only protection on that hop.
+ */
+static int moor_circuit_extend_checked(moor_circuit_t *circ,
+                                       const moor_node_descriptor_t *next,
+                                       const char *position) {
+    if (hop_has_pq(next))
+        return moor_circuit_extend_pq(circ, next);
+
+    if (g_require_pq) {
+        LOG_ERROR("circuit %u: %s relay %s:%u offers no hybrid PQ and "
+                  "RequirePQ is set -- abandoning circuit rather than "
+                  "downgrading this hop to classical X25519",
+                  circ->circuit_id, position, next->address, next->or_port);
+        return -1;
+    }
+
+    /* RequirePQ disabled: warn on every downgrade, not only when the relay
+     * used to have a key. A relay that never advertised PQ is still a hop the
+     * user is getting no post-quantum protection on. */
+    if (!sodium_is_zero(next->kem_pk, 1184))
+        LOG_WARN("circuit %u: %s relay %s:%u lost PQ capability -- possible "
+                 "downgrade attack", circ->circuit_id, position,
+                 next->address, next->or_port);
+    else
+        LOG_WARN("circuit %u: %s relay %s:%u has no PQ capability -- this hop "
+                 "is classical X25519 only", circ->circuit_id, position,
+                 next->address, next->or_port);
+    return moor_circuit_extend(circ, next);
 }
 
 /* ---- Tor-aligned deferred close queue ----
@@ -2478,17 +2542,32 @@ int moor_circuit_build(moor_circuit_t *circ,
     guard_conn->circuit_refcount++;
 
     /* CREATE with guard — use PQ hybrid if relay supports Kyber768.
-     * Fallback to classical if PQ CREATE fails (some relays don't handle
-     * CREATE_PQ on standalone connections vs channel-multiplexed ones). */
+     *
+     * F-05(b): the classical retry below used to be unconditional. Because a
+     * failed PQ CREATE is indistinguishable from a dropped CELL_KEM_CT, an
+     * on-path attacker could force the guard hop down to X25519-only just by
+     * discarding one cell, repeatably. Under RequirePQ (the default) the
+     * retry is gone: a PQ CREATE failure fails the circuit, and the caller
+     * picks another guard. The retry is kept only when the operator has
+     * explicitly set RequirePQ 0 to talk to a pre-PQ network. */
     memcpy(circ->hops[0].node_id, guard->identity_pk, 32);
     int create_ok = 0;
-    if ((guard->features & NODE_FEATURE_PQ) && !sodium_is_zero(guard->kem_pk, 1184)) {
+    if (hop_has_pq(guard)) {
         if (moor_circuit_create_pq(circ, guard->identity_pk, guard->onion_pk, guard->kem_pk) == 0) {
             create_ok = 1;
+        } else if (g_require_pq) {
+            LOG_ERROR("circuit %u: PQ CREATE failed with guard %s:%u and "
+                      "RequirePQ is set -- abandoning this guard rather than "
+                      "retrying classical (a dropped KEM cell must not be a "
+                      "downgrade oracle)",
+                      circ->circuit_id, guard->address, guard->or_port);
+            moor_guard_mark_unreachable(&g_pathbias_guard_state, guard->identity_pk);
+            return -1;
         } else {
             /* PQ failed — reconnect and try classical.  The connection state
              * is corrupted after a failed PQ exchange (nonces advanced). */
-            LOG_WARN("PQ CREATE failed, falling back to classical CKE");
+            LOG_WARN("PQ CREATE failed, falling back to classical CKE "
+                     "(RequirePQ is disabled)");
             if (guard_conn->fd >= 0) {
                 close(guard_conn->fd);
                 guard_conn->fd = -1;
@@ -2504,6 +2583,11 @@ int moor_circuit_build(moor_circuit_t *circ,
                     create_ok = 1;
             }
         }
+    } else if (g_require_pq) {
+        LOG_ERROR("circuit %u: guard %s:%u offers no hybrid PQ and RequirePQ "
+                  "is set -- refusing to build a classical-only first hop",
+                  circ->circuit_id, guard->address, guard->or_port);
+        return -1;
     } else {
         /* R10-ADV2: Warn on possible PQ downgrade */
         if (!sodium_is_zero(guard->kem_pk, 1184))
@@ -2516,22 +2600,25 @@ int moor_circuit_build(moor_circuit_t *circ,
 
     /* Select exit first (exclude guard) -- reserve it so middle selection
      * doesn't consume the only exit relay.
-     * Use GeoIP-diverse selection if GeoIP database is loaded. */
+     *
+     * F-01: diversity selection is now UNCONDITIONAL. It used to run only
+     * when a GeoIP database was loaded, which meant the family check -- a
+     * DA-assigned property with nothing to do with GeoIP -- was skipped on
+     * every build that had no GeoIP file. The repo ships none and setup.sh
+     * fetches it with "|| true", so the default client enforced nothing and
+     * handed ~20% of circuits wholly to one operator in a 4-of-6 consensus
+     * (tests/test_path_diversity.c). The selector now enforces family and IP
+     * prefix always, and treats country/AS as best-effort when GeoIP data is
+     * present. */
     memcpy(exclude + 32, guard->identity_pk, 32);
     const moor_node_descriptor_t *selected_descs[3];
     selected_descs[0] = guard;
 
-    const moor_node_descriptor_t *exit_relay;
-    if (g_geoip_db) {
-        exit_relay = moor_node_select_relay_diverse(
-            consensus, NODE_FLAG_EXIT | NODE_FLAG_RUNNING,
-            exclude, 2, selected_descs, 1);
-    } else {
-        exit_relay = moor_node_select_relay(
-            consensus, NODE_FLAG_EXIT | NODE_FLAG_RUNNING, exclude, 2);
-    }
+    const moor_node_descriptor_t *exit_relay = moor_node_select_relay_diverse(
+        consensus, NODE_FLAG_EXIT | NODE_FLAG_RUNNING,
+        exclude, 2, selected_descs, 1);
     if (!exit_relay) {
-        LOG_ERROR("no suitable exit relay");
+        LOG_ERROR("no suitable exit relay (no candidate is diverse from the guard)");
         return -1;
     }
 
@@ -2539,39 +2626,18 @@ int moor_circuit_build(moor_circuit_t *circ,
     memcpy(exclude + 64, exit_relay->identity_pk, 32);
     selected_descs[1] = exit_relay;
 
-    const moor_node_descriptor_t *middle;
-    if (g_geoip_db) {
-        middle = moor_node_select_relay_diverse(
-            consensus, NODE_FLAG_RUNNING, exclude, 3,
-            selected_descs, 2);
-    } else {
-        middle = moor_node_select_relay(
-            consensus, NODE_FLAG_RUNNING, exclude, 3);
-    }
+    const moor_node_descriptor_t *middle = moor_node_select_relay_diverse(
+        consensus, NODE_FLAG_RUNNING, exclude, 3, selected_descs, 2);
     if (!middle) {
-        LOG_ERROR("no suitable middle relay");
+        LOG_ERROR("no suitable middle relay (no candidate is diverse from guard+exit)");
         return -1;
     }
 
     /* EXTEND to middle */
-    if ((middle->features & NODE_FEATURE_PQ) && !sodium_is_zero(middle->kem_pk, 1184))
-        { if (moor_circuit_extend_pq(circ, middle) != 0) return -1; }
-    else {
-        if (!sodium_is_zero(middle->kem_pk, 1184))
-            LOG_WARN("relay %s:%u lost PQ capability -- possible downgrade attack",
-                     middle->address, middle->or_port);
-        if (moor_circuit_extend(circ, middle) != 0) return -1;
-    }
+    if (moor_circuit_extend_checked(circ, middle, "middle") != 0) return -1;
 
     /* EXTEND to exit */
-    if ((exit_relay->features & NODE_FEATURE_PQ) && !sodium_is_zero(exit_relay->kem_pk, 1184))
-        { if (moor_circuit_extend_pq(circ, exit_relay) != 0) return -1; }
-    else {
-        if (!sodium_is_zero(exit_relay->kem_pk, 1184))
-            LOG_WARN("relay %s:%u lost PQ capability -- possible downgrade attack",
-                     exit_relay->address, exit_relay->or_port);
-        if (moor_circuit_extend(circ, exit_relay) != 0) return -1;
-    }
+    if (moor_circuit_extend_checked(circ, exit_relay, "exit") != 0) return -1;
 
     /* Path bias: record build success + update guard reachability */
     moor_pathbias_count_build_success(&g_pathbias_guard_state,
@@ -2713,15 +2779,11 @@ int moor_circuit_build_bridge(moor_circuit_t *circ,
     const moor_node_descriptor_t *selected_descs[3];
     selected_descs[0] = NULL; /* bridge is not in consensus */
 
-    const moor_node_descriptor_t *exit_relay;
-    if (g_geoip_db) {
-        exit_relay = moor_node_select_relay_diverse(
-            consensus, NODE_FLAG_EXIT | NODE_FLAG_RUNNING,
-            exclude, 2, selected_descs, 0);
-    } else {
-        exit_relay = moor_node_select_relay(
-            consensus, NODE_FLAG_EXIT | NODE_FLAG_RUNNING, exclude, 2);
-    }
+    /* F-01: unconditional diversity selection -- see the note in the
+     * non-bridge builder above. */
+    const moor_node_descriptor_t *exit_relay = moor_node_select_relay_diverse(
+        consensus, NODE_FLAG_EXIT | NODE_FLAG_RUNNING,
+        exclude, 2, selected_descs, 0);
     if (!exit_relay) {
         LOG_ERROR("no suitable exit relay");
         bridge_conn->circuit_refcount--;
@@ -2731,39 +2793,24 @@ int moor_circuit_build_bridge(moor_circuit_t *circ,
     memcpy(exclude + 64, exit_relay->identity_pk, 32);
     selected_descs[0] = exit_relay;
 
-    const moor_node_descriptor_t *middle;
-    if (g_geoip_db) {
-        middle = moor_node_select_relay_diverse(
-            consensus, NODE_FLAG_RUNNING, exclude, 3,
-            selected_descs, 1);
-    } else {
-        middle = moor_node_select_relay(
-            consensus, NODE_FLAG_RUNNING, exclude, 3);
-    }
+    const moor_node_descriptor_t *middle = moor_node_select_relay_diverse(
+        consensus, NODE_FLAG_RUNNING, exclude, 3, selected_descs, 1);
     if (!middle) {
-        LOG_ERROR("no suitable middle relay");
+        LOG_ERROR("no suitable middle relay (no candidate is diverse from the exit)");
         bridge_conn->circuit_refcount--;
         return -1;
     }
 
     /* EXTEND to middle */
-    if ((middle->features & NODE_FEATURE_PQ) && !sodium_is_zero(middle->kem_pk, 1184))
-        { if (moor_circuit_extend_pq(circ, middle) != 0) { bridge_conn->circuit_refcount--; return -1; } }
-    else {
-        if (!sodium_is_zero(middle->kem_pk, 1184))
-            LOG_WARN("relay %s:%u lost PQ capability -- possible downgrade attack",
-                     middle->address, middle->or_port);
-        if (moor_circuit_extend(circ, middle) != 0) { bridge_conn->circuit_refcount--; return -1; }
+    if (moor_circuit_extend_checked(circ, middle, "middle") != 0) {
+        bridge_conn->circuit_refcount--;
+        return -1;
     }
 
     /* EXTEND to exit */
-    if ((exit_relay->features & NODE_FEATURE_PQ) && !sodium_is_zero(exit_relay->kem_pk, 1184))
-        { if (moor_circuit_extend_pq(circ, exit_relay) != 0) { bridge_conn->circuit_refcount--; return -1; } }
-    else {
-        if (!sodium_is_zero(exit_relay->kem_pk, 1184))
-            LOG_WARN("relay %s:%u lost PQ capability -- possible downgrade attack",
-                     exit_relay->address, exit_relay->or_port);
-        if (moor_circuit_extend(circ, exit_relay) != 0) { bridge_conn->circuit_refcount--; return -1; }
+    if (moor_circuit_extend_checked(circ, exit_relay, "exit") != 0) {
+        bridge_conn->circuit_refcount--;
+        return -1;
     }
 
     LOG_INFO("circuit %u built via bridge: 3 hops (transport=%s)",

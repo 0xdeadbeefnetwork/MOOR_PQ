@@ -1,14 +1,24 @@
 #!/bin/bash
 # MOOR Relay Setup v0.8.1
-# One command to fetch, build, configure, and start a MOOR node.
+# One command to build, configure, and start a MOOR node -- from the checkout
+# it is run in. What you read is what gets installed.
 #
-# Usage:
-#   curl -sL https://moor.afflicted.sh/install.sh | sudo bash
+# Usage (from a clone you have looked at):
+#   git clone https://github.com/0xdeadbeefnetwork/MOOR_PQ && cd MOOR_PQ
+#   sudo ./setup.sh
 #
 # Non-interactive:
-#   curl -sL .../install.sh | sudo bash -s -- --role exit --nickname MYRELAY --ip 1.2.3.4
-#   curl -sL .../install.sh | sudo bash -s -- --role bridge --nickname MYBRIDGE --ip 1.2.3.4 --transport shitstorm
-#   curl -sL .../install.sh | sudo bash -s -- --role relay --enclave /path/to/mynet.enclave
+#   sudo ./setup.sh --role exit --nickname MYRELAY --ip 1.2.3.4
+#   sudo ./setup.sh --role bridge --nickname MYBRIDGE --ip 1.2.3.4 --transport shitstorm
+#   sudo ./setup.sh --role relay --enclave /path/to/mynet.enclave
+#
+# Pinned fetch, when there is no checkout on the box:
+#   sudo ./setup.sh --fetch <full 40-hex commit id> [--repo URL]
+#
+# Piping this file from a URL into a root shell is not supported any more:
+# that installed whatever upstream HEAD was at that moment (review finding
+# F-16). --fetch takes a commit id, never a branch or tag, and refuses any
+# tree that does not resolve to exactly that commit.
 
 main() {
 
@@ -16,7 +26,7 @@ set -euo pipefail
 
 # Detect if we can prompt the user. Three cases:
 #   1. Interactive terminal (./setup.sh) → stdin works
-#   2. Piped with tty (curl | sudo bash in terminal) → /dev/tty works
+#   2. No stdin but a tty (sudo under some terminals) → /dev/tty works
 #   3. Piped without tty (ssh remote sudo) → no prompts, flags required
 STDIN_FD=0
 if [[ ! -t 0 ]]; then
@@ -39,10 +49,14 @@ MOOR_USER="moor"
 TRANSPORT=""
 ENCLAVE=""
 CONTACT_INFO=""
+FETCH_COMMIT=""
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 detect_ip() {
+    # F-24: these third parties learn this machine's public IP. Harmless for a
+    # relay whose address is about to be published anyway, but a privacy tool
+    # should say so rather than do it quietly. --ip skips this entirely.
     curl -4s --max-time 5 https://ifconfig.me 2>/dev/null ||
     curl -4s --max-time 5 https://icanhazip.com 2>/dev/null ||
     curl -4s --max-time 5 https://api.ipify.org 2>/dev/null ||
@@ -58,6 +72,8 @@ while [[ $# -gt 0 ]]; do
         --transport) TRANSPORT="$2"; shift 2 ;;
         --enclave)   ENCLAVE="$2"; shift 2 ;;
         --contact)   CONTACT_INFO="$2"; shift 2 ;;
+        --fetch)     FETCH_COMMIT="$2"; shift 2 ;;
+        --repo)      REPO_URL="$2"; shift 2 ;;
         --help|-h)
             echo "Usage: sudo $0 [OPTIONS]"
             echo ""
@@ -73,7 +89,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ "$(id -u)" -eq 0 ]] || die "Run with: curl -sL .../install.sh | sudo bash"
+[[ "$(id -u)" -eq 0 ]] || die "Run with: sudo ./setup.sh"
 
 cat << 'BANNER'
 
@@ -95,7 +111,9 @@ ask() {
     if [[ -n "$STDIN_FD" ]]; then
         read -rp "$prompt" "$var" <&$STDIN_FD
     elif [[ -n "$default" ]]; then
-        eval "$var='$default'"
+        # F-25: printf %q quotes the value so a default containing a single
+        # quote cannot break out of the assignment.
+        eval "$var=$(printf '%q' "$default")"
     else
         die "$var is required (no terminal for prompt — pass via flags)"
     fi
@@ -225,26 +243,63 @@ if pkg-config --exists libsodium 2>/dev/null; then
     if [[ "$(printf '%s\n' "1.0.18" "$SODIUM_VER" | sort -V | head -1)" != "1.0.18" ]]; then
         echo "  libsodium $SODIUM_VER too old, building 1.0.20 from source..."
         cd /tmp
-        curl -sLO https://download.libsodium.org/libsodium/releases/libsodium-1.0.20-RELEASE.tar.gz
-        tar xzf libsodium-1.0.20-RELEASE.tar.gz
-        cd libsodium-1.0.20-RELEASE
-        ./configure --prefix=/usr/local >/dev/null 2>&1
-        make -j"$(nproc)" >/dev/null 2>&1 && make install >/dev/null 2>&1
-        ldconfig
-        cd /tmp && rm -rf libsodium-1.0.20-RELEASE*
+        # F-16: this used to download a libsodium tarball over plain HTTPS
+        # with no signature or checksum check and build it as root -- the
+        # shortest path from a compromised mirror or DNS answer to every
+        # relay's identity key. libsodium publishes minisign signatures; none
+        # were checked.
+        #
+        # It is also dead: that URL now returns 404, so the fallback has been
+        # silently broken as well as unverified.
+        #
+        # Rather than pin a checksum this script cannot establish, refuse.
+        # Installing a crypto library is the operator's decision to make
+        # deliberately, from a source they trust, not something an install
+        # script should do for them unverified.
+        die "libsodium is not available from this system's package manager.
+  Install it deliberately before re-running, either from your distribution or
+  from source you have verified yourself:
+
+    https://doc.libsodium.org/installation
+
+  Verify the release signature with minisign against libsodium's published
+  public key. This script will not download and build a crypto library
+  unverified as root."
     fi
 else
     die "libsodium not found after install."
 fi
 echo "  done"
 
-# ---- fetch source ----
+# ---- source ----
+# The tree this script sits in is the tree that gets built. The only fetch
+# left is --fetch COMMIT, and it refuses anything but that exact commit.
+SRC_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "$(dirname "${BASH_SOURCE[0]}")/src/main.c" ]]; then
+    SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
 
-echo "[2/5] Fetching source..."
-rm -rf "$BUILD_DIR"
-git clone --depth 1 "$REPO_URL" "$BUILD_DIR" 2>/dev/null ||
-    die "Failed to clone $REPO_URL"
-echo "  done"
+if [[ -n "$FETCH_COMMIT" ]]; then
+    [[ "$FETCH_COMMIT" =~ ^[0-9a-f]{40}$ ]] ||
+        die "--fetch needs the full 40-hex commit id, not a branch or tag -- that is what makes it a pin"
+    echo "[2/5] Fetching $REPO_URL at $FETCH_COMMIT..."
+    rm -rf "$BUILD_DIR"
+    git clone -q "$REPO_URL" "$BUILD_DIR" 2>/dev/null || die "Failed to clone $REPO_URL"
+    git -C "$BUILD_DIR" checkout -q "$FETCH_COMMIT" 2>/dev/null ||
+        die "$FETCH_COMMIT is not a commit in $REPO_URL"
+    [[ "$(git -C "$BUILD_DIR" rev-parse HEAD)" == "$FETCH_COMMIT" ]] ||
+        die "checked-out tree is not $FETCH_COMMIT -- refusing to build it"
+    echo "  done"
+elif [[ -n "$SRC_DIR" ]]; then
+    echo "[2/5] Using source tree $SRC_DIR (commit $(git -C "$SRC_DIR" rev-parse --short HEAD 2>/dev/null || echo 'unknown, not a git checkout'))..."
+    if [[ "$SRC_DIR" != "$BUILD_DIR" ]]; then
+        rm -rf "$BUILD_DIR"
+        cp -a "$SRC_DIR" "$BUILD_DIR"
+    fi
+    echo "  done"
+else
+    die "run this from a MOOR_PQ checkout (git clone it, read it, then: sudo ./setup.sh), or pass --fetch <full commit id>. Piping setup.sh from a URL is not supported."
+fi
 
 # ---- build ----
 
@@ -256,27 +311,51 @@ if ! ./configure > /tmp/moor_build.log 2>&1; then
     tail -5 /tmp/moor_build.log
     die "Run manually: cd $BUILD_DIR && ./configure && make"
 fi
-if ! make -j"$(nproc)" >> /tmp/moor_build.log 2>&1; then
+# `make release` is the deployable binary: debug info split into moor.debug
+# rather than shipped inside a 4 MB relay. The symbols go where gdb looks for
+# a debuglink of an installed binary, so a crash off a live relay is readable.
+if ! make -j"$(nproc)" release >> /tmp/moor_build.log 2>&1; then
     echo "  build failed:"
     tail -10 /tmp/moor_build.log
-    die "Run manually: cd $BUILD_DIR && make"
+    die "Run manually: cd $BUILD_DIR && make release"
 fi
 install -m 755 moor /usr/local/bin/moor
-echo "  installed /usr/local/bin/moor"
+install -d /usr/lib/debug/usr/local/bin
+install -m 644 moor.debug /usr/lib/debug/usr/local/bin/moor.debug
+echo "  installed /usr/local/bin/moor ($(stat -c %s moor) bytes; symbols in /usr/lib/debug/usr/local/bin/moor.debug)"
 
-# Fetch GeoIP database for path diversity (Tor-format IPFire location data)
+# GeoIP database for country diversity (Tor-format, IPFire location data).
+# Tor stopped shipping src/config/geoip in its repo on 2024-03-05, so the old
+# raw-GitHub fetch has 404'd on every fresh relay since. Take the files from
+# the distro instead: apt checks the package against its keyring, and
+# `apt-get download` + `dpkg -x` gives the two files without installing the
+# tor daemon that tor-geoipdb depends on. Other distros ship the same files in
+# their tor package; use them when present. Nothing is fetched over bare curl.
+# moor looks in $GEOIP_DIR on its own (src/main.c), so no config line is needed.
 GEOIP_DIR="/usr/local/share/moor"
 mkdir -p "$GEOIP_DIR"
-if [[ ! -f "$GEOIP_DIR/geoip" ]]; then
-    echo "  fetching GeoIP database..."
-    curl -sL "https://raw.githubusercontent.com/torproject/tor/main/src/config/geoip" \
-        -o "$GEOIP_DIR/geoip" 2>/dev/null || true
-    if [[ -s "$GEOIP_DIR/geoip" ]]; then
-        echo "  installed GeoIP ($(wc -l < "$GEOIP_DIR/geoip") entries)"
-    else
-        echo "  GeoIP fetch failed (path diversity will be disabled)"
-        rm -f "$GEOIP_DIR/geoip"
+if [[ ! -s "$GEOIP_DIR/geoip" ]]; then
+    geoip_src=""
+    geoip_tmp=""
+    if command -v apt-get >/dev/null 2>&1; then
+        geoip_tmp=$(mktemp -d)
+        if (cd "$geoip_tmp" && apt-get download tor-geoipdb >/dev/null 2>&1) &&
+           dpkg -x "$geoip_tmp"/tor-geoipdb_*.deb "$geoip_tmp/x" 2>/dev/null &&
+           [[ -s "$geoip_tmp/x/usr/share/tor/geoip" ]]; then
+            geoip_src="$geoip_tmp/x/usr/share/tor"
+        fi
+    elif [[ -s /usr/share/tor/geoip ]]; then
+        geoip_src=/usr/share/tor
     fi
+    if [[ -n "$geoip_src" ]]; then
+        install -m 644 "$geoip_src/geoip" "$GEOIP_DIR/geoip"
+        [[ -s "$geoip_src/geoip6" ]] && install -m 644 "$geoip_src/geoip6" "$GEOIP_DIR/geoip6"
+        echo "  installed GeoIP from the distro package ($(grep -vc '^#' "$GEOIP_DIR/geoip") entries)"
+    else
+        echo "  no GeoIP database available: country diversity is off (family diversity still applies)."
+        echo "  Put a Tor-format geoip file at $GEOIP_DIR/geoip to enable it."
+    fi
+    [[ -n "$geoip_tmp" ]] && rm -rf "$geoip_tmp"
 fi
 
 # ---- configure ----

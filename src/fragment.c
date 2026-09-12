@@ -71,7 +71,7 @@ int moor_fragment_receive(moor_reassembly_state_t *state,
                           const uint8_t *relay_data, uint16_t relay_data_len,
                           uint16_t stream_id, uint8_t frag_cmd,
                           uint8_t *out_cmd,
-                          uint8_t *out_data, size_t *out_len) {
+                          uint8_t *out_data, size_t out_cap, size_t *out_len) {
     if (!state || !relay_data || relay_data_len < MOOR_FRAGMENT_HEADER)
         return -1;
 
@@ -160,7 +160,14 @@ int moor_fragment_receive(moor_reassembly_state_t *state,
             return -1;
         }
 
-        /* Reassembly complete */
+        /* Reassembly complete. F-22: refuse rather than overrun a caller's
+         * buffer we were never given the size of. */
+        if (out_data && slot->received > out_cap) {
+            LOG_WARN("fragment: reassembled %zu bytes but caller buffer is %zu",
+                     slot->received, out_cap);
+            slot->active = 0;
+            return -1;
+        }
         if (out_cmd) *out_cmd = slot->inner_relay_cmd;
         if (out_data) memcpy(out_data, slot->buffer, slot->received);
         if (out_len) *out_len = slot->received;

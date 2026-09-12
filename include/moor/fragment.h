@@ -58,16 +58,20 @@ int moor_fragment_send(uint32_t circuit_id, uint8_t relay_cmd,
  * Process a received fragment cell. Feed relay cells with command
  * RELAY_FRAGMENT or RELAY_FRAGMENT_END.
  *
+ * F-22: out_cap is the size of out_data. The function used to copy up to
+ * MOOR_MAX_REASSEMBLY bytes into a buffer whose size it was never told;
+ * both callers happened to pass enough, and nothing enforced it.
+ *
  * Returns:
  *   0  = more fragments needed (waiting)
  *   1  = complete reassembled payload in out_data, out_len, out_cmd
- *  -1  = error (invalid fragment)
+ *  -1  = error (invalid fragment, or out_data too small for the payload)
  */
 int moor_fragment_receive(moor_reassembly_state_t *state,
                           const uint8_t *relay_data, uint16_t relay_data_len,
                           uint16_t stream_id, uint8_t frag_cmd,
                           uint8_t *out_cmd,
-                          uint8_t *out_data, size_t *out_len);
+                          uint8_t *out_data, size_t out_cap, size_t *out_len);
 
 /* Generate a unique fragment ID */
 uint16_t moor_fragment_gen_id(void);

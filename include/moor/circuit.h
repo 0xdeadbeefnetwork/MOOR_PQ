@@ -331,6 +331,12 @@ int moor_vanguard_load(moor_vanguard_set_t *vg, const char *data_dir);
 /* Set global GeoIP database for diverse path selection */
 void moor_circuit_set_geoip(moor_geoip_db_t *db);
 
+/* F-05: require hybrid PQ on every circuit hop (default 1). With this set, a
+ * relay that does not offer PQ is never selected and never extended to; the
+ * circuit fails instead of silently falling back to classical X25519. */
+void moor_circuit_set_require_pq(int require);
+int  moor_circuit_require_pq(void);
+
 /* Initialize circuit pool */
 void moor_circuit_init_pool(void);
 

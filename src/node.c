@@ -6,6 +6,30 @@
 #include <time.h>
 #include <ctype.h>
 
+/*
+ * The largest body desc_sign_serialize can produce, field by field:
+ *   identity_pk 32 + onion_pk 32 + address 64 + ports 4 + flags 4
+ *   + bandwidth 8 + published 8 + kem_pk 1184 + features 4          = 1340
+ *   V3: count 1 + 8 family members * 32                             =  257
+ *   V4: nickname 32 + address6 64 + prev_onion_pk 32 + ver 4 + ts 8  =  140
+ *   V5: contact_info                                                 =  128
+ *   V7: build_id                                                     =   16
+ *   V8: falcon_pk                                                    =  897
+ *                                                                    -----
+ *                                                                     2778
+ * F-20: the callers used a bare malloc(4096) and this function wrote into it
+ * with no bounds checking. 4096 is comfortable today and silently stops being
+ * so the day MOOR_FALCON_PK_LEN, the contact field or the 8-member family cap
+ * grows. Sized here from the constants so it cannot drift, and asserted at
+ * both call sites.
+ */
+#define DESC_SIGN_BODY_MAX (32 + 32 + 64 + 4 + 4 + 8 + 8 + 1184 + 4 \
+                            + 1 + 8 * 32 \
+                            + 32 + 64 + 32 + 4 + 8 \
+                            + 128 \
+                            + 16 \
+                            + MOOR_FALCON_PK_LEN)
+
 /* Forward declaration — defined below, used by create_descriptor */
 static size_t desc_sign_serialize(uint8_t *buf, const moor_node_descriptor_t *desc);
 
@@ -133,9 +157,8 @@ int moor_node_create_descriptor(moor_node_descriptor_t *desc,
     }
 
     /* Sign all fields including V3/V4/V8 via shared serializer.
-     * Buffer must hold signable bytes; enlarged to 4096 to cover
-     * V8's 897-byte Falcon pk. */
-    uint8_t *buf = malloc(4096);
+     * F-20: sized from the field constants, not a round number. */
+    uint8_t *buf = malloc(DESC_SIGN_BODY_MAX);
     if (!buf) return -1;
     size_t off = desc_sign_serialize(buf, desc);
     int ret = moor_crypto_sign(desc->signature, buf, off, identity_sk);
@@ -182,8 +205,10 @@ static uint32_t desc_wire_features(const moor_node_descriptor_t *desc) {
     return f;
 }
 
+
 /* Serialize descriptor fields into buffer for signing/verification.
- * Covers all fields including V3/V4 (#207). Returns bytes written. */
+ * Covers all fields including V3/V4 (#207). Returns bytes written.
+ * `buf` must hold at least DESC_SIGN_BODY_MAX bytes. */
 static size_t desc_sign_serialize(uint8_t *buf, const moor_node_descriptor_t *desc) {
     size_t off = 0;
     memcpy(buf + off, desc->identity_pk, 32); off += 32;
@@ -258,7 +283,7 @@ int moor_node_sign_descriptor(moor_node_descriptor_t *desc,
     /* Ensure features match what serialization will produce */
     desc->features = desc_wire_features(desc);
 
-    uint8_t *buf = malloc(4096);
+    uint8_t *buf = malloc(DESC_SIGN_BODY_MAX);   /* F-20 */
     if (!buf) return -1;
     size_t off = desc_sign_serialize(buf, desc);
 
@@ -274,7 +299,7 @@ int moor_node_sign_descriptor(moor_node_descriptor_t *desc,
 }
 
 int moor_node_verify_descriptor(const moor_node_descriptor_t *desc) {
-    uint8_t *buf = malloc(4096);
+    uint8_t *buf = malloc(DESC_SIGN_BODY_MAX);   /* F-20 */
     if (!buf) return -1;
     size_t off = desc_sign_serialize(buf, desc);
 
@@ -1256,6 +1281,34 @@ int moor_node_same_family(const moor_node_descriptor_t *a,
     return (sodium_memcmp(a->family_id, b->family_id, 32) == 0) ? 1 : 0;
 }
 
+/*
+ * F-05: PQ-hybrid requirement, applied at the point where candidates are
+ * filtered so every caller inherits it.
+ *
+ * MOOR's README states PQ hybrid is mandatory with no downgrade path. The
+ * code did not implement that: moor_node_select_relay() admitted any relay,
+ * and each extend site independently decided whether to use the PQ or the
+ * classical handshake. Measured on a half-PQ consensus, 95.1% of circuits
+ * carried at least one classical hop. Default on, so a build that never calls
+ * the setter still behaves the way the project documents.
+ */
+static int g_require_pq = 1;
+
+void moor_node_set_require_pq(int require) {
+    g_require_pq = require ? 1 : 0;
+}
+
+int moor_node_require_pq(void) {
+    return g_require_pq;
+}
+
+/* A relay offers hybrid PQ when it advertises the feature AND carries a
+ * usable ML-KEM public key. Both halves matter: the bit alone can be set by a
+ * relay with no key, and a key alone is a relay that has dropped the bit. */
+static int node_has_pq(const moor_node_descriptor_t *r) {
+    return (r->features & NODE_FEATURE_PQ) && !sodium_is_zero(r->kem_pk, 1184);
+}
+
 const moor_node_descriptor_t *moor_node_select_relay(
     const moor_consensus_t *cons, uint32_t required_flags,
     const uint8_t *exclude_ids, int num_exclude) {
@@ -1286,6 +1339,33 @@ const moor_node_descriptor_t *moor_node_select_relay(
         /* Exclude MiddleOnly relays from guard and exit positions */
         if ((required_flags & (NODE_FLAG_GUARD | NODE_FLAG_EXIT)) &&
             (r->flags & NODE_FLAG_MIDDLEONLY))
+            continue;
+
+        /* F-05: under RequirePQ a relay without hybrid PQ is not a candidate
+         * for any position. Enforcing it here rather than at the call sites
+         * means every selection path inherits it -- guard, middle, exit,
+         * hidden-service and DHT alike -- so "mandatory" cannot be true in
+         * one code path and false in another. */
+        if (g_require_pq && !node_has_pq(r))
+            continue;
+
+        /* F-26: enforce the upgrade floor client-side as well as at the DA.
+         *
+         * directory.c already rejects descriptors below
+         * MOOR_MIN_PROTOCOL_VERSION -- "Relays must upgrade to join the
+         * network." But that ran only on the authority, and the client used
+         * whatever the consensus contained without ever reading the field it
+         * was handed. On a network whose trust root is a small number of
+         * authorities, making them the only thing standing between a client
+         * and an out-of-date relay puts the whole upgrade policy behind a
+         * single compromise. A relay running old code is by definition
+         * carrying whatever the upgrade fixed, so the client refuses it
+         * independently.
+         *
+         * protocol_version is a V6 descriptor extension: it reads 0 on a
+         * descriptor that predates the field, which is itself below the floor
+         * and correctly rejected. */
+        if (r->protocol_version < MOOR_MIN_PROTOCOL_VERSION)
             continue;
 
         /* Check exclusion list */
@@ -1373,47 +1453,98 @@ const moor_node_descriptor_t *moor_node_select_relay(
     return result;
 }
 
+/*
+ * Diversity classes, in the order the selector relaxes them.
+ *
+ * HARD is family, and family alone. family_id is MOOR's own signal: the DA
+ * computes it in moor_da_assign_families() from mutual declarations, so it is
+ * the network's own statement that two relays are one operator. It is never
+ * relaxed -- if no candidate satisfies it the selector returns NULL and the
+ * caller fails the circuit. That is F-04: quietly handing back an
+ * unconstrained relay meant the caller could not tell a diverse path from a
+ * captured one.
+ *
+ * SOFT is country and AS. Both come from a GeoIP database that may be absent,
+ * stale or wrong, so refusing to build a circuit over them would make the
+ * client unusable for no security gain. After MOOR_DIVERSE_ATTEMPTS draws we
+ * accept a soft conflict -- but never a hard one.
+ */
+#define MOOR_DIVERSE_ATTEMPTS 16
+
+static int hard_conflict(const moor_node_descriptor_t *cand,
+                         const moor_node_descriptor_t **sel, int n) {
+    for (int i = 0; i < n && sel; i++) {
+        if (!sel[i]) continue;
+        if (moor_node_same_family(cand, sel[i])) return 1;
+    }
+    return 0;
+}
+
+static int soft_conflict(const moor_node_descriptor_t *cand,
+                         const moor_node_descriptor_t **sel, int n) {
+    for (int i = 0; i < n && sel; i++) {
+        if (!sel[i]) continue;
+        if (cand->country_code != 0 &&
+            cand->country_code == sel[i]->country_code) return 1;
+        if (cand->as_number != 0 &&
+            cand->as_number == sel[i]->as_number) return 1;
+    }
+    return 0;
+}
+
 const moor_node_descriptor_t *moor_node_select_relay_diverse(
     const moor_consensus_t *cons, uint32_t required_flags,
     const uint8_t *exclude_ids, int num_exclude,
     const moor_node_descriptor_t **selected_descs, int num_selected) {
 
-    /* Try up to 10 times to find a relay in a different country/AS */
-    for (int attempt = 0; attempt < 10; attempt++) {
+    const moor_node_descriptor_t *hard_ok = NULL;
+
+    /* Prefer a candidate with no conflict of any kind. Remember the first one
+     * that at least satisfies the hard constraints, in case every draw has a
+     * soft conflict. */
+    for (int attempt = 0; attempt < MOOR_DIVERSE_ATTEMPTS; attempt++) {
         const moor_node_descriptor_t *candidate =
             moor_node_select_relay(cons, required_flags, exclude_ids, num_exclude);
         if (!candidate) return NULL;
 
-        /* Check diversity against already-selected hops */
-        int conflict = 0;
-        for (int i = 0; i < num_selected && selected_descs; i++) {
-            if (!selected_descs[i]) continue;
+        if (hard_conflict(candidate, selected_descs, num_selected))
+            continue;
 
-            /* Check family */
-            if (moor_node_same_family(candidate, selected_descs[i])) {
-                conflict = 1;
-                break;
-            }
-            /* Check country */
-            if (candidate->country_code != 0 &&
-                candidate->country_code == selected_descs[i]->country_code) {
-                conflict = 1;
-                break;
-            }
-            /* Check AS */
-            if (candidate->as_number != 0 &&
-                candidate->as_number == selected_descs[i]->as_number) {
-                conflict = 1;
-                break;
-            }
-        }
+        if (!soft_conflict(candidate, selected_descs, num_selected))
+            return candidate;               /* fully diverse */
 
-        if (!conflict)
-            return candidate;
+        if (!hard_ok) hard_ok = candidate;  /* acceptable, keep looking */
     }
 
-    /* Fallback: accept any relay after 10 retries */
-    return moor_node_select_relay(cons, required_flags, exclude_ids, num_exclude);
+    if (hard_ok) {
+        LOG_DEBUG("path diversity: accepting same country/AS after %d draws "
+                  "(family and IP prefix still distinct)", MOOR_DIVERSE_ATTEMPTS);
+        return hard_ok;
+    }
+
+    /* F-04: fail closed. Random draws found nothing satisfying family and
+     * prefix; sweep the consensus deterministically before giving up, so a
+     * small or bandwidth-skewed consensus is not reported as captured when a
+     * valid relay exists. */
+    for (uint32_t i = 0; i < cons->num_relays; i++) {
+        const moor_node_descriptor_t *r = &cons->relays[i];
+        if ((r->flags & required_flags) != required_flags) continue;
+        if ((required_flags & NODE_FLAG_EXIT) && (r->flags & NODE_FLAG_BADEXIT)) continue;
+        if ((required_flags & (NODE_FLAG_GUARD | NODE_FLAG_EXIT)) &&
+            (r->flags & NODE_FLAG_MIDDLEONLY)) continue;
+        int excluded = 0;
+        for (int j = 0; j < num_exclude && exclude_ids; j++)
+            if (sodium_memcmp(r->identity_pk, exclude_ids + j * 32, 32) == 0) {
+                excluded = 1; break;
+            }
+        if (excluded) continue;
+        if (hard_conflict(r, selected_descs, num_selected)) continue;
+        return r;
+    }
+
+    LOG_WARN("path diversity: every candidate shares a family with an "
+             "already-selected hop; refusing to build a single-operator path");
+    return NULL;
 }
 
 /*

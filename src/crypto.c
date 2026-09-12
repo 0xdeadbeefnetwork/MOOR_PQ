@@ -2,6 +2,7 @@
 #include <sodium.h>
 #include <string.h>
 #include <stdio.h>
+#include <errno.h>
 
 #ifdef _WIN32
 #include <direct.h>
@@ -45,6 +46,59 @@ static FILE *secure_fopen_crypto(const char *path, const char *mode) {
     return fdopen(fd, "wb");
 }
 #endif
+
+/*
+ * F-18: create a directory and make sure it actually has the mode we asked
+ * for.
+ *
+ * Every call site did a bare `mkdir(dir, 0700)` and ignored the result. mkdir
+ * fails with EEXIST on a directory that is already there, and its mode is then
+ * whatever it happens to be -- 0755 from an older version, or from an admin
+ * who created it by hand. The key *files* are 0600 so the material itself is
+ * not exposed, but a world-readable keys/ or hidden_service/ directory leaks
+ * the listing, and for a hidden service the file names are the service names.
+ *
+ * Returns 0 when the directory exists and is no more permissive than `mode`,
+ * -1 otherwise. Tightening an existing directory is deliberate: a privacy
+ * tool should not keep running against a keys/ anyone can enumerate.
+ */
+int moor_secure_mkdir(const char *path, unsigned mode) {
+    if (!path || !path[0]) return -1;
+
+#ifdef _WIN32
+    (void)mode;
+    if (mkdir(path, 0) != 0 && errno != EEXIST) return -1;
+    return 0;   /* NTFS ACLs are set per-file by secure_fopen_crypto() */
+#else
+    if (mkdir(path, (mode_t)mode) == 0)
+        return 0;
+    if (errno != EEXIST) {
+        LOG_ERROR("cannot create %s: %s", path, strerror(errno));
+        return -1;
+    }
+
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        LOG_ERROR("cannot stat %s: %s", path, strerror(errno));
+        return -1;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        LOG_ERROR("%s exists and is not a directory", path);
+        return -1;
+    }
+
+    unsigned have = st.st_mode & 07777;
+    if (have & ~mode) {
+        LOG_WARN("%s has mode %04o, tightening to %04o", path, have, mode);
+        if (chmod(path, (mode_t)mode) != 0) {
+            LOG_ERROR("cannot tighten %s to %04o: %s",
+                      path, mode, strerror(errno));
+            return -1;
+        }
+    }
+    return 0;
+#endif
+}
 
 int moor_crypto_init(void) {
     if (sodium_init() < 0) {
@@ -259,22 +313,63 @@ int moor_crypto_seal_open(uint8_t *pt, const uint8_t *ct, size_t ct_len,
  * Wire layout: kem_ct(1088) || aead_ct(pt_len) || aead_tag(16)
  * Anonymous: no sender key material involved (the ML-KEM encaps step
  * generates a fresh randomness internally that isn't exposed). */
+/*
+ * F-13: bind the KEM ciphertext into the AEAD key.
+ *
+ * The key used to be KDF(shared_secret) alone, with the ciphertext neither
+ * hashed into the derivation nor passed as associated data. ML-KEM is IND-CCA2
+ * but not MAL-BIND-K-CT (Cremers, Dax, Medinger, "Keeping Up with the KEMs"):
+ * a shared secret does not uniquely determine the ciphertext that produced it,
+ * so a seal was not committed to its own encapsulation. The standard hardening
+ * is to derive over ss || ct.
+ *
+ * This is a WIRE FORMAT CHANGE. A peer on the old derivation cannot open a new
+ * seal and vice versa, so MOOR_PROTOCOL_VERSION is bumped to 5 and the floor
+ * raised with it -- old relays are refused rather than silently failing to
+ * decrypt. That matches the project's stated policy: a relay that has not
+ * upgraded is carrying whatever the upgrade fixed, and does not get to
+ * participate.
+ *
+ * The KDF context is "moorSEL2" rather than "moorSEAL" so that even if the
+ * two derivations ever met, they could not agree on a key by accident.
+ */
+static int pq_seal_derive_key(uint8_t aead_key[32],
+                              const uint8_t kem_ss[MOOR_KEM_SS_LEN],
+                              const uint8_t *kem_ct) {
+    /* BLAKE2b(ss || ct) -> 32 bytes, then the KDF over that. Hashing first
+     * keeps the KDF's 32-byte master-key contract while still committing to
+     * the full 1088-byte ciphertext. */
+    uint8_t bound[32];
+    crypto_generichash_state st;
+    crypto_generichash_blake2b_init(&st, NULL, 0, 32);
+    crypto_generichash_blake2b_update(&st, kem_ss, MOOR_KEM_SS_LEN);
+    crypto_generichash_blake2b_update(&st, kem_ct, MOOR_KEM_CT_LEN);
+    crypto_generichash_blake2b_final(&st, bound, 32);
+
+    int rc = moor_crypto_kdf(aead_key, 32, bound, 0, "moorSEL2");
+    sodium_memzero(bound, sizeof(bound));
+    return rc;
+}
+
 int moor_crypto_pq_seal(uint8_t *ct, const uint8_t *pt, size_t pt_len,
                         const uint8_t *recipient_kem_pk) {
     uint8_t kem_ss[MOOR_KEM_SS_LEN];
     if (moor_kem_encapsulate(ct, kem_ss, recipient_kem_pk) != 0) return -1;
 
     uint8_t aead_key[32];
-    if (moor_crypto_kdf(aead_key, 32, kem_ss, 0, "moorSEAL") != 0) {
+    if (pq_seal_derive_key(aead_key, kem_ss, ct) != 0) {
         moor_crypto_wipe(kem_ss, sizeof(kem_ss));
         return -1;
     }
     moor_crypto_wipe(kem_ss, sizeof(kem_ss));
 
+    /* The ciphertext is also the associated data, so the tag covers it even
+     * if the key derivation were ever weakened. Belt and braces on a binding
+     * that matters. */
     size_t aead_ct_len = 0;
     int ret = moor_crypto_aead_encrypt(ct + MOOR_KEM_CT_LEN, &aead_ct_len,
                                         pt, pt_len,
-                                        NULL, 0, aead_key, 0);
+                                        ct, MOOR_KEM_CT_LEN, aead_key, 0);
     moor_crypto_wipe(aead_key, sizeof(aead_key));
     if (ret != 0) return -1;
     if (aead_ct_len != pt_len + MOOR_PQ_SEAL_AEAD_TAG) return -1;
@@ -290,7 +385,7 @@ int moor_crypto_pq_seal_open(uint8_t *pt, const uint8_t *ct, size_t ct_len,
     if (moor_kem_decapsulate(kem_ss, ct, recipient_kem_sk) != 0) return -1;
 
     uint8_t aead_key[32];
-    if (moor_crypto_kdf(aead_key, 32, kem_ss, 0, "moorSEAL") != 0) {
+    if (pq_seal_derive_key(aead_key, kem_ss, ct) != 0) {   /* F-13 */
         moor_crypto_wipe(kem_ss, sizeof(kem_ss));
         return -1;
     }
@@ -299,7 +394,7 @@ int moor_crypto_pq_seal_open(uint8_t *pt, const uint8_t *ct, size_t ct_len,
     size_t pt_len = 0;
     int ret = moor_crypto_aead_decrypt(pt, &pt_len,
                                         ct + MOOR_KEM_CT_LEN, aead_ct_len,
-                                        NULL, 0, aead_key, 0);
+                                        ct, MOOR_KEM_CT_LEN, aead_key, 0);
     moor_crypto_wipe(aead_key, sizeof(aead_key));
     return ret;
 }
@@ -804,35 +899,55 @@ static int read_key_file(const char *path, uint8_t *data, size_t len) {
                     rename(tmp_path, path);
                 }
             } else {
-                /* Both MACs invalid: refuse the file. Self-healing here lets a
-                 * local attacker who can write to keys/ swap identity/onion/PQ
-                 * keys silently — the process would re-sign over its own MAC.
-                 * Legacy no-MAC migration is handled below (rd == len path);
-                 * a file that HAS a MAC but fails BOTH derivations is either
-                 * tampered, corrupt, or keyed for a different install. None of
-                 * those should silently succeed. */
-                LOG_ERROR("key file %s: BOTH MACs invalid -- refusing to load "
-                          "(possible tamper). Move the file aside manually "
-                          "if you've deliberately rotated MAC keys.", path);
+                /* F-09: this MAC detects corruption, not tampering, and the
+                 * message must not claim otherwise. key_file_mac_base is a
+                 * compile-time constant in a public repository, so anyone can
+                 * compute a valid MAC for any path; an attacker who can write
+                 * to keys/ simply writes a correct one. Filesystem permissions
+                 * (0600, O_NOFOLLOW) are the access control here. Refusing the
+                 * file is still right -- a MAC that fails both derivations is
+                 * corrupt, truncated, or from another install -- but "possible
+                 * tamper" oversold what the check can tell us. */
+                LOG_ERROR("key file %s: integrity MAC does not match -- "
+                          "refusing to load. The file is corrupt, truncated, "
+                          "or belongs to a different install. Move it aside "
+                          "manually if that is expected.", path);
                 ret = -1;
             }
         }
         sodium_memzero(mac_key, 32);
         sodium_memzero(expected_mac, sizeof(expected_mac));
     } else if (rd == len) {
-        /* Legacy file without MAC -- accept and re-save with MAC.
-         * Keys MUST survive binary upgrades; rejecting valid key material
-         * because of a missing MAC would force key regeneration and break
-         * the entire trust chain (DA fingerprints, relay registration). */
-        LOG_WARN("key file %s has no integrity MAC (accepting, will re-save)", path);
-        memcpy(data, buf, len);
-        ret = 0;
-        /* Re-save with MAC for next startup */
-        int is_secret = 1;
-        char tmp_path[4096];
-        snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
-        if (write_key_file(tmp_path, buf, len, is_secret) == 0)
-            rename(tmp_path, path);
+        /* F-09: a file with no trailing MAC used to be accepted silently and
+         * then re-saved with a freshly computed one. That made the integrity
+         * check bypassable by simply omitting it -- write a file 32 bytes
+         * shorter and the daemon adopts the key and blesses it. The check was
+         * only ever a corruption detector, but a corruption detector you can
+         * turn off by truncating is not even that.
+         *
+         * Migration is still possible, because keys genuinely must survive a
+         * binary upgrade and regenerating them breaks the trust chain (DA
+         * fingerprints, relay registration). It is now a deliberate act:
+         * MOOR_MIGRATE_KEYS=1 for one start, rather than the default path. */
+        if (getenv("MOOR_MIGRATE_KEYS")) {
+            LOG_WARN("key file %s has no integrity MAC -- migrating because "
+                     "MOOR_MIGRATE_KEYS is set. Unset it after this start.",
+                     path);
+            memcpy(data, buf, len);
+            ret = 0;
+            int is_secret = 1;
+            char tmp_path[4096];
+            snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+            if (write_key_file(tmp_path, buf, len, is_secret) == 0)
+                rename(tmp_path, path);
+        } else {
+            LOG_ERROR("key file %s has no integrity MAC. If this install "
+                      "predates MAC'd key files, start once with "
+                      "MOOR_MIGRATE_KEYS=1 to adopt and re-save it. Refusing "
+                      "by default so a truncated file cannot bypass the "
+                      "check.", path);
+            ret = -1;
+        }
     }
     sodium_memzero(buf, sizeof(buf)); /* Wipe key material from stack (#192) */
     return ret;
@@ -844,7 +959,7 @@ int moor_keys_save(const char *data_dir,
     char keys_dir[512];
     int n = snprintf(keys_dir, sizeof(keys_dir), "%s/keys", data_dir);
     if (n < 0 || (size_t)n >= sizeof(keys_dir)) return -1; /* L3 */
-    mkdir(keys_dir, 0700);
+    if (moor_secure_mkdir(keys_dir, 0700) != 0) return -1;   /* F-18 */
 
     char path[576];
     n = snprintf(path, sizeof(path), "%s/identity_pk", keys_dir);
@@ -896,7 +1011,7 @@ int moor_pq_keys_save(const char *data_dir,
     char keys_dir[512];
     int n = snprintf(keys_dir, sizeof(keys_dir), "%s/keys", data_dir);
     if (n < 0 || (size_t)n >= sizeof(keys_dir)) return -1;
-    mkdir(keys_dir, 0700);
+    if (moor_secure_mkdir(keys_dir, 0700) != 0) return -1;   /* F-18 */
 
     char path[576];
     n = snprintf(path, sizeof(path), "%s/pq_identity_pk", keys_dir);
@@ -931,7 +1046,7 @@ int moor_falcon_keys_save(const char *data_dir,
     char keys_dir[512];
     int n = snprintf(keys_dir, sizeof(keys_dir), "%s/keys", data_dir);
     if (n < 0 || (size_t)n >= sizeof(keys_dir)) return -1;
-    mkdir(keys_dir, 0700);
+    if (moor_secure_mkdir(keys_dir, 0700) != 0) return -1;   /* F-18 */
 
     char path[576];
     n = snprintf(path, sizeof(path), "%s/falcon_identity_pk", keys_dir);

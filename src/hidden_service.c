@@ -265,8 +265,10 @@ int moor_hs_save_keys(const moor_hs_config_t *config) {
         return -1;
     }
 
-    /* Create directory */
-    mkdir(config->hs_dir, 0700);
+    /* Create directory. F-18: verify the mode on an existing one -- a
+     * world-readable hidden_service/ leaks the file names, and for a hidden
+     * service the file names are the service. */
+    if (moor_secure_mkdir(config->hs_dir, 0700) != 0) return -1;
 
     char path[512];
 
@@ -1924,14 +1926,24 @@ verify_descriptor:
             LOG_DEBUG("HS: PQ commitment verified (%s)",
                       hs_desc.falcon_available ? "v3 kem||falcon" : "v2 kem-only");
         } else if (hs_desc.falcon_available) {
-            /* Try v2 fallback (kem-only) in case the service still publishes
-             * a v2 address while also including falcon_pk for forward-compat. */
-            moor_crypto_hash(full_hash, hs_desc.kem_pk, sizeof(hs_desc.kem_pk));
-            if (sodium_memcmp(full_hash, pq_commitment, 16) != 0) {
-                LOG_ERROR("HS: PQ commitment mismatch — descriptor pks don't match address");
-                return -1;
-            }
-            LOG_DEBUG("HS: PQ commitment verified (v2 kem-only, service advertises Falcon)");
+            /* F-12: the v2 fallback is gone.
+             *
+             * It accepted a kem-only commitment from a service that advertises
+             * Falcon, which meant the Falcon public key was bound to the
+             * service by the Ed25519 descriptor signature alone -- exactly the
+             * dependency the address commitment exists to remove. The README
+             * says both keys are hashed into the address "so the onion address
+             * cannot be forged even if Ed25519 falls"; on this path an
+             * adversary who breaks Ed25519 could swap the Falcon key freely.
+             *
+             * A service that publishes a Falcon key must publish a v3 address
+             * committing to it. Anything else is a downgrade, and MOOR does
+             * not carry downgrade paths. */
+            LOG_ERROR("HS: address commits to a v2 (KEM-only) hash but the "
+                      "descriptor advertises a Falcon key -- refusing. The "
+                      "Falcon key would be bound only by the Ed25519 "
+                      "signature. The service must publish a v3 address.");
+            return -1;
         } else {
             LOG_ERROR("HS: PQ commitment mismatch — KEM pk doesn't match address");
             return -1;
@@ -2526,7 +2538,7 @@ int moor_hs_decode_address(uint8_t identity_pk[32], const char *address) {
 int moor_hs_save_auth_clients(const moor_hs_config_t *config) {
     char dir[512];
     snprintf(dir, sizeof(dir), "%s/clients", config->hs_dir);
-    mkdir(dir, 0700);
+    if (moor_secure_mkdir(dir, 0700) != 0) return -1;   /* F-18 */
 
     for (int i = 0; i < config->num_auth_clients; i++) {
         char path[576];

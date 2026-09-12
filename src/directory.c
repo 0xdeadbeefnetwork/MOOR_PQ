@@ -9,13 +9,24 @@
 #include <fcntl.h>
 #endif
 
-/* Trusted DA hybrid keys (Ed25519 + ML-DSA-65) for consensus verification. */
-static moor_trusted_da_key_t g_trusted_da_keys[16];
+/* Trusted DA hybrid keys (Ed25519 + ML-DSA-65) for consensus verification.
+ *
+ * F-27: sized by MOOR_MAX_DA_AUTHORITIES, not a separate literal. This array
+ * was 16 wide and filled up to 16, while moor_consensus_verify_hybrid()
+ * indexes a counted[MOOR_MAX_DA_AUTHORITIES] by the same slot number -- the
+ * two bounds disagreed, and the larger one won. One constant now governs both.
+ */
+static moor_trusted_da_key_t g_trusted_da_keys[MOOR_MAX_DA_AUTHORITIES];
 static int g_num_trusted_da_keys = 0;
 
 void moor_set_trusted_da_keys(const moor_da_entry_t *da_list, int num_das) {
     g_num_trusted_da_keys = 0;
-    for (int i = 0; i < num_das && i < 16; i++) {
+    if (num_das > MOOR_MAX_DA_AUTHORITIES) {
+        LOG_WARN("trusted DA keys: %d supplied, only %d slots -- ignoring the "
+                 "rest", num_das, MOOR_MAX_DA_AUTHORITIES);
+        num_das = MOOR_MAX_DA_AUTHORITIES;
+    }
+    for (int i = 0; i < num_das && i < MOOR_MAX_DA_AUTHORITIES; i++) {
         int has_pk = 0;
         for (int j = 0; j < 32; j++) {
             if (da_list[i].identity_pk[j] != 0) { has_pk = 1; break; }
@@ -1164,6 +1175,22 @@ int moor_consensus_verify_hybrid(const moor_consensus_t *cons,
     size_t body_len = 0;
 
     int verified = 0;
+
+    /* F-27: counted[] is MOOR_MAX_DA_AUTHORITIES wide and is indexed by
+     * trusted-key slot, but moor_set_trusted_da_keys() accepts up to 16 keys
+     * into a 16-wide g_trusted_da_keys[]. More than MOOR_MAX_DA_AUTHORITIES
+     * configured authorities therefore wrote past this stack array, inside the
+     * function that decides whether a consensus is trusted. The config parser
+     * caps num_das at 9 today so it was not reachable from a moorrc, but the
+     * two array bounds disagreed by construction. Clamp before anything is
+     * indexed, and before the majority is computed -- a threshold derived from
+     * more keys than are actually examined is its own bug. */
+    if (num_trusted > MOOR_MAX_DA_AUTHORITIES) {
+        LOG_WARN("consensus verify: %d trusted DA keys configured, capping to "
+                 "%d", num_trusted, MOOR_MAX_DA_AUTHORITIES);
+        num_trusted = MOOR_MAX_DA_AUTHORITIES;
+    }
+
     /* F-03: require a genuine majority of distinct authorities. The previous
      * "(num_trusted <= 2) ? 1 : ..." exemption collapsed the trust model to a
      * single authority for the shipped 2-DA config. Two authorities cannot
@@ -1173,7 +1200,18 @@ int moor_consensus_verify_hybrid(const moor_consensus_t *cons,
     uint8_t counted[MOOR_MAX_DA_AUTHORITIES];
     memset(counted, 0, sizeof(counted));
 
-    for (uint32_t i = 0; i < cons->num_da_sigs; i++) {
+    /* F-21: bound the signature walk by the array as well as by the declared
+     * count. Every comparable loop in node.c and directory.c carries this
+     * guard; this one -- the loop that counts signatures towards the trust
+     * threshold -- was the exception. */
+    uint32_t n_sigs = cons->num_da_sigs;
+    if (n_sigs > MOOR_MAX_DA_AUTHORITIES) {
+        LOG_WARN("consensus declares %u DA signatures, capping to %d",
+                 n_sigs, MOOR_MAX_DA_AUTHORITIES);
+        n_sigs = MOOR_MAX_DA_AUTHORITIES;
+    }
+
+    for (uint32_t i = 0; i < n_sigs; i++) {
         for (int j = 0; j < num_trusted; j++) {
             if (counted[j]) continue;  /* each trusted key credited at most once */
             if (sodium_memcmp(cons->da_sigs[i].identity_pk,

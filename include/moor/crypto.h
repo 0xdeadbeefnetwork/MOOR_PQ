@@ -5,6 +5,10 @@
 #include <stddef.h>
 
 /* Initialize libsodium. Must be called once at startup. Returns 0 on success. */
+/* F-18: mkdir that verifies the mode on an already-existing directory,
+ * tightening it if it is more permissive than asked. Returns 0 on success. */
+int moor_secure_mkdir(const char *path, unsigned mode);
+
 int moor_crypto_init(void);
 
 /* Ed25519 keygen */

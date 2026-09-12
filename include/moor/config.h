@@ -84,6 +84,10 @@ typedef struct {
     int          middle_only;
     int          padding;
     int          verbose;
+    /* F-05: no require_pq field. Hybrid PQ is mandatory on every hop and is
+     * not configurable -- a config key would be the downgrade path the README
+     * says does not exist. Enforced in moor_node_select_relay() and
+     * moor_circuit_extend_checked(), both defaulting on. */
 
     /* Exit policy */
     moor_exit_policy_t exit_policy;

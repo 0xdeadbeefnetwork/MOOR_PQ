@@ -18,6 +18,7 @@ EXTRA_LDFLAGS ?=
 
 CFLAGS = -Wall -Wextra -O2 -g3 -fno-strict-aliasing -fstack-protector-strong \
          -fno-omit-frame-pointer \
+         -ffile-prefix-map=$(CURDIR)=. \
          -D_FORTIFY_SOURCE=2 -Iinclude \
          -Isrc/pqclean -Isrc/pqclean/common \
          -fPIE -Wformat -Wformat-security \
@@ -59,6 +60,7 @@ SOURCES = $(SRCDIR)/log.c \
           $(SRCDIR)/fragment.c \
           $(SRCDIR)/pow.c \
           $(SRCDIR)/geoip.c \
+          $(SRCDIR)/randombytes_moor.c \
           $(SRCDIR)/bw_auth.c \
           $(SRCDIR)/conflux.c \
           $(SRCDIR)/ratelimit.c \
@@ -86,7 +88,13 @@ SOURCES = $(SRCDIR)/log.c \
           $(SRCDIR)/dns_server.c \
           $(SRCDIR)/exit_notice.c
 
-PQCLEAN_SOURCES = $(wildcard $(SRCDIR)/pqclean/common/*.c) \
+# F-14: PQClean leaves randombytes() to the integrator. MOOR supplies it in
+# src/randombytes_moor.c (fail-closed: aborts rather than hand back weak or
+# uninitialised bytes), so upstream's src/pqclean/common/randombytes.c is
+# excluded from the build. The file stays in the tree unmodified -- the
+# vendored PQClean is byte-identical to upstream and is meant to remain so.
+PQCLEAN_SOURCES = $(filter-out $(SRCDIR)/pqclean/common/randombytes.c, \
+                      $(wildcard $(SRCDIR)/pqclean/common/*.c)) \
                   $(wildcard $(SRCDIR)/pqclean/ml_kem_768/*.c) \
                   $(wildcard $(SRCDIR)/pqclean/falcon_512/*.c) \
                   $(wildcard $(SRCDIR)/pqclean/ml_dsa_65/*.c)
@@ -183,7 +191,7 @@ TEST_SERIALIZE_TARGET = $(BUILDDIR)/test_serialize
 TEST_DESCRIPTOR_TARGET = $(BUILDDIR)/test_descriptor
 TEST_PRODUCTION_REGRESSIONS_TARGET = $(BUILDDIR)/test_production_regressions
 
-.PHONY: all clean tests tools test check test-production-regressions install uninstall distclean static-analysis asan-test tsan-test fuzz-build fuzz fuzz-clean coverage infer kat dudect cbmc build-moor-top
+.PHONY: all release clean tests tools test check test-production-regressions install uninstall distclean static-analysis asan-test tsan-test fuzz-build fuzz fuzz-clean coverage infer kat dudect cbmc build-moor-top
 
 all: $(OBJDIR) $(OBJDIR)/pqclean $(TARGET)
 
@@ -410,8 +418,17 @@ test: tests
 	./$(TEST_PRODUCTION_REGRESSIONS_TARGET)
 	@echo "=== All tests passed ==="
 
+# Release: the installable binary with its debug info split out rather than
+# thrown away -- moor.debug stays beside it so a crash off a live relay can
+# still be read. Same dirty-tree guard as any build (build_id).
+release: all
+	objcopy --only-keep-debug $(TARGET) $(TARGET).debug
+	objcopy --strip-debug --strip-unneeded --add-gnu-debuglink=$(TARGET).debug $(TARGET)
+	chmod 644 $(TARGET).debug
+	@echo "Release: $(TARGET) (symbols in $(TARGET).debug)"
+
 clean:
-	rm -rf $(OBJDIR) $(TARGET) $(KEYGEN_TARGET) $(MOOR_TOP_TARGET)
+	rm -rf $(OBJDIR) $(TARGET) $(TARGET).debug $(KEYGEN_TARGET) $(MOOR_TOP_TARGET)
 	rm -f $(TEST_CRYPTO_TARGET) $(TEST_CELL_TARGET) $(TEST_CIRCUIT_TARGET) $(TEST_CONFIG_TARGET)
 	rm -f $(TEST_TRANSPORT_TARGET) $(TEST_KEM_TARGET)
 	rm -f $(TEST_FRAGMENT_TARGET) $(TEST_PQ_CIRCUIT_TARGET) $(TEST_POW_TARGET) $(TEST_GEOIP_TARGET)
@@ -675,30 +692,31 @@ debug: moor_debug
 # =============================================================================
 
 FUZZ_CC = clang
-# Library objects: ASan+UBSan but NO -fsanitize=fuzzer (that's only for harness main)
+# Library objects: ASan+UBSan plus coverage instrumentation (fuzzer-no-link),
+# without which libFuzzer sees no edges inside the library and mutates blind --
+# the first smoke run of the F-15 harnesses reported cov: 1..7 after millions
+# of executions for exactly that reason. The fuzzer runtime itself (main) is
+# linked only into the harness via -fsanitize=fuzzer.
 FUZZ_LIB_CFLAGS = -Wall -Wextra -O1 -g -fno-strict-aliasing \
-                  -fsanitize=address,undefined -fno-omit-frame-pointer \
-                  -Iinclude -Isrc/kyber -Isrc/dilithium \
-                  $(shell pkg-config --cflags libsodium)
+                  -fsanitize=address,undefined,fuzzer-no-link -fno-omit-frame-pointer \
+                  -Iinclude -Isrc/pqclean -Isrc/pqclean/common \
+                  -DMOOR_SYSCONFDIR='"$(SYSCONFDIR)/moor"' \
+                  $(SODIUM_CFLAGS) $(LIBEVENT_CFLAGS) $(ZLIB_CFLAGS)
 # Harness files: add -fsanitize=fuzzer for LLVMFuzzerTestOneInput linkage
-FUZZ_HARNESS_CFLAGS = $(FUZZ_LIB_CFLAGS) -fsanitize=fuzzer
+FUZZ_HARNESS_CFLAGS = $(FUZZ_LIB_CFLAGS) -Ifuzz -fsanitize=fuzzer
 FUZZ_LDFLAGS = -fsanitize=fuzzer,address,undefined \
-               $(shell pkg-config --libs libsodium) -lm -lpthread -lz
+               $(SODIUM_LIBS) $(LIBEVENT_LIBS) -lm -lpthread $(ZLIB_LIBS)
 
 FUZZ_OBJDIR = obj_fuzz
 FUZZ_OBJECTS = $(patsubst $(SRCDIR)/%.c,$(FUZZ_OBJDIR)/%.o,$(SOURCES))
 FUZZ_KYBER_OBJECTS = $(patsubst $(SRCDIR)/kyber/%.c,$(FUZZ_OBJDIR)/kyber/%.o,$(KYBER_SOURCES))
 FUZZ_DILITHIUM_OBJECTS = $(patsubst $(SRCDIR)/dilithium/%.c,$(FUZZ_OBJDIR)/dilithium/%.o,$(DILITHIUM_SOURCES))
-FUZZ_ALL_OBJECTS = $(FUZZ_OBJECTS) $(FUZZ_KYBER_OBJECTS) $(FUZZ_DILITHIUM_OBJECTS)
+FUZZ_PQCLEAN_OBJECTS = $(patsubst $(SRCDIR)/pqclean/%.c,$(FUZZ_OBJDIR)/pqclean/%.o,$(PQCLEAN_SOURCES))
+FUZZ_ALL_OBJECTS = $(FUZZ_OBJECTS) $(FUZZ_KYBER_OBJECTS) $(FUZZ_DILITHIUM_OBJECTS) $(FUZZ_PQCLEAN_OBJECTS)
 
-FUZZ_HARNESSES = fuzz/fuzz_cell fuzz/fuzz_socks5 fuzz/fuzz_cke \
-                 fuzz/fuzz_config fuzz/fuzz_hs_addr fuzz/fuzz_consensus \
-                 fuzz/fuzz_noise fuzz/fuzz_kyber fuzz/fuzz_mldsa \
-                 fuzz/fuzz_lspec fuzz/fuzz_transport fuzz/fuzz_microdesc \
-                 fuzz/fuzz_wfpad fuzz/fuzz_pow fuzz/fuzz_padding \
-                 fuzz/fuzz_conflux fuzz/fuzz_ratelimit \
-                 fuzz/fuzz_descriptor fuzz/fuzz_geoip \
-                 fuzz/fuzz_relay_cell fuzz/fuzz_base32 fuzz/fuzz_dpf
+# Every fuzz/fuzz_*.c is a harness. F-15 recorded 21 names here with no source
+# behind them; the list now follows the tree so a missing harness cannot hide.
+FUZZ_HARNESSES = $(patsubst %.c,%,$(wildcard fuzz/fuzz_*.c))
 
 $(FUZZ_OBJDIR):
 	mkdir -p $(FUZZ_OBJDIR)
@@ -712,13 +730,17 @@ $(FUZZ_OBJDIR)/dilithium:
 $(FUZZ_OBJDIR)/%.o: $(SRCDIR)/%.c | $(FUZZ_OBJDIR)
 	$(FUZZ_CC) $(FUZZ_LIB_CFLAGS) -c $< -o $@
 
+$(FUZZ_OBJDIR)/pqclean/%.o: $(SRCDIR)/pqclean/%.c | $(FUZZ_OBJDIR)
+	@mkdir -p $(dir $@)
+	$(FUZZ_CC) $(FUZZ_LIB_CFLAGS) -c $< -o $@
+
 $(FUZZ_OBJDIR)/kyber/%.o: $(SRCDIR)/kyber/%.c | $(FUZZ_OBJDIR)/kyber
 	$(FUZZ_CC) $(FUZZ_LIB_CFLAGS) -c $< -o $@
 
 $(FUZZ_OBJDIR)/dilithium/%.o: $(SRCDIR)/dilithium/%.c | $(FUZZ_OBJDIR)/dilithium
 	$(FUZZ_CC) $(FUZZ_LIB_CFLAGS) -c $< -o $@
 
-fuzz/fuzz_%: fuzz/fuzz_%.c $(FUZZ_ALL_OBJECTS) | $(FUZZ_OBJDIR) $(FUZZ_OBJDIR)/kyber $(FUZZ_OBJDIR)/dilithium
+fuzz/fuzz_%: fuzz/fuzz_%.c fuzz/fuzz_stubs.h $(FUZZ_ALL_OBJECTS) | $(FUZZ_OBJDIR) $(FUZZ_OBJDIR)/kyber $(FUZZ_OBJDIR)/dilithium
 	$(FUZZ_CC) $(FUZZ_HARNESS_CFLAGS) $< $(FUZZ_ALL_OBJECTS) -o $@ $(FUZZ_LDFLAGS)
 
 fuzz-build: $(FUZZ_OBJDIR) $(FUZZ_OBJDIR)/kyber $(FUZZ_OBJDIR)/dilithium $(FUZZ_ALL_OBJECTS) $(FUZZ_HARNESSES)

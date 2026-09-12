@@ -202,6 +202,8 @@ static void apply_config_to_globals(const moor_config_t *cfg) {
     if (cfg->exit) g_relay_flags |= NODE_FLAG_EXIT;
     if (cfg->middle_only) g_relay_flags |= NODE_FLAG_MIDDLEONLY;
     g_padding = cfg->padding;
+    /* F-05: hybrid PQ is mandatory and has no config path to disable it.
+     * Both modules default to on; the setters exist for tests only. */
     g_verbose = cfg->verbose;
     g_is_bridge = cfg->is_bridge;
     g_use_bridges = cfg->use_bridges;
@@ -1739,7 +1741,6 @@ static int run_da(void) {
     if (listen_fd < 0) return -1;
 
     moor_event_add(listen_fd, MOOR_EVENT_READ, da_accept_cb, NULL);
-    da_pool_init();
 
     /* Build initial consensus and exchange votes with peers */
     moor_da_build_consensus(&g_da_config);
@@ -1786,6 +1787,13 @@ static int run_da(void) {
     if (maybe_drop_privileges() != 0) return -1;
 #endif
     moor_sandbox_apply();
+    /* F-07: create the DA worker pool AFTER the sandbox is installed, so the
+     * workers inherit the seccomp filter. prctl(PR_SET_SECCOMP) applies to the
+     * calling thread and is inherited only by threads created afterwards; the
+     * pool previously started ~46 lines earlier and ran unsandboxed. The
+     * workers only take work from da_accept_cb inside the event loop below, so
+     * nothing between here and the accept path needed them earlier. */
+    da_pool_init();
     int ret = moor_event_loop();
     da_pool_shutdown();
     return ret;
@@ -3230,7 +3238,8 @@ static void hs_intro_read_cb(int fd, int events, void *arg) {
             int fret = moor_fragment_receive(
                 &circ->reassembly, relay.data, relay.data_length,
                 relay.stream_id, relay.relay_command,
-                &inner_cmd, reassembled, &reassembled_len);
+                &inner_cmd, reassembled, sizeof(reassembled),
+                &reassembled_len);
             if (fret == 1 && inner_cmd == RELAY_INTRODUCE2) {
                 LOG_INFO("HS: received INTRODUCE2 (%zu bytes, reassembled)",
                          reassembled_len);
@@ -4258,10 +4267,14 @@ static int keygen_enclave(const char *data_dir, const char *address,
     /* Ensure data dir exists */
     char keys_dir[512];
     snprintf(keys_dir, sizeof(keys_dir), "%s/keys", data_dir);
-#ifndef _WIN32
-    mkdir(data_dir, 0700);
-    mkdir(keys_dir, 0700);
-#endif
+    /* F-18: mkdir alone leaves an already-existing directory at whatever
+     * mode it has. Key files are 0600, but a readable keys/ leaks the
+     * listing. */
+    if (moor_secure_mkdir(data_dir, 0700) != 0 ||
+        moor_secure_mkdir(keys_dir, 0700) != 0) {
+        fprintf(stderr, "FATAL: cannot secure %s\n", data_dir);
+        return 1;
+    }
 
     /* Generate Ed25519 identity keypair (signing) */
     uint8_t pk[32], sk[64];

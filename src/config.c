@@ -476,6 +476,16 @@ int moor_config_set(moor_config_t *cfg, const char *key, const char *value) {
     else if (strcmp(key, "Padding") == 0) {
         cfg->padding = atoi(value);
     }
+    else if (strcmp(key, "RequirePQ") == 0) {
+        /* F-05: deliberately NOT settable. The README states PQ hybrid is
+         * mandatory with no downgrade path, and a relay that has not upgraded
+         * is carrying whatever the upgrade fixed. Accepted and ignored so an
+         * existing moorrc does not fail to parse; anything but 1 is refused
+         * loudly rather than silently honoured. */
+        if (atoi(value) != 1)
+            LOG_WARN("RequirePQ %s ignored: hybrid PQ is mandatory and cannot "
+                     "be disabled. Remove this line from your moorrc.", value);
+    }
     else if (strcmp(key, "Verbose") == 0) {
         cfg->verbose = atoi(value);
     }

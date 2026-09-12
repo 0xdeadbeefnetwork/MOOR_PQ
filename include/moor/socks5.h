@@ -70,6 +70,9 @@ int moor_socks5_handle_auth(moor_socks5_client_t *client,
                             const uint8_t *data, size_t len);
 
 /* Handle SOCKS5 connect request */
+int moor_socks5_parse_request(moor_socks5_client_t *client,
+                              const uint8_t *data, size_t len,
+                              uint8_t *cmd_out);
 int moor_socks5_handle_request(moor_socks5_client_t *client,
                                const uint8_t *data, size_t len);
 

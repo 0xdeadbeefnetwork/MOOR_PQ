@@ -38,7 +38,9 @@ make
 
 Deploy a relay (one command):
 ```bash
-curl -sL https://raw.githubusercontent.com/0xdeadbeefnetwork/MOOR_PQ/main/setup.sh | sudo bash
+git clone https://github.com/0xdeadbeefnetwork/MOOR_PQ && cd MOOR_PQ
+# read setup.sh first -- it runs as root
+sudo ./setup.sh
 ```
 
 Deploy a relay (manual):

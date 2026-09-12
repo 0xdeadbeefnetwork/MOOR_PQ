@@ -30,7 +30,9 @@ hs_keys/
 *.pem
 *.p12
 site/
-fuzz/
+fuzz/*
+!fuzz/fuzz_*.c
+!fuzz/fuzz_stubs.h
 deploy.sh
 deploy-debug.sh
 fuzzer.sh
@@ -53,3 +55,4 @@ docs/email_syverson.txt
 *.zip
 *.rar
 *.7z
+/moor.debug

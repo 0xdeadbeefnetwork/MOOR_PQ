@@ -79,8 +79,12 @@
  * changes.  DAs reject descriptors below MOOR_MIN_PROTOCOL_VERSION.
  * This prevents old binaries from joining the network and causing
  * signature verification failures during DA-to-DA sync. */
-#define MOOR_PROTOCOL_VERSION       4   /* v0.8.2: adds build_id (V7) to descriptor */
-#define MOOR_MIN_PROTOCOL_VERSION   4   /* minimum accepted by DAs */
+#define MOOR_PROTOCOL_VERSION       5   /* F-13: pq_seal binds the KEM ciphertext */
+/* F-13 raised the floor with the version: the pq_seal key derivation changed,
+ * so a v4 peer cannot open a v5 seal or the reverse. Refusing v4 outright is
+ * better than letting INTRODUCE1 fail to decrypt with no explanation, and it
+ * matches the policy that a relay which has not upgraded does not participate. */
+#define MOOR_MIN_PROTOCOL_VERSION   5   /* minimum accepted by DAs and clients */
 
 /* Length of the git-commit build identifier carried in every descriptor.
  * 12 hex chars + space for NUL/padding.  Populated from moor_build_id
