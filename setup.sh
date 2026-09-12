@@ -311,13 +311,18 @@ if ! ./configure > /tmp/moor_build.log 2>&1; then
     tail -5 /tmp/moor_build.log
     die "Run manually: cd $BUILD_DIR && ./configure && make"
 fi
-if ! make -j"$(nproc)" >> /tmp/moor_build.log 2>&1; then
+# `make release` is the deployable binary: debug info split into moor.debug
+# rather than shipped inside a 4 MB relay. The symbols go where gdb looks for
+# a debuglink of an installed binary, so a crash off a live relay is readable.
+if ! make -j"$(nproc)" release >> /tmp/moor_build.log 2>&1; then
     echo "  build failed:"
     tail -10 /tmp/moor_build.log
-    die "Run manually: cd $BUILD_DIR && make"
+    die "Run manually: cd $BUILD_DIR && make release"
 fi
 install -m 755 moor /usr/local/bin/moor
-echo "  installed /usr/local/bin/moor"
+install -d /usr/lib/debug/usr/local/bin
+install -m 644 moor.debug /usr/lib/debug/usr/local/bin/moor.debug
+echo "  installed /usr/local/bin/moor ($(stat -c %s moor) bytes; symbols in /usr/lib/debug/usr/local/bin/moor.debug)"
 
 # GeoIP database for country diversity (Tor-format, IPFire location data).
 # Tor stopped shipping src/config/geoip in its repo on 2024-03-05, so the old
