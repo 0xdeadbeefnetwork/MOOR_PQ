@@ -7,14 +7,8 @@
  * Nothing here is set up beyond what a real caller has: a zeroed struct. */
 #include <stddef.h>
 #include <stdint.h>
-#include <sodium.h>
 #include "moor/moor.h"
 #include "fuzz_stubs.h"
-
-int LLVMFuzzerInitialize(int *argc, char ***argv) {
-    (void)argc; (void)argv;
-    return sodium_init() < 0 ? 1 : 0;
-}
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     moor_node_descriptor_t desc;
