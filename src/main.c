@@ -1739,7 +1739,6 @@ static int run_da(void) {
     if (listen_fd < 0) return -1;
 
     moor_event_add(listen_fd, MOOR_EVENT_READ, da_accept_cb, NULL);
-    da_pool_init();
 
     /* Build initial consensus and exchange votes with peers */
     moor_da_build_consensus(&g_da_config);
@@ -1786,6 +1785,13 @@ static int run_da(void) {
     if (maybe_drop_privileges() != 0) return -1;
 #endif
     moor_sandbox_apply();
+    /* F-07: create the DA worker pool AFTER the sandbox is installed, so the
+     * workers inherit the seccomp filter. prctl(PR_SET_SECCOMP) applies to the
+     * calling thread and is inherited only by threads created afterwards; the
+     * pool previously started ~46 lines earlier and ran unsandboxed. The
+     * workers only take work from da_accept_cb inside the event loop below, so
+     * nothing between here and the accept path needed them earlier. */
+    da_pool_init();
     int ret = moor_event_loop();
     da_pool_shutdown();
     return ret;

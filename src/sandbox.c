@@ -24,6 +24,29 @@
  * If a new syscall is needed, add it to the whitelist below.
  */
 
+/* F-06: the filter matches raw syscall numbers, so it must first pin the
+ * architecture. On x86-64 a process can invoke the i386 ABI (int 0x80), where
+ * the same number is a different syscall -- e.g. number 11 is munmap on
+ * x86-64 (allowed) but execve on i386 (never intended). Without an arch guard
+ * the allowlist authorises those i386 aliases. Kill any non-native arch. */
+#if defined(__x86_64__)
+#  define MOOR_AUDIT_ARCH AUDIT_ARCH_X86_64
+#elif defined(__aarch64__)
+#  define MOOR_AUDIT_ARCH AUDIT_ARCH_AARCH64
+#elif defined(__arm__)
+#  define MOOR_AUDIT_ARCH AUDIT_ARCH_ARM
+#elif defined(__i386__)
+#  define MOOR_AUDIT_ARCH AUDIT_ARCH_I386
+#else
+#  define MOOR_AUDIT_ARCH 0
+#endif
+
+/* SECCOMP_RET_KILL_PROCESS (Linux 4.14+) kills the whole process; fall back to
+ * the older thread-kill action on ancient headers. */
+#ifndef SECCOMP_RET_KILL_PROCESS
+#  define SECCOMP_RET_KILL_PROCESS 0x80000000U
+#endif
+
 /* BPF macros for readability */
 #define SC_ALLOW(nr) \
     BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (nr), 0, 1), \
@@ -33,6 +56,17 @@
 
 static int install_seccomp_filter(void) {
     struct sock_filter filter[] = {
+#if MOOR_AUDIT_ARCH != 0
+        /* F-06: architecture gate MUST come first. Load seccomp_data.arch; if
+         * it is not our native arch, kill the process (not EPERM -- a
+         * foreign-ABI syscall here is an attack or a bug, not something the
+         * caller should be allowed to retry around). */
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, arch)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, MOOR_AUDIT_ARCH, 1, 0),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+#endif
+
         /* Load syscall number */
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
                  offsetof(struct seccomp_data, nr)),

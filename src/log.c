@@ -28,12 +28,18 @@ void moor_log_set_safe_mode(int enabled) {
     g_log_safe_mode = enabled;
 }
 
-/* Sanitize a formatted log message: redact IPv4/IPv6 addresses and
- * hex strings that look like key material (32+ hex chars).
+/* Sanitize a formatted log message: redact IPv4 and IPv6 addresses,
+ * .moor/.onion hidden-service addresses, and hex strings that look like key
+ * material (8+ hex chars = 4+ bytes).
  * Writes sanitized result to `out` (up to out_len-1 chars). */
 static void sanitize_log_message(char *out, size_t out_len,
                                   const char *msg) {
-    if (!g_log_safe_mode || out_len == 0) {
+    /* F-19: out_len == 0 leaves no room even for the NUL. Returning here
+     * avoids the len = out_len - 1 underflow to SIZE_MAX below. */
+    if (out_len == 0)
+        return;
+
+    if (!g_log_safe_mode) {
         size_t len = strlen(msg);
         if (len >= out_len) len = out_len - 1;
         memcpy(out, msg, len);
@@ -69,7 +75,52 @@ static void sanitize_log_message(char *out, size_t out_len,
             }
         }
 
-        /* Detect long hex strings (potential key material: 16+ hex chars = 8+ bytes) */
+        /* F-10: Detect IPv6 literals. A run of hex digits and colons counts
+         * as an address when it holds a "::" elision or at least 3 colons --
+         * that keeps clock values like 12:34:56 (2 colons, no "::") and
+         * host:port pairs (1 colon) out of the match. A run may begin at a
+         * colon only when that colon starts a "::", so a stray separator in
+         * prose does not open a scan. */
+        if (msg[si] == ':' ? (si + 1 < msg_len && msg[si + 1] == ':')
+                           : isxdigit((unsigned char)msg[si])) {
+            size_t v6_start = si;
+            size_t j = si;
+            int colons = 0, elision = 0, hexdigits = 0;
+            while (j < msg_len && (isxdigit((unsigned char)msg[j]) || msg[j] == ':')) {
+                if (msg[j] == ':') {
+                    colons++;
+                    if (j + 1 < msg_len && msg[j + 1] == ':') elision = 1;
+                } else {
+                    hexdigits++;
+                }
+                j++;
+            }
+            /* Absorb an embedded IPv4 tail (::ffff:192.0.2.128) so the
+             * dotted octets are not left behind after the v6 part is cut. */
+            if (j < msg_len && msg[j] == '.') {
+                size_t k = j;
+                while (k < msg_len && (isdigit((unsigned char)msg[k]) || msg[k] == '.'))
+                    k++;
+                j = k;
+            }
+            /* Trim a trailing ':' or '.' so a separator stays visible. */
+            while (j > v6_start && (msg[j - 1] == ':' || msg[j - 1] == '.')) {
+                if (msg[j - 1] == ':') colons--;
+                j--;
+            }
+            if (hexdigits > 0 && (elision || colons >= 3)) {
+                const char *redacted = "[REDACTED6]";
+                size_t rlen = strlen(redacted);
+                if (di + rlen < out_len) {
+                    memcpy(out + di, redacted, rlen);
+                    di += rlen;
+                }
+                si = j;
+                continue;
+            }
+        }
+
+        /* Detect long hex strings (potential key material: 8+ hex chars = 4+ bytes) */
         if (isxdigit((unsigned char)msg[si]) && si + 1 < msg_len &&
             isxdigit((unsigned char)msg[si + 1])) {
             size_t hex_start = si;
@@ -88,14 +139,17 @@ static void sanitize_log_message(char *out, size_t out_len,
             }
         }
 
-        /* Detect .moor addresses (alphanumeric+.moor) */
+        /* Detect onion-style addresses. F-11: .onion was never covered, so a
+         * Tor address pasted into a MOOR proxy reached the log in full. */
         if (si + 5 < msg_len && isalnum((unsigned char)msg[si])) {
             size_t j = si;
             while (j < msg_len && (isalnum((unsigned char)msg[j]) || msg[j] == '.'))
                 j++;
-            if (j - si > 10 && j >= 5 &&
-                msg[j-5] == '.' && msg[j-4] == 'm' && msg[j-3] == 'o' &&
-                msg[j-2] == 'o' && msg[j-1] == 'r') {
+            size_t run = j - si;
+            int hidden_suffix =
+                (run > 10 && j >= 5 && memcmp(msg + j - 5, ".moor", 5) == 0) ||
+                (run > 10 && j >= 6 && memcmp(msg + j - 6, ".onion", 6) == 0);
+            if (hidden_suffix) {
                 const char *redacted = "[ADDR]";
                 size_t rlen = strlen(redacted);
                 if (di + rlen < out_len) {
@@ -110,6 +164,13 @@ static void sanitize_log_message(char *out, size_t out_len,
         out[di++] = msg[si++];
     }
     out[di] = '\0';
+}
+
+/* Test-only entry point into the redactor. Declared in tests, not in log.h,
+ * so it adds no public surface. */
+void moor_log_redact_for_test(char *out, size_t out_len, const char *msg);
+void moor_log_redact_for_test(char *out, size_t out_len, const char *msg) {
+    sanitize_log_message(out, out_len, msg);
 }
 
 void moor_log_impl(moor_log_level_t level, const char *file, int line,
