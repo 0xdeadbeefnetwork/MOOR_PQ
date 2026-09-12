@@ -84,6 +84,11 @@ typedef struct {
     int          middle_only;
     int          padding;
     int          verbose;
+    /* F-05: require hybrid PQ on every circuit hop. Default ON -- the README
+     * states PQ hybrid is mandatory with no downgrade path, and without this
+     * the builder silently accepted classical-only hops. Set to 0 only to
+     * interoperate with a pre-PQ network. */
+    int          require_pq;
 
     /* Exit policy */
     moor_exit_policy_t exit_policy;

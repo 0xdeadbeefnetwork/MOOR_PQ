@@ -7,7 +7,7 @@
 #
 #   ./tests/run-review-tests.sh
 #
-# Covers: F-01..F-04 (path diversity), F-05 (PQ not mandatory),
+# Covers: F-01/F-03/F-04 (path diversity), F-05 (PQ mandatory),
 #         F-06 (seccomp arch gate), F-10/F-11/F-19 (log redaction).
 set -uo pipefail
 cd "$(dirname "$0")/.."

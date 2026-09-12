@@ -139,12 +139,22 @@ const moor_node_descriptor_t *moor_node_select_relay(
     const moor_consensus_t *cons, uint32_t required_flags,
     const uint8_t *exclude_ids, int num_exclude);
 
-/* Select relay with GeoIP diversity enforcement.
- * Rejects candidates sharing country/AS with selected_descs (up to 10 retries). */
+/* Select a relay with path diversity enforced.
+ *
+ * HARD, never relaxed, NULL returned if unsatisfiable:
+ *   - family (DA-assigned via mutual declaration; no GeoIP involvement)
+ * SOFT, best-effort, relaxed after MOOR_DIVERSE_ATTEMPTS draws:
+ *   - country, AS (both from GeoIP, which may be absent or stale)
+ */
 const moor_node_descriptor_t *moor_node_select_relay_diverse(
     const moor_consensus_t *cons, uint32_t required_flags,
     const uint8_t *exclude_ids, int num_exclude,
     const moor_node_descriptor_t **selected_descs, int num_selected);
+
+/* F-05: when set (default), no relay lacking hybrid PQ is selected for any
+ * position, by any caller. Set 0 only to interoperate with a pre-PQ network. */
+void moor_node_set_require_pq(int require);
+int  moor_node_require_pq(void);
 
 /* Select relay requiring PQ capability (NODE_FEATURE_PQ) */
 const moor_node_descriptor_t *moor_node_select_relay_pq(

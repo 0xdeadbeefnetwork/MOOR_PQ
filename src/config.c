@@ -149,6 +149,7 @@ void moor_config_defaults(moor_config_t *cfg) {
     cfg->padding = MOOR_PADDING_ENABLED;    /* Mandatory baseline: ON */
     snprintf(cfg->padding_machine, sizeof(cfg->padding_machine), "generic");
     cfg->verbose = 0;
+    cfg->require_pq = 1;                    /* F-05: PQ hybrid mandatory by default */
     cfg->exit_policy.num_rules = 0;
     cfg->num_hidden_services = 0;
     cfg->pir = 1;
@@ -475,6 +476,15 @@ int moor_config_set(moor_config_t *cfg, const char *key, const char *value) {
     }
     else if (strcmp(key, "Padding") == 0) {
         cfg->padding = atoi(value);
+    }
+    else if (strcmp(key, "RequirePQ") == 0) {
+        /* F-05: 1 (default) refuses any circuit hop without hybrid PQ.
+         * 0 restores the old behaviour of silently accepting classical hops --
+         * only for talking to a pre-PQ network, and it is logged loudly. */
+        cfg->require_pq = atoi(value) ? 1 : 0;
+        if (!cfg->require_pq)
+            LOG_WARN("RequirePQ 0: circuits may use classical-only hops. "
+                     "Traffic is NOT protected against a quantum adversary.");
     }
     else if (strcmp(key, "Verbose") == 0) {
         cfg->verbose = atoi(value);

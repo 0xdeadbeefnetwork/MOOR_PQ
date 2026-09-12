@@ -80,10 +80,12 @@ static void free_consensus(moor_consensus_t *c) { free(c->relays); free(c); }
 
 static void test_selector_admits_non_pq(void) {
     char buf[256];
-    printf("== F-05(a): circuit selector does not require PQ ==\n");
+    printf("== F-05(a): with RequirePQ OFF, non-PQ hops are admitted ==\n");
     note("consensus: 3 relays with NODE_FEATURE_PQ + valid kem_pk,");
     note("           3 relays with neither.");
+    note("This is the pre-fix behaviour, reachable now only by opting out.");
 
+    moor_node_set_require_pq(0);
     moor_consensus_t *c = build_mixed_consensus();
 
     int classical_hops = 0, total_hops = 0, circuits_with_classical = 0;
@@ -129,13 +131,81 @@ static void test_selector_admits_non_pq(void) {
     else bad("expected circuits with a non-PQ hop");
 
     if (classical_hops > 0)
-        ok("=> 'PQ hybrid is mandatory / no downgrade path' does not hold");
+        ok("=> this is what the README's 'no downgrade path' used to mean");
+    moor_node_set_require_pq(1);
+}
+
+/* ---- the fix: RequirePQ on (the default) ----------------------------- */
+
+static void test_require_pq_default(void) {
+    char buf[256];
+    printf("\n== F-05: with RequirePQ ON (default), no non-PQ hop is selected ==\n");
+
+    if (moor_node_require_pq()) ok("RequirePQ defaults to on");
+    else bad("RequirePQ does not default to on");
+
+    moor_consensus_t *c = build_mixed_consensus();
+    int classical_hops = 0, total_hops = 0, nulls = 0;
+
+    for (int t = 0; t < TRIALS; t++) {
+        uint8_t exclude[3][32];
+        const moor_node_descriptor_t *hop[3];
+        int n_ex = 0;
+
+        hop[0] = moor_node_select_relay(c, NODE_FLAG_GUARD | NODE_FLAG_RUNNING,
+                                        (const uint8_t *)exclude, n_ex);
+        if (!hop[0]) { nulls++; continue; }
+        memcpy(exclude[n_ex++], hop[0]->identity_pk, 32);
+
+        hop[2] = moor_node_select_relay(c, NODE_FLAG_EXIT | NODE_FLAG_RUNNING,
+                                        (const uint8_t *)exclude, n_ex);
+        if (!hop[2]) { nulls++; continue; }
+        memcpy(exclude[n_ex++], hop[2]->identity_pk, 32);
+
+        hop[1] = moor_node_select_relay(c, NODE_FLAG_RUNNING,
+                                        (const uint8_t *)exclude, n_ex);
+        if (!hop[1]) { nulls++; continue; }
+
+        for (int h = 0; h < 3; h++) {
+            total_hops++;
+            if (!circuit_would_use_pq(hop[h])) classical_hops++;
+        }
+    }
+    free_consensus(c);
+
+    snprintf(buf, sizeof(buf),
+             "%d/%d selected hops would take the classical extend",
+             classical_hops, total_hops);
+    if (classical_hops == 0) ok(buf); else bad(buf);
+
+    ok("=> a relay without hybrid PQ is no longer a candidate for any position");
+}
+
+/* The filter must not quietly empty the network: when every relay is PQ the
+ * selector must still return relays. */
+static void test_require_pq_all_pq_network(void) {
+    printf("\n== F-05: an all-PQ consensus is unaffected ==\n");
+    moor_consensus_t *c = build_mixed_consensus();
+    for (int i = 0; i < N_RELAYS; i++) {
+        c->relays[i].features |= NODE_FEATURE_PQ;
+        memset(c->relays[i].kem_pk, 0xA5, 1184);
+    }
+    int got = 0;
+    for (int t = 0; t < 1000; t++) {
+        uint8_t ex[1][32];
+        if (moor_node_select_relay(c, NODE_FLAG_RUNNING, (const uint8_t *)ex, 0)) got++;
+    }
+    free_consensus(c);
+    char buf[128];
+    snprintf(buf, sizeof(buf), "selector returned a relay %d/1000 times", got);
+    if (got == 1000) ok(buf); else bad(buf);
 }
 
 /* ---- F-05(c): the PQ-filtering selector exists and works ------------- */
 
 static void test_pq_selector_works_but_is_unused(void) {
     printf("\n== F-05(c): moor_node_select_relay_pq() filters correctly ==\n");
+    moor_node_set_require_pq(0);   /* isolate this selector's own filtering */
     moor_consensus_t *c = build_mixed_consensus();
 
     int non_pq_returned = 0, nulls = 0;
@@ -156,8 +226,10 @@ static void test_pq_selector_works_but_is_unused(void) {
     if (non_pq_returned == 0) ok(buf);
     else bad(buf);
 
-    ok("=> the correct selector exists and works; circuit.c never calls it");
-    note("(grep: moor_node_select_relay_pq has 0 call sites outside node.c)");
+    ok("=> this selector was already correct; the gap was that nothing called it");
+    note("(the fix enforces PQ in moor_node_select_relay itself, so every");
+    note(" caller inherits it rather than each remembering to opt in)");
+    moor_node_set_require_pq(1);
 }
 
 /* ---- the hop-level gate itself --------------------------------------- */
@@ -189,6 +261,8 @@ int main(void) {
     if (sodium_init() < 0) { fprintf(stderr, "sodium_init failed\n"); return 2; }
 
     test_selector_admits_non_pq();
+    test_require_pq_default();
+    test_require_pq_all_pq_network();
     test_pq_selector_works_but_is_unused();
     test_gate_predicate();
 
