@@ -3238,7 +3238,8 @@ static void hs_intro_read_cb(int fd, int events, void *arg) {
             int fret = moor_fragment_receive(
                 &circ->reassembly, relay.data, relay.data_length,
                 relay.stream_id, relay.relay_command,
-                &inner_cmd, reassembled, &reassembled_len);
+                &inner_cmd, reassembled, sizeof(reassembled),
+                &reassembled_len);
             if (fret == 1 && inner_cmd == RELAY_INTRODUCE2) {
                 LOG_INFO("HS: received INTRODUCE2 (%zu bytes, reassembled)",
                          reassembled_len);
