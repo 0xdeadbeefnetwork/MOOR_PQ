@@ -10,7 +10,8 @@
 # Covers: F-01/F-03/F-04 (path diversity), F-05/F-26 (PQ + upgrade floor),
 #         F-15 (ML-KEM-768 and ML-DSA-65 against NIST vectors),
 #         F-06 (seccomp arch gate), F-10/F-11/F-19 (log redaction),
-#         F-09/F-18 (key store), F-20/F-21/F-27 (descriptor + consensus bounds).
+#         F-09/F-18 (key store), F-20/F-21/F-27 (descriptor + consensus bounds),
+#         F-15 (the SOCKS5 request parser on its own).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
@@ -114,6 +115,9 @@ if [ -d obj ] && [ -n "$(find obj -name '*.o' -print -quit 2>/dev/null)" ]; then
     [ -n "$SOD_INC" ] && EV_LIB="$PREFIX/usr/lib/x86_64-linux-gnu/libevent.a $PREFIX/usr/lib/x86_64-linux-gnu/libevent_pthreads.a" || EV_LIB="-levent -levent_pthreads"
     # shellcheck disable=SC2086
     run test_descriptor_bounds tests/test_descriptor_bounds.c $OBJS $SOD_LIB $EV_LIB $Z_LIB -lm -lpthread
+    # SOCKS5 request parser, split out of the handler 2026-09-12 (F-15).
+    # shellcheck disable=SC2086
+    run test_socks5_parse tests/test_socks5_parse.c $OBJS $SOD_LIB $EV_LIB $Z_LIB -lm -lpthread
 else
     printf '\n=== test_descriptor_bounds ===\n  skipped: run make first (needs obj/*.o)\n'
 fi

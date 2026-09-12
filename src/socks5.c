@@ -2054,8 +2054,16 @@ int moor_socks5_handle_auth(moor_socks5_client_t *client,
     return 0;
 }
 
-int moor_socks5_handle_request(moor_socks5_client_t *client,
-                               const uint8_t *data, size_t len) {
+/* Parse a SOCKS5 request: the fixed header, the address by type, the port,
+ * and the ingress checks that need nothing but the bytes. On success the
+ * client's target_addr and target_port are set and *cmd_out is the command.
+ * On failure the protocol reply is sent, as before, and -1 returned. This is
+ * the parser and nothing else: no circuit, no thread, no global -- the F-15
+ * socks5 harness calls it directly, so it fuzzes at parser speed. Routing
+ * lives in moor_socks5_handle_request(). */
+int moor_socks5_parse_request(moor_socks5_client_t *client,
+                              const uint8_t *data, size_t len,
+                              uint8_t *cmd_out) {
     if (len < 7) return -1;
     uint8_t cmd = data[1];
     if (data[0] != 0x05 || (cmd != 0x01 && cmd != 0xF0)) {
@@ -2127,6 +2135,16 @@ int moor_socks5_handle_request(moor_socks5_client_t *client,
         send(client->client_fd, (char *)fail, sizeof(fail), MSG_NOSIGNAL);
         return -1;
     }
+
+    *cmd_out = cmd;
+    return 0;
+}
+
+int moor_socks5_handle_request(moor_socks5_client_t *client,
+                               const uint8_t *data, size_t len) {
+    uint8_t cmd;
+    if (moor_socks5_parse_request(client, data, len, &cmd) != 0)
+        return -1;
 
     /* SOCKS5 RESOLVE (0xF0): resolve hostname through circuit, return IP.
      * Tor-aligned: client sends domain name, we resolve and return IPv4. */
