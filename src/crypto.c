@@ -313,22 +313,63 @@ int moor_crypto_seal_open(uint8_t *pt, const uint8_t *ct, size_t ct_len,
  * Wire layout: kem_ct(1088) || aead_ct(pt_len) || aead_tag(16)
  * Anonymous: no sender key material involved (the ML-KEM encaps step
  * generates a fresh randomness internally that isn't exposed). */
+/*
+ * F-13: bind the KEM ciphertext into the AEAD key.
+ *
+ * The key used to be KDF(shared_secret) alone, with the ciphertext neither
+ * hashed into the derivation nor passed as associated data. ML-KEM is IND-CCA2
+ * but not MAL-BIND-K-CT (Cremers, Dax, Medinger, "Keeping Up with the KEMs"):
+ * a shared secret does not uniquely determine the ciphertext that produced it,
+ * so a seal was not committed to its own encapsulation. The standard hardening
+ * is to derive over ss || ct.
+ *
+ * This is a WIRE FORMAT CHANGE. A peer on the old derivation cannot open a new
+ * seal and vice versa, so MOOR_PROTOCOL_VERSION is bumped to 5 and the floor
+ * raised with it -- old relays are refused rather than silently failing to
+ * decrypt. That matches the project's stated policy: a relay that has not
+ * upgraded is carrying whatever the upgrade fixed, and does not get to
+ * participate.
+ *
+ * The KDF context is "moorSEL2" rather than "moorSEAL" so that even if the
+ * two derivations ever met, they could not agree on a key by accident.
+ */
+static int pq_seal_derive_key(uint8_t aead_key[32],
+                              const uint8_t kem_ss[MOOR_KEM_SS_LEN],
+                              const uint8_t *kem_ct) {
+    /* BLAKE2b(ss || ct) -> 32 bytes, then the KDF over that. Hashing first
+     * keeps the KDF's 32-byte master-key contract while still committing to
+     * the full 1088-byte ciphertext. */
+    uint8_t bound[32];
+    crypto_generichash_state st;
+    crypto_generichash_blake2b_init(&st, NULL, 0, 32);
+    crypto_generichash_blake2b_update(&st, kem_ss, MOOR_KEM_SS_LEN);
+    crypto_generichash_blake2b_update(&st, kem_ct, MOOR_KEM_CT_LEN);
+    crypto_generichash_blake2b_final(&st, bound, 32);
+
+    int rc = moor_crypto_kdf(aead_key, 32, bound, 0, "moorSEL2");
+    sodium_memzero(bound, sizeof(bound));
+    return rc;
+}
+
 int moor_crypto_pq_seal(uint8_t *ct, const uint8_t *pt, size_t pt_len,
                         const uint8_t *recipient_kem_pk) {
     uint8_t kem_ss[MOOR_KEM_SS_LEN];
     if (moor_kem_encapsulate(ct, kem_ss, recipient_kem_pk) != 0) return -1;
 
     uint8_t aead_key[32];
-    if (moor_crypto_kdf(aead_key, 32, kem_ss, 0, "moorSEAL") != 0) {
+    if (pq_seal_derive_key(aead_key, kem_ss, ct) != 0) {
         moor_crypto_wipe(kem_ss, sizeof(kem_ss));
         return -1;
     }
     moor_crypto_wipe(kem_ss, sizeof(kem_ss));
 
+    /* The ciphertext is also the associated data, so the tag covers it even
+     * if the key derivation were ever weakened. Belt and braces on a binding
+     * that matters. */
     size_t aead_ct_len = 0;
     int ret = moor_crypto_aead_encrypt(ct + MOOR_KEM_CT_LEN, &aead_ct_len,
                                         pt, pt_len,
-                                        NULL, 0, aead_key, 0);
+                                        ct, MOOR_KEM_CT_LEN, aead_key, 0);
     moor_crypto_wipe(aead_key, sizeof(aead_key));
     if (ret != 0) return -1;
     if (aead_ct_len != pt_len + MOOR_PQ_SEAL_AEAD_TAG) return -1;
@@ -344,7 +385,7 @@ int moor_crypto_pq_seal_open(uint8_t *pt, const uint8_t *ct, size_t ct_len,
     if (moor_kem_decapsulate(kem_ss, ct, recipient_kem_sk) != 0) return -1;
 
     uint8_t aead_key[32];
-    if (moor_crypto_kdf(aead_key, 32, kem_ss, 0, "moorSEAL") != 0) {
+    if (pq_seal_derive_key(aead_key, kem_ss, ct) != 0) {   /* F-13 */
         moor_crypto_wipe(kem_ss, sizeof(kem_ss));
         return -1;
     }
@@ -353,7 +394,7 @@ int moor_crypto_pq_seal_open(uint8_t *pt, const uint8_t *ct, size_t ct_len,
     size_t pt_len = 0;
     int ret = moor_crypto_aead_decrypt(pt, &pt_len,
                                         ct + MOOR_KEM_CT_LEN, aead_ct_len,
-                                        NULL, 0, aead_key, 0);
+                                        ct, MOOR_KEM_CT_LEN, aead_key, 0);
     moor_crypto_wipe(aead_key, sizeof(aead_key));
     return ret;
 }

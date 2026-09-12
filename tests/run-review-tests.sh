@@ -88,12 +88,18 @@ run test_kyber_kat tests/test_kyber_kat.c $KEM_SRC $SOD_LIB -lm
 # shellcheck disable=SC2086
 run test_mldsa_kat tests/test_mldsa_kat.c $DSA_SRC $SOD_LIB -lm
 
-# F-09/F-18: key-store hardening, against real files in a scratch dir.
+# Full crypto-layer source set, used by the seal and key-store tests.
 KS_SRC="src/crypto.c src/log.c src/kem.c src/sig.c src/falcon.c
         src/randombytes_moor.c src/pqclean/common/fips202.c
         src/pqclean/common/sha2.c src/pqclean/common/aes.c
         src/pqclean/ml_kem_768/*.c src/pqclean/ml_dsa_65/*.c
         src/pqclean/falcon_512/*.c"
+
+# F-13: pq_seal binds its KEM ciphertext (wire change, protocol v5).
+# shellcheck disable=SC2086
+run test_pq_seal tests/test_pq_seal.c $KS_SRC $SOD_LIB -lm
+
+# F-09/F-18: key-store hardening, against real files in a scratch dir.
 # shellcheck disable=SC2086
 run test_keystore tests/test_keystore.c $KS_SRC $SOD_LIB -lm
 
