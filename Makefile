@@ -692,9 +692,13 @@ debug: moor_debug
 # =============================================================================
 
 FUZZ_CC = clang
-# Library objects: ASan+UBSan but NO -fsanitize=fuzzer (that's only for harness main)
+# Library objects: ASan+UBSan plus coverage instrumentation (fuzzer-no-link),
+# without which libFuzzer sees no edges inside the library and mutates blind --
+# the first smoke run of the F-15 harnesses reported cov: 1..7 after millions
+# of executions for exactly that reason. The fuzzer runtime itself (main) is
+# linked only into the harness via -fsanitize=fuzzer.
 FUZZ_LIB_CFLAGS = -Wall -Wextra -O1 -g -fno-strict-aliasing \
-                  -fsanitize=address,undefined -fno-omit-frame-pointer \
+                  -fsanitize=address,undefined,fuzzer-no-link -fno-omit-frame-pointer \
                   -Iinclude -Isrc/pqclean -Isrc/pqclean/common \
                   -DMOOR_SYSCONFDIR='"$(SYSCONFDIR)/moor"' \
                   $(SODIUM_CFLAGS) $(LIBEVENT_CFLAGS) $(ZLIB_CFLAGS)
