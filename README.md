@@ -174,7 +174,7 @@ moor             --enclave mynet.enclave  # client
 - [Protocol](docs/protocol.md) — wire formats, cell commands, handshake + consensus format
 - [Security](docs/security.md) — threat model, cryptographic analysis, limitations
 - [Configuration](docs/configuration.md) — all config options, CLI flags, torrc compatibility
-- [Building](docs/building.md) — dependencies, build options, cross-compilation, sanitizers
+- [Building](docs/building.md) — dependencies, configure, build options, cross-compilation, sanitizers, fuzzing
 - [OPSEC](docs/opsec.md) — using MOOR without defeating the point
 - [Philosophy](docs/philosophy.md) — why MOOR exists
 - [PQ crypto flow diagram](docs/pq-crypto-flow.svg) — one-page overview of the hybrid PQ data paths
