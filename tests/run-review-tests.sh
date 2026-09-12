@@ -7,7 +7,8 @@
 #
 #   ./tests/run-review-tests.sh
 #
-# Covers: F-01/F-03/F-04 (path diversity), F-05 (PQ mandatory),
+# Covers: F-01/F-03/F-04 (path diversity), F-05/F-26 (PQ + upgrade floor),
+#         F-15 (ML-KEM-768 and ML-DSA-65 against NIST vectors),
 #         F-06 (seccomp arch gate), F-10/F-11/F-19 (log redaction).
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -33,7 +34,7 @@ else
     echo "using local prefix $PREFIX"
 fi
 
-INC="-Iinclude -Isrc/pqclean -Isrc/pqclean/common $SOD_INC"
+INC="-Iinclude -Isrc/pqclean -Isrc/pqclean/common -Itests $SOD_INC"
 WARN="-Wall -Wextra -O2"
 
 # Scalar PQClean only: keccak2x is ARM NEON, keccak4x needs -mavx2.
@@ -71,6 +72,17 @@ run test_sandbox_arch src/sandbox.c src/log.c tests/test_sandbox_arch.c
 run test_path_diversity tests/test_path_diversity.c $CORE $LIBS
 # shellcheck disable=SC2086
 run test_pq_mandatory   tests/test_pq_mandatory.c   $CORE $LIBS
+
+# F-15: the PQ primitives against NIST's own vectors. These are the tests that
+# say the post-quantum claim is true, so they run even though they are slower.
+KEM_SRC="src/kem.c src/log.c src/pqclean/common/fips202.c
+         src/pqclean/common/randombytes.c src/pqclean/ml_kem_768/*.c"
+DSA_SRC="src/sig.c src/log.c src/pqclean/common/fips202.c
+         src/pqclean/common/randombytes.c src/pqclean/ml_dsa_65/*.c"
+# shellcheck disable=SC2086
+run test_kyber_kat tests/test_kyber_kat.c $KEM_SRC $SOD_LIB -lm
+# shellcheck disable=SC2086
+run test_mldsa_kat tests/test_mldsa_kat.c $DSA_SRC $SOD_LIB -lm
 
 printf '\n%s\n' "$( [ $fail -eq 0 ] && echo 'ALL REVIEW TESTS PASSED' || echo 'FAILURES -- see above' )"
 exit $fail
