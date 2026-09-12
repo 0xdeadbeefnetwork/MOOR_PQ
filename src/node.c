@@ -6,6 +6,30 @@
 #include <time.h>
 #include <ctype.h>
 
+/*
+ * The largest body desc_sign_serialize can produce, field by field:
+ *   identity_pk 32 + onion_pk 32 + address 64 + ports 4 + flags 4
+ *   + bandwidth 8 + published 8 + kem_pk 1184 + features 4          = 1340
+ *   V3: count 1 + 8 family members * 32                             =  257
+ *   V4: nickname 32 + address6 64 + prev_onion_pk 32 + ver 4 + ts 8  =  140
+ *   V5: contact_info                                                 =  128
+ *   V7: build_id                                                     =   16
+ *   V8: falcon_pk                                                    =  897
+ *                                                                    -----
+ *                                                                     2778
+ * F-20: the callers used a bare malloc(4096) and this function wrote into it
+ * with no bounds checking. 4096 is comfortable today and silently stops being
+ * so the day MOOR_FALCON_PK_LEN, the contact field or the 8-member family cap
+ * grows. Sized here from the constants so it cannot drift, and asserted at
+ * both call sites.
+ */
+#define DESC_SIGN_BODY_MAX (32 + 32 + 64 + 4 + 4 + 8 + 8 + 1184 + 4 \
+                            + 1 + 8 * 32 \
+                            + 32 + 64 + 32 + 4 + 8 \
+                            + 128 \
+                            + 16 \
+                            + MOOR_FALCON_PK_LEN)
+
 /* Forward declaration — defined below, used by create_descriptor */
 static size_t desc_sign_serialize(uint8_t *buf, const moor_node_descriptor_t *desc);
 
@@ -133,9 +157,8 @@ int moor_node_create_descriptor(moor_node_descriptor_t *desc,
     }
 
     /* Sign all fields including V3/V4/V8 via shared serializer.
-     * Buffer must hold signable bytes; enlarged to 4096 to cover
-     * V8's 897-byte Falcon pk. */
-    uint8_t *buf = malloc(4096);
+     * F-20: sized from the field constants, not a round number. */
+    uint8_t *buf = malloc(DESC_SIGN_BODY_MAX);
     if (!buf) return -1;
     size_t off = desc_sign_serialize(buf, desc);
     int ret = moor_crypto_sign(desc->signature, buf, off, identity_sk);
@@ -182,8 +205,10 @@ static uint32_t desc_wire_features(const moor_node_descriptor_t *desc) {
     return f;
 }
 
+
 /* Serialize descriptor fields into buffer for signing/verification.
- * Covers all fields including V3/V4 (#207). Returns bytes written. */
+ * Covers all fields including V3/V4 (#207). Returns bytes written.
+ * `buf` must hold at least DESC_SIGN_BODY_MAX bytes. */
 static size_t desc_sign_serialize(uint8_t *buf, const moor_node_descriptor_t *desc) {
     size_t off = 0;
     memcpy(buf + off, desc->identity_pk, 32); off += 32;
@@ -258,7 +283,7 @@ int moor_node_sign_descriptor(moor_node_descriptor_t *desc,
     /* Ensure features match what serialization will produce */
     desc->features = desc_wire_features(desc);
 
-    uint8_t *buf = malloc(4096);
+    uint8_t *buf = malloc(DESC_SIGN_BODY_MAX);   /* F-20 */
     if (!buf) return -1;
     size_t off = desc_sign_serialize(buf, desc);
 
@@ -274,7 +299,7 @@ int moor_node_sign_descriptor(moor_node_descriptor_t *desc,
 }
 
 int moor_node_verify_descriptor(const moor_node_descriptor_t *desc) {
-    uint8_t *buf = malloc(4096);
+    uint8_t *buf = malloc(DESC_SIGN_BODY_MAX);   /* F-20 */
     if (!buf) return -1;
     size_t off = desc_sign_serialize(buf, desc);
 

@@ -25,7 +25,10 @@ else
     if [ ! -f "$PREFIX/usr/include/sodium.h" ]; then
         echo "fetching libsodium + zlib into $PREFIX (no root, nothing installed)"
         mkdir -p "$WORK/debs" "$PREFIX"
-        ( cd "$WORK/debs" && apt-get download libsodium-dev libsodium23 zlib1g-dev >/dev/null 2>&1 )
+        ( cd "$WORK/debs" && apt-get download \
+            libsodium-dev libsodium23 zlib1g-dev \
+            libevent-dev libevent-2.1-7t64 libevent-core-2.1-7t64 \
+            libevent-extra-2.1-7t64 libevent-pthreads-2.1-7t64 >/dev/null 2>&1 )
         for d in "$WORK"/debs/*.deb; do dpkg -x "$d" "$PREFIX/"; done
     fi
     SOD_INC="-I$PREFIX/usr/include"
@@ -83,6 +86,18 @@ DSA_SRC="src/sig.c src/log.c src/pqclean/common/fips202.c
 run test_kyber_kat tests/test_kyber_kat.c $KEM_SRC $SOD_LIB -lm
 # shellcheck disable=SC2086
 run test_mldsa_kat tests/test_mldsa_kat.c $DSA_SRC $SOD_LIB -lm
+
+# F-20/F-21/F-27: needs the whole library, so it links the built objects rather
+# than a source subset. Requires `make` to have run; skipped with a note if not.
+if [ -d obj ] && [ -n "$(find obj -name '*.o' -print -quit 2>/dev/null)" ]; then
+    OBJS=$(find obj -name '*.o' ! -name 'main.o' | tr '\n' ' ')
+    EV_LIB=""
+    [ -n "$SOD_INC" ] && EV_LIB="$PREFIX/usr/lib/x86_64-linux-gnu/libevent.a $PREFIX/usr/lib/x86_64-linux-gnu/libevent_pthreads.a" || EV_LIB="-levent -levent_pthreads"
+    # shellcheck disable=SC2086
+    run test_descriptor_bounds tests/test_descriptor_bounds.c $OBJS $SOD_LIB $EV_LIB $Z_LIB -lm -lpthread
+else
+    printf '\n=== test_descriptor_bounds ===\n  skipped: run make first (needs obj/*.o)\n'
+fi
 
 printf '\n%s\n' "$( [ $fail -eq 0 ] && echo 'ALL REVIEW TESTS PASSED' || echo 'FAILURES -- see above' )"
 exit $fail
