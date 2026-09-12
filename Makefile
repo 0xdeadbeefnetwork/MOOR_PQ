@@ -695,27 +695,24 @@ FUZZ_CC = clang
 # Library objects: ASan+UBSan but NO -fsanitize=fuzzer (that's only for harness main)
 FUZZ_LIB_CFLAGS = -Wall -Wextra -O1 -g -fno-strict-aliasing \
                   -fsanitize=address,undefined -fno-omit-frame-pointer \
-                  -Iinclude -Isrc/kyber -Isrc/dilithium \
-                  $(shell pkg-config --cflags libsodium)
+                  -Iinclude -Isrc/pqclean -Isrc/pqclean/common \
+                  -DMOOR_SYSCONFDIR='"$(SYSCONFDIR)/moor"' \
+                  $(SODIUM_CFLAGS) $(LIBEVENT_CFLAGS) $(ZLIB_CFLAGS)
 # Harness files: add -fsanitize=fuzzer for LLVMFuzzerTestOneInput linkage
 FUZZ_HARNESS_CFLAGS = $(FUZZ_LIB_CFLAGS) -fsanitize=fuzzer
 FUZZ_LDFLAGS = -fsanitize=fuzzer,address,undefined \
-               $(shell pkg-config --libs libsodium) -lm -lpthread -lz
+               $(SODIUM_LIBS) $(LIBEVENT_LIBS) -lm -lpthread $(ZLIB_LIBS)
 
 FUZZ_OBJDIR = obj_fuzz
 FUZZ_OBJECTS = $(patsubst $(SRCDIR)/%.c,$(FUZZ_OBJDIR)/%.o,$(SOURCES))
 FUZZ_KYBER_OBJECTS = $(patsubst $(SRCDIR)/kyber/%.c,$(FUZZ_OBJDIR)/kyber/%.o,$(KYBER_SOURCES))
 FUZZ_DILITHIUM_OBJECTS = $(patsubst $(SRCDIR)/dilithium/%.c,$(FUZZ_OBJDIR)/dilithium/%.o,$(DILITHIUM_SOURCES))
-FUZZ_ALL_OBJECTS = $(FUZZ_OBJECTS) $(FUZZ_KYBER_OBJECTS) $(FUZZ_DILITHIUM_OBJECTS)
+FUZZ_PQCLEAN_OBJECTS = $(patsubst $(SRCDIR)/pqclean/%.c,$(FUZZ_OBJDIR)/pqclean/%.o,$(PQCLEAN_SOURCES))
+FUZZ_ALL_OBJECTS = $(FUZZ_OBJECTS) $(FUZZ_KYBER_OBJECTS) $(FUZZ_DILITHIUM_OBJECTS) $(FUZZ_PQCLEAN_OBJECTS)
 
-FUZZ_HARNESSES = fuzz/fuzz_cell fuzz/fuzz_socks5 fuzz/fuzz_cke \
-                 fuzz/fuzz_config fuzz/fuzz_hs_addr fuzz/fuzz_consensus \
-                 fuzz/fuzz_noise fuzz/fuzz_kyber fuzz/fuzz_mldsa \
-                 fuzz/fuzz_lspec fuzz/fuzz_transport fuzz/fuzz_microdesc \
-                 fuzz/fuzz_wfpad fuzz/fuzz_pow fuzz/fuzz_padding \
-                 fuzz/fuzz_conflux fuzz/fuzz_ratelimit \
-                 fuzz/fuzz_descriptor fuzz/fuzz_geoip \
-                 fuzz/fuzz_relay_cell fuzz/fuzz_base32 fuzz/fuzz_dpf
+# Every fuzz/fuzz_*.c is a harness. F-15 recorded 21 names here with no source
+# behind them; the list now follows the tree so a missing harness cannot hide.
+FUZZ_HARNESSES = $(patsubst %.c,%,$(wildcard fuzz/fuzz_*.c))
 
 $(FUZZ_OBJDIR):
 	mkdir -p $(FUZZ_OBJDIR)
@@ -727,6 +724,10 @@ $(FUZZ_OBJDIR)/dilithium:
 	mkdir -p $(FUZZ_OBJDIR)/dilithium
 
 $(FUZZ_OBJDIR)/%.o: $(SRCDIR)/%.c | $(FUZZ_OBJDIR)
+	$(FUZZ_CC) $(FUZZ_LIB_CFLAGS) -c $< -o $@
+
+$(FUZZ_OBJDIR)/pqclean/%.o: $(SRCDIR)/pqclean/%.c | $(FUZZ_OBJDIR)
+	@mkdir -p $(dir $@)
 	$(FUZZ_CC) $(FUZZ_LIB_CFLAGS) -c $< -o $@
 
 $(FUZZ_OBJDIR)/kyber/%.o: $(SRCDIR)/kyber/%.c | $(FUZZ_OBJDIR)/kyber

@@ -30,7 +30,8 @@ hs_keys/
 *.pem
 *.p12
 site/
-fuzz/
+fuzz/*
+!fuzz/fuzz_*.c
 deploy.sh
 deploy-debug.sh
 fuzzer.sh
