@@ -43,6 +43,9 @@ CONTACT_INFO=""
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 detect_ip() {
+    # F-24: these third parties learn this machine's public IP. Harmless for a
+    # relay whose address is about to be published anyway, but a privacy tool
+    # should say so rather than do it quietly. --ip skips this entirely.
     curl -4s --max-time 5 https://ifconfig.me 2>/dev/null ||
     curl -4s --max-time 5 https://icanhazip.com 2>/dev/null ||
     curl -4s --max-time 5 https://api.ipify.org 2>/dev/null ||
@@ -95,7 +98,9 @@ ask() {
     if [[ -n "$STDIN_FD" ]]; then
         read -rp "$prompt" "$var" <&$STDIN_FD
     elif [[ -n "$default" ]]; then
-        eval "$var='$default'"
+        # F-25: printf %q quotes the value so a default containing a single
+        # quote cannot break out of the assignment.
+        eval "$var=$(printf '%q' "$default")"
     else
         die "$var is required (no terminal for prompt — pass via flags)"
     fi
@@ -225,13 +230,28 @@ if pkg-config --exists libsodium 2>/dev/null; then
     if [[ "$(printf '%s\n' "1.0.18" "$SODIUM_VER" | sort -V | head -1)" != "1.0.18" ]]; then
         echo "  libsodium $SODIUM_VER too old, building 1.0.20 from source..."
         cd /tmp
-        curl -sLO https://download.libsodium.org/libsodium/releases/libsodium-1.0.20-RELEASE.tar.gz
-        tar xzf libsodium-1.0.20-RELEASE.tar.gz
-        cd libsodium-1.0.20-RELEASE
-        ./configure --prefix=/usr/local >/dev/null 2>&1
-        make -j"$(nproc)" >/dev/null 2>&1 && make install >/dev/null 2>&1
-        ldconfig
-        cd /tmp && rm -rf libsodium-1.0.20-RELEASE*
+        # F-16: this used to download a libsodium tarball over plain HTTPS
+        # with no signature or checksum check and build it as root -- the
+        # shortest path from a compromised mirror or DNS answer to every
+        # relay's identity key. libsodium publishes minisign signatures; none
+        # were checked.
+        #
+        # It is also dead: that URL now returns 404, so the fallback has been
+        # silently broken as well as unverified.
+        #
+        # Rather than pin a checksum this script cannot establish, refuse.
+        # Installing a crypto library is the operator's decision to make
+        # deliberately, from a source they trust, not something an install
+        # script should do for them unverified.
+        die "libsodium is not available from this system's package manager.
+  Install it deliberately before re-running, either from your distribution or
+  from source you have verified yourself:
+
+    https://doc.libsodium.org/installation
+
+  Verify the release signature with minisign against libsodium's published
+  public key. This script will not download and build a crypto library
+  unverified as root."
     fi
 else
     die "libsodium not found after install."
